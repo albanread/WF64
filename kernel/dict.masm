@@ -1,0 +1,352 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — dictionary lookup & header construction.
+;
+; Header layout is defined in macros.masm (dh_link/dh_ct/dh_xtptr/
+; dh_comp/.../dh_nt) and is read/written *only* by the primitives in
+; this file (plus `find_name` and the interpreter dispatcher).
+; The Rust driver does NOT know the header layout; it bootstraps the
+; dictionary by calling `(create)` once per primitive followed by
+; `(set-xt)` and optionally `(set-flags)`.
+; ─────────────────────────────────────────────────────────────────────
+
+; find-name  ( c-addr u -- nt -1 | c-addr u 0 )
+;     Look up a name in the dictionary. On match: replace (c-addr u)
+;     with (nt -1), where nt points at the counted name token byte.
+;     On miss: leave (c-addr u) intact and push 0, preserving the name
+;     for number?.
+proc(find_name)
+    ; TOS = u (length), [DSP] = c-addr.
+    mov     rcx, TOS                         ; rcx = u (loop bound)
+    mov     rsi, [DSP]                       ; rsi = c-addr (query)
+    mov     rdi, [UP + user_LATEST]          ; rdi = current header
+
+.scan:
+    test    rdi, rdi
+    jz      .not_found
+    cmp     cl, byte ptr [rdi + dh_nt]
+    jne     .skip
+    ; Lengths match — compare bytes.
+    xor     r8, r8                           ; r8 = byte index
+.cmpbyte:
+    cmp     r8, rcx
+    je      .matched
+    mov     dl, byte ptr [rsi + r8]
+    lea     r9, [rdi + dh_name]
+    cmp     dl, byte ptr [r9 + r8]
+    jne     .skip
+    inc     r8
+    jmp     .cmpbyte
+
+.skip:
+    mov     rdi, [rdi + dh_link]
+    jmp     .scan
+
+.matched:
+    ; Replace (c-addr u) with (nt -1).
+    lea     r8, [rdi + dh_nt]
+    mov     [DSP], r8                        ; NOS slot ← nt
+    mov     TOS, -1                          ; TOS ← true flag
+    ; Stack effect: 2 in, 2 out — no stk needed.
+    next()
+
+.not_found:
+    ; Push 0 below original (c-addr u) — they stay.
+    ; Currently: rax = u, [rbp] = c-addr.
+    ; After: rax = 0, [rbp] = u, [rbp+cell] = c-addr.
+    mov     [DSP - cell], TOS                ; spill u into the new NOS slot
+    xor     TOS, TOS                         ; TOS ← 0 flag
+    stk(2, 3)                                ; emit `sub rbp, 8` (push 1)
+    next()
+endp()
+
+
+; >ct  ( xt -- ct )
+;     Use the xt-side backoffset cell to recover the address of the
+;     owning header's compilation-token field.
+proc(to_ct)
+    mov     rcx, [TOS - cell]
+    add     TOS, rcx
+    next()
+endp()
+
+
+; >comp  ( xt -- comp )
+;     Convert xt to the header's compile helper slot.
+proc(to_comp)
+    mov     rcx, [TOS - cell]
+    lea     TOS, [TOS + rcx + dh_comp - dh_ct]
+    next()
+endp()
+
+
+; >name  ( xt -- nt )
+;     Translate an xt to its name token. Primitive xts now carry a
+;     ct-backoffset cell at xt-cell; runtime-created xts still fall
+;     back to a dictionary scan until their xt-side metadata exists.
+proc(to_name)
+    mov     rcx, [TOS - cell]                ; candidate ct offset
+    lea     r8, [TOS + rcx]                  ; candidate ct addr
+    mov     r9, [r8 + dh_xtptr - dh_ct]      ; header.xtptr via ct addr
+    cmp     r9, TOS
+    jne     .scan_fallback
+    lea     TOS, [r8 + dh_nt - dh_ct]
+    next()
+
+.scan_fallback:
+    mov     rdi, [UP + user_LATEST]
+
+.scan:
+    test    rdi, rdi
+    jz      .not_found
+    cmp     TOS, [rdi + dh_xtptr]
+    je      .matched
+    mov     rdi, [rdi + dh_link]
+    jmp     .scan
+
+.matched:
+    lea     TOS, [rdi + dh_nt]
+    next()
+
+.not_found:
+    xor     TOS, TOS
+    next()
+endp()
+
+
+; link>name  ( lfa -- nt )
+;     Convert a header-link address/header base to the counted name.
+proc(link_to_name)
+    add     TOS, dh_nt
+    next()
+endp()
+
+
+; name>interpret  ( nt -- xt )
+;     Fetch the executable xt from a name token.
+proc(name_to_interpret)
+    mov     TOS, [TOS + dh_xtptr - dh_nt]
+    next()
+endp()
+
+
+; name>compile  ( nt -- xt ct )
+;     Fetch the compilation token pair in WF32's stack order so an
+;     immediate EXECUTE of the returned ct consumes xt.
+proc(name_to_compile)
+    lea     rcx, [TOS + dh_ct - dh_nt]
+    mov     rdx, [rcx]                       ; ct
+    mov     r8,  [rcx + cell]                ; xt
+    mov     [DSP - cell], r8                 ; NOS = xt
+    mov     TOS, rdx                         ; TOS = ct
+    stk(1, 2)
+    next()
+endp()
+
+
+; tfa@  ( nt -- type )
+;     Fetch the type flag byte from a name token.
+proc(tfa_fetch)
+    movzx   TOS, byte ptr [TOS + dh_tfa - dh_nt]
+    next()
+endp()
+
+
+; >body  ( xt -- addr | 0 )
+;     CREATE-family words return their body address. Other word kinds
+;     now THROW -31, matching WF32's ">BODY used on non-CREATEd
+;     definition" error.
+proc(to_body)
+    mov     rcx, [TOS - cell]
+    lea     r8, [TOS + rcx]                  ; r8 = ct
+    cmp     byte ptr [r8 + dh_tfa - dh_ct], tfa_tcre
+    jne     .unsupported
+    add     TOS, create_stub_size
+    next()
+
+.unsupported:
+    mov     TOS, -31
+    call    throw_word
+    next()
+endp()
+
+
+; latestxt  ( -- xt )
+;     Xt of the most recently created or updated definition.
+proc(latestxt)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_LATESTXT]
+    stk(0, 1)
+    next()
+endp()
+
+
+; forget_last  ( -- )
+;     Drop the most recently created post-bootstrap word from the
+;     dictionary, rolling back HERE/LATEST/LATESTXT in place.
+;     If there is nothing above the protected bootstrap fence, no-op.
+proc(forget_last_word)
+    mov     rdi, [UP + user_LATEST]
+    mov     r8, [UP + user_FORGET_FENCE]
+    test    rdi, rdi
+    jz      .done
+    cmp     rdi, r8
+    jbe     .done
+
+    mov     rcx, [rdi + dh_link]
+    mov     [UP + user_HERE], rdi
+    mov     [UP + user_LATEST], rcx
+    test    rcx, rcx
+    jz      .clear_latestxt
+    mov     r8, [rcx + dh_xtptr]
+    mov     [UP + user_LATESTXT], r8
+    next()
+
+.clear_latestxt:
+    mov     qword ptr [UP + user_LATESTXT], 0
+
+.done:
+    next()
+endp()
+
+
+; (create)  ( c-addr u -- )
+;     Allocate a new dictionary header at HERE:
+;       link      = LATEST
+;       ct        = compile,
+;       xtptr     = body start (with one cell reserved at xt-cell for ct-offset)
+;       comp      = compile,
+;       rec/vfa/ofa/stk/tfa = 0
+;       nt        = counted string (u + bytes)
+;     Advance HERE past the header (to where the body will live), and
+;     install the new header as LATEST — so the word becomes
+;     immediately visible to `find_name`.
+;
+;     This is the foundation `:` uses; the bootstrap calls it once per
+;     primitive (the body bytes don't matter for primitives — the
+;     `(set-xt)` that follows overwrites the xt with the JIT-resolved
+;     address).
+proc(create)
+    mov     rcx, TOS                         ; rcx = u
+    mov     rsi, [DSP]                       ; rsi = c-addr
+    mov     rdi, [UP + user_HERE]            ; rdi = header base
+
+    ; link = LATEST
+    mov     r8, [UP + user_LATEST]
+    mov     [rdi + dh_link], r8
+
+    ; Default compilation token mirrors WF32: ct = compile-word semantics,
+    ; comp = the helper that materialises a plain call to xt.
+    lea     r8, [rip + compile_word]
+    mov     [rdi + dh_ct], r8
+    lea     r8, [rip + compile_comma]
+    mov     [rdi + dh_comp], r8
+    mov     qword ptr [rdi + dh_rec], 0
+    mov     word ptr [rdi + dh_vfa], 0
+    mov     word ptr [rdi + dh_ofa], 0
+    mov     word ptr [rdi + dh_stk], 0
+    mov     byte ptr [rdi + dh_tfa], 0
+    mov     byte ptr [rdi + dh_nt], cl
+
+    ; Copy name bytes.
+    lea     r8, [rdi + dh_name]
+    xor     r9, r9
+.copy:
+    cmp     r9, rcx
+    je      .copied
+    mov     dl, byte ptr [rsi + r9]
+    mov     byte ptr [r8 + r9], dl
+    inc     r9
+    jmp     .copy
+
+.copied:
+    ; Reserve one cell immediately before xt for the WF32-style
+    ; ct-backoffset slot. The executable entry remains the first code
+    ; byte after that slot.
+    lea     r10, [rcx + dh_name + 7]
+    and     r10, -8
+    lea     r11, [rdi + r10 + cell]
+    lea     r8,  [rdi + dh_ct]
+    sub     r8, r11
+    mov     [r11 - cell], r8
+    mov     [rdi + dh_xtptr], r11            ; xt → body start
+    mov     [UP + user_HERE],   r11
+    mov     [UP + user_LATEST], rdi
+    mov     [UP + user_LATESTXT], r11
+
+    ; Drop (c-addr u). Stack at entry: TOS=u, [DSP]=c-addr, [DSP+cell]=old TOS.
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    next()
+endp()
+
+
+; (set-xt)  ( xt -- )
+;     Overwrite LATEST's xt slot with the given value. Used by the
+;     bootstrap to point each primitive header at its JIT-resolved
+;     code address (instead of the empty body location `(create)`
+;     defaulted to).
+proc(set_xt)
+    mov     rdi, [UP + user_LATEST]
+    mov     [rdi + dh_xtptr], TOS
+    mov     [UP + user_LATESTXT], TOS
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+
+; (set-comp)  ( xt -- )
+;     Bootstrap helper: overwrite LATEST's comp slot with the given helper.
+proc(set_comp)
+    mov     rdi, [UP + user_LATEST]
+    mov     [rdi + dh_comp], TOS
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+
+; (set-flags)  ( n -- )
+;     Bootstrap helper retained for the current Rust-side registry.
+;     Non-zero means IMMEDIATE, so flip HEAD.CT to EXECUTE; zero
+;     restores the normal compile-time token. TFA is now reserved for
+;     actual WF32-style type tags and is not modified here.
+proc(set_flags)
+    mov     rdi, [UP + user_LATEST]
+    lea     r8, [rip + compile_word]
+    test    TOS, TOS
+    jz      .store_ct
+    lea     r8, [rip + execute]
+.store_ct:
+    mov     [rdi + dh_ct], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+
+; largest  ( addr count -- max-addr max )
+;     Scan `count` cells starting at `addr`, returning the address of
+;     the largest cell and its value. Faithful port of WF32's helper
+;     used while iterating vocabulary thread arrays.
+proc(largest)
+    mov     rcx, rax                        ; rcx = count
+    mov     rax, [rbp]                      ; rax = current addr
+    xor     rdi, rdi                        ; best value = 0
+    mov     rdx, rax                        ; best addr = start
+
+.loop:
+    cmp     [rax], rdi
+    jle     .next
+    mov     rdx, rax
+    mov     rdi, [rax]
+
+.next:
+    add     rax, cell
+    sub     rcx, 1
+    jnz     .loop
+
+    mov     [rbp], rdx                      ; NOS = best addr
+    mov     rax, rdi                        ; TOS = best value
+    next()
+endp()

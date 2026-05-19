@@ -1,0 +1,1327 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — colon compiler.
+;
+; M4 lets users define new words at runtime via `:` … `;`. The compiled
+; body is straight subroutine-threaded code in the dict heap:
+;
+;   - Each Forth word in the body becomes `call rel32` (5 bytes).
+;   - Each literal number becomes `call do_lit` + `.quad N`   (13 bytes).
+;   - `;` writes a single `ret` byte (0xC3).
+;
+; M3's VirtualAlloc2 placement guarantees every call between the kernel
+; (.text) and the dict heap fits in the rel32 form, so we never need
+; the 12-byte indirect path.
+; ─────────────────────────────────────────────────────────────────────
+
+; do_lit  ( -- n )   [runtime helper, never user-callable]
+;     Compiled by `literal` as: call do_lit ; .quad N
+;     The caller's return slot points at the 8-byte literal sitting
+;     just past the `call` site. We load that quad, bump the return
+;     past it, then ret as normal.
+proc(do_lit)
+    mov     r9,  [rsp]                       ; r9 = addr of inline data
+    mov     r10, [r9]                        ; r10 = literal value
+    add     qword ptr [rsp], 8               ; skip the 8 bytes on return
+    mov     [DSP - cell], TOS                ; old TOS → new NOS slot
+    mov     TOS, r10                         ; new TOS = literal
+    stk(0, 1)                                ; sub rbp, 8
+    next()
+endp()
+
+; compile  ( xt -- )
+;     WF32-style compile token for ordinary words: duplicate xt, map the
+;     duplicate to its comp-field address, then dispatch that helper while
+;     leaving the original xt on the stack for the helper to consume.
+proc(compile_word)
+    mov     [DSP - cell], TOS                ; duplicate xt
+    stk(1, 2)
+    call    to_comp                          ; ( xt xt -- xt a-comp )
+    jmp     perform                          ; helper sees original xt on TOS
+endp()
+
+; xt-call,  ( xt -- )
+;     Append a 5-byte `call rel32` pointing at xt to HERE.
+;     Because the dict heap is within ±1.75 GB of every primitive
+;     (M3's VirtualAlloc2 placement), the rel32 always fits.
+proc(compile_comma)
+    mov     r8, [UP + user_HERE]             ; r8 = HERE
+    mov     byte ptr [r8], 0xE8              ; CALL opcode
+    sub     TOS, r8
+    sub     TOS, 5                           ; eax = xt - (HERE + 5)
+    mov     dword ptr [r8 + 1], eax
+    add     r8, 5
+    mov     [UP + user_HERE], r8
+    ; Drop xt.
+    mov     TOS, [DSP]
+    stk(1, 0)                                ; add rbp, 8
+    next()
+endp()
+
+; inline-dup,  ( xt -- )
+;     First real WF32-style inline compile helper: ignore xt and emit the
+;     body of DUP directly into the current definition, with no CALL/RET
+;     boundary.
+proc(inline_dup_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov [rbp-8], rax
+    mov     byte ptr [r8 + 1], 0x89
+    mov     byte ptr [r8 + 2], 0x45
+    mov     byte ptr [r8 + 3], 0xF8
+    mov     byte ptr [r8 + 4], 0x48          ; sub rbp, 8
+    mov     byte ptr [r8 + 5], 0x83
+    mov     byte ptr [r8 + 6], 0xED
+    mov     byte ptr [r8 + 7], 0x08
+    add     r8, 8
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-drop,  ( xt -- )
+;     Emit DROP directly into the current definition.
+proc(inline_drop_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov rax, [rbp]
+    mov     byte ptr [r8 + 1], 0x8B
+    mov     byte ptr [r8 + 2], 0x45
+    mov     byte ptr [r8 + 3], 0x00
+    mov     byte ptr [r8 + 4], 0x48          ; add rbp, 8
+    mov     byte ptr [r8 + 5], 0x83
+    mov     byte ptr [r8 + 6], 0xC5
+    mov     byte ptr [r8 + 7], 0x08
+    add     r8, 8
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-swap,  ( xt -- )
+;     Emit SWAP directly into the current definition.
+proc(inline_swap_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov rcx, [rbp]
+    mov     byte ptr [r8 + 1], 0x8B
+    mov     byte ptr [r8 + 2], 0x4D
+    mov     byte ptr [r8 + 3], 0x00
+    mov     byte ptr [r8 + 4], 0x48          ; mov [rbp], rax
+    mov     byte ptr [r8 + 5], 0x89
+    mov     byte ptr [r8 + 6], 0x45
+    mov     byte ptr [r8 + 7], 0x00
+    mov     byte ptr [r8 + 8], 0x48          ; mov rax, rcx
+    mov     byte ptr [r8 + 9], 0x89
+    mov     byte ptr [r8 + 10], 0xC8
+    add     r8, 11
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-over,  ( xt -- )
+;     Emit OVER directly into the current definition.
+proc(inline_over_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov [rbp-8], rax
+    mov     byte ptr [r8 + 1], 0x89
+    mov     byte ptr [r8 + 2], 0x45
+    mov     byte ptr [r8 + 3], 0xF8
+    mov     byte ptr [r8 + 4], 0x48          ; mov rax, [rbp]
+    mov     byte ptr [r8 + 5], 0x8B
+    mov     byte ptr [r8 + 6], 0x45
+    mov     byte ptr [r8 + 7], 0x00
+    mov     byte ptr [r8 + 8], 0x48          ; sub rbp, 8
+    mov     byte ptr [r8 + 9], 0x83
+    mov     byte ptr [r8 + 10], 0xED
+    mov     byte ptr [r8 + 11], 0x08
+    add     r8, 12
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline->r,  ( xt -- )
+;     Emit >R directly into the current definition, matching WF32's
+;     inline body with no callable-proc return-address juggling.
+proc(inline_to_r_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x50          ; push rax
+    mov     byte ptr [r8 + 1], 0x48          ; mov rax, [rbp]
+    mov     byte ptr [r8 + 2], 0x8B
+    mov     byte ptr [r8 + 3], 0x45
+    mov     byte ptr [r8 + 4], 0x00
+    mov     byte ptr [r8 + 5], 0x48          ; add rbp, 8
+    mov     byte ptr [r8 + 6], 0x83
+    mov     byte ptr [r8 + 7], 0xC5
+    mov     byte ptr [r8 + 8], 0x08
+    add     r8, 9
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-r>,  ( xt -- )
+;     Emit R> directly into the current definition, matching WF32's
+;     inline body with no callable-proc return-address juggling.
+proc(inline_r_from_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov [rbp-8], rax
+    mov     byte ptr [r8 + 1], 0x89
+    mov     byte ptr [r8 + 2], 0x45
+    mov     byte ptr [r8 + 3], 0xF8
+    mov     byte ptr [r8 + 4], 0x58          ; pop rax
+    mov     byte ptr [r8 + 5], 0x48          ; sub rbp, 8
+    mov     byte ptr [r8 + 6], 0x83
+    mov     byte ptr [r8 + 7], 0xED
+    mov     byte ptr [r8 + 8], 0x08
+    add     r8, 9
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-r@,  ( xt -- )
+;     Emit R@ directly into the current definition.
+proc(inline_r_fetch_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov [rbp-8], rax
+    mov     byte ptr [r8 + 1], 0x89
+    mov     byte ptr [r8 + 2], 0x45
+    mov     byte ptr [r8 + 3], 0xF8
+    mov     byte ptr [r8 + 4], 0x48          ; mov rax, [rsp]
+    mov     byte ptr [r8 + 5], 0x8B
+    mov     byte ptr [r8 + 6], 0x04
+    mov     byte ptr [r8 + 7], 0x24
+    mov     byte ptr [r8 + 8], 0x48          ; sub rbp, 8
+    mov     byte ptr [r8 + 9], 0x83
+    mov     byte ptr [r8 + 10], 0xED
+    mov     byte ptr [r8 + 11], 0x08
+    add     r8, 12
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-2>r,  ( xt -- )
+;     Emit 2>R directly into the current definition.
+proc(inline_two_to_r_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0xFF          ; push qword [rbp]
+    mov     byte ptr [r8 + 1], 0x75
+    mov     byte ptr [r8 + 2], 0x00
+    mov     byte ptr [r8 + 3], 0x50          ; push rax
+    mov     byte ptr [r8 + 4], 0x48          ; mov rax, [rbp+8]
+    mov     byte ptr [r8 + 5], 0x8B
+    mov     byte ptr [r8 + 6], 0x45
+    mov     byte ptr [r8 + 7], 0x08
+    mov     byte ptr [r8 + 8], 0x48          ; add rbp, 16
+    mov     byte ptr [r8 + 9], 0x83
+    mov     byte ptr [r8 + 10], 0xC5
+    mov     byte ptr [r8 + 11], 0x10
+    add     r8, 12
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    add     DSP, 2*cell
+    next()
+endp()
+
+; inline-2r>,  ( xt -- )
+;     Emit 2R> directly into the current definition.
+proc(inline_two_r_from_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; sub rbp, 16
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xED
+    mov     byte ptr [r8 + 3], 0x10
+    mov     byte ptr [r8 + 4], 0x48          ; mov [rbp+8], rax
+    mov     byte ptr [r8 + 5], 0x89
+    mov     byte ptr [r8 + 6], 0x45
+    mov     byte ptr [r8 + 7], 0x08
+    mov     byte ptr [r8 + 8], 0x58          ; pop rax
+    mov     byte ptr [r8 + 9], 0x59          ; pop rcx
+    mov     byte ptr [r8 + 10], 0x48         ; mov [rbp], rcx
+    mov     byte ptr [r8 + 11], 0x89
+    mov     byte ptr [r8 + 12], 0x4D
+    mov     byte ptr [r8 + 13], 0x00
+    add     r8, 14
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-2r@,  ( xt -- )
+;     Emit 2R@ directly into the current definition.
+proc(inline_two_r_fetch_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; sub rbp, 16
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xED
+    mov     byte ptr [r8 + 3], 0x10
+    mov     byte ptr [r8 + 4], 0x48          ; mov [rbp+8], rax
+    mov     byte ptr [r8 + 5], 0x89
+    mov     byte ptr [r8 + 6], 0x45
+    mov     byte ptr [r8 + 7], 0x08
+    mov     byte ptr [r8 + 8], 0x48          ; mov rdx, [rsp+8]
+    mov     byte ptr [r8 + 9], 0x8B
+    mov     byte ptr [r8 + 10], 0x54
+    mov     byte ptr [r8 + 11], 0x24
+    mov     byte ptr [r8 + 12], 0x08
+    mov     byte ptr [r8 + 13], 0x48         ; mov rax, [rsp]
+    mov     byte ptr [r8 + 14], 0x8B
+    mov     byte ptr [r8 + 15], 0x04
+    mov     byte ptr [r8 + 16], 0x24
+    mov     byte ptr [r8 + 17], 0x48         ; mov [rbp], rdx
+    mov     byte ptr [r8 + 18], 0x89
+    mov     byte ptr [r8 + 19], 0x55
+    mov     byte ptr [r8 + 20], 0x00
+    add     r8, 21
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-i,  ( xt -- )
+;     Emit I directly into the current definition.
+proc(inline_i_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov [rbp-8], rax
+    mov     byte ptr [r8 + 1], 0x89
+    mov     byte ptr [r8 + 2], 0x45
+    mov     byte ptr [r8 + 3], 0xF8
+    mov     byte ptr [r8 + 4], 0x48          ; mov rax, [rsp]
+    mov     byte ptr [r8 + 5], 0x8B
+    mov     byte ptr [r8 + 6], 0x04
+    mov     byte ptr [r8 + 7], 0x24
+    mov     byte ptr [r8 + 8], 0x48          ; add rax, [rsp+8]
+    mov     byte ptr [r8 + 9], 0x03
+    mov     byte ptr [r8 + 10], 0x44
+    mov     byte ptr [r8 + 11], 0x24
+    mov     byte ptr [r8 + 12], 0x08
+    mov     byte ptr [r8 + 13], 0x48         ; sub rbp, 8
+    mov     byte ptr [r8 + 14], 0x83
+    mov     byte ptr [r8 + 15], 0xED
+    mov     byte ptr [r8 + 16], 0x08
+    add     r8, 17
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-j,  ( xt -- )
+;     Emit J directly into the current definition.
+proc(inline_j_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov [rbp-8], rax
+    mov     byte ptr [r8 + 1], 0x89
+    mov     byte ptr [r8 + 2], 0x45
+    mov     byte ptr [r8 + 3], 0xF8
+    mov     byte ptr [r8 + 4], 0x48          ; mov rax, [rsp+16]
+    mov     byte ptr [r8 + 5], 0x8B
+    mov     byte ptr [r8 + 6], 0x44
+    mov     byte ptr [r8 + 7], 0x24
+    mov     byte ptr [r8 + 8], 0x10
+    mov     byte ptr [r8 + 9], 0x48          ; add rax, [rsp+24]
+    mov     byte ptr [r8 + 10], 0x03
+    mov     byte ptr [r8 + 11], 0x44
+    mov     byte ptr [r8 + 12], 0x24
+    mov     byte ptr [r8 + 13], 0x18
+    mov     byte ptr [r8 + 14], 0x48         ; sub rbp, 8
+    mov     byte ptr [r8 + 15], 0x83
+    mov     byte ptr [r8 + 16], 0xED
+    mov     byte ptr [r8 + 17], 0x08
+    add     r8, 18
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-do-part1,  ( xt -- )
+;     Emit WF32's first loop-frame setup half directly into the definition.
+proc(inline_do_part1_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; mov rdx, rax
+    mov     byte ptr [r8 + 1], 0x89
+    mov     byte ptr [r8 + 2], 0xC2
+    mov     byte ptr [r8 + 3], 0x48          ; mov rcx, [rbp]
+    mov     byte ptr [r8 + 4], 0x8B
+    mov     byte ptr [r8 + 5], 0x4D
+    mov     byte ptr [r8 + 6], 0x00
+    mov     byte ptr [r8 + 7], 0x48          ; mov rax, [rbp+8]
+    mov     byte ptr [r8 + 8], 0x8B
+    mov     byte ptr [r8 + 9], 0x45
+    mov     byte ptr [r8 + 10], 0x08
+    mov     byte ptr [r8 + 11], 0x48         ; add rbp, 16
+    mov     byte ptr [r8 + 12], 0x83
+    mov     byte ptr [r8 + 13], 0xC5
+    mov     byte ptr [r8 + 14], 0x10
+    add     r8, 15
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-do-part2,  ( xt -- )
+;     Emit WF32's second loop-frame setup half directly into the definition.
+proc(inline_do_part2_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x49          ; mov r8, 1
+    mov     byte ptr [r8 + 1], 0xC7
+    mov     byte ptr [r8 + 2], 0xC0
+    mov     dword ptr [r8 + 3], 1
+    mov     byte ptr [r8 + 7], 0x49          ; shl r8, 63
+    mov     byte ptr [r8 + 8], 0xC1
+    mov     byte ptr [r8 + 9], 0xE0
+    mov     byte ptr [r8 + 10], 0x3F
+    mov     byte ptr [r8 + 11], 0x4C         ; add rcx, r8
+    mov     byte ptr [r8 + 12], 0x01
+    mov     byte ptr [r8 + 13], 0xC1
+    mov     byte ptr [r8 + 14], 0x48         ; sub rdx, rcx
+    mov     byte ptr [r8 + 15], 0x29
+    mov     byte ptr [r8 + 16], 0xCA
+    mov     byte ptr [r8 + 17], 0x51         ; push rcx
+    mov     byte ptr [r8 + 18], 0x52         ; push rdx
+    add     r8, 19
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; bra  ( -- )  [compile-only runtime stub]
+proc(bra_word)
+    jmp     comp_only_word
+endp()
+
+; mark>  ( -- addr )
+;     Return the current HERE value. WF32 uses this as the mark carried on
+;     the compile-time control-flow stack; for rel32 branches it is the
+;     address just past the instruction's displacement field.
+proc(mark_to)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_HERE]
+    stk(0, 1)
+    next()
+endp()
+
+; <resolve  ( dest -- )
+;     Patch the rel32 field of the most recently emitted branch so it jumps
+;     backward to dest. The field starts 4 bytes before HERE.
+proc(back_resolve)
+    mov     r8, [UP + user_HERE]
+    sub     TOS, r8
+    mov     dword ptr [r8 - 4], eax
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; >resolve  ( orig -- )
+;     Patch the rel32 field at orig-4 so it jumps forward to the current HERE.
+proc(forward_resolve)
+    mov     rcx, TOS
+    mov     r8, [UP + user_HERE]
+    sub     r8, rcx
+    mov     dword ptr [rcx - 4], r8d
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; ?pairs  ( n1 n2 -- )
+;     THROW -22 if the control-flow marks differ; otherwise drop both.
+proc(qpairs)
+    mov     rcx, [DSP]
+    xor     rcx, TOS
+    jz      .ok
+    mov     TOS, -22
+    call    throw_word
+    next()
+.ok:
+    mov     TOS, [DSP + cell]
+    stk(2, 0)
+    next()
+endp()
+
+; ahead  ( c: -- orig )                                   IMMEDIATE
+;     Compile an unresolved forward branch and leave its mark pair.
+proc(ahead_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0xE9
+    mov     dword ptr [r8 + 1], 0
+    add     r8, 5
+    mov     [UP + user_HERE], r8
+    call    mark_to
+    mov     [DSP - cell], TOS
+    mov     TOS, -1
+    stk(0, 1)
+    next()
+endp()
+
+; if  ( c: -- orig )  ( x -- )                            IMMEDIATE
+proc(if_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xC5
+    mov     byte ptr [r8 + 3], 0x08
+    mov     byte ptr [r8 + 4], 0x48
+    mov     byte ptr [r8 + 5], 0x85
+    mov     byte ptr [r8 + 6], 0xC0
+    mov     byte ptr [r8 + 7], 0x48
+    mov     byte ptr [r8 + 8], 0x8B
+    mov     byte ptr [r8 + 9], 0x45
+    mov     byte ptr [r8 + 10], 0xF8
+    mov     byte ptr [r8 + 11], 0x0F
+    mov     byte ptr [r8 + 12], 0x84
+    mov     dword ptr [r8 + 13], 0
+    add     r8, 17
+    mov     [UP + user_HERE], r8
+    call    mark_to
+    mov     [DSP - cell], TOS
+    mov     TOS, -1
+    stk(0, 1)
+    next()
+endp()
+
+; -if  ( c: -- orig )  ( x -- x )                         IMMEDIATE
+proc(minus_if_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x85
+    mov     byte ptr [r8 + 2], 0xC0
+    mov     byte ptr [r8 + 3], 0x0F
+    mov     byte ptr [r8 + 4], 0x84
+    mov     dword ptr [r8 + 5], 0
+    add     r8, 9
+    mov     [UP + user_HERE], r8
+    call    mark_to
+    mov     [DSP - cell], TOS
+    mov     TOS, -1
+    stk(0, 1)
+    next()
+endp()
+
+; then  ( c: orig -- )                                    IMMEDIATE
+proc(then_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    mov     [DSP - cell], TOS
+    mov     TOS, -1
+    stk(0, 1)
+    call    qpairs
+    call    forward_resolve
+    next()
+endp()
+
+; else  ( c: orig1 -- orig2 )                             IMMEDIATE
+proc(else_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    ahead_word
+    call    two_swap
+    call    then_word
+    next()
+endp()
+
+; begin  ( c: -- dest )                                   IMMEDIATE
+proc(begin_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    mark_to
+    mov     [DSP - cell], TOS
+    mov     TOS, -2
+    stk(0, 1)
+    next()
+endp()
+
+; while  ( c: dest -- orig dest )  ( x -- )               IMMEDIATE
+proc(while_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    if_word
+    call    two_swap
+    next()
+endp()
+
+; again  ( c: dest -- )                                   IMMEDIATE
+proc(again_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    mov     [DSP - cell], TOS
+    mov     TOS, -2
+    stk(0, 1)
+    call    qpairs
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0xE9
+    mov     dword ptr [r8 + 1], 0
+    add     r8, 5
+    mov     [UP + user_HERE], r8
+    call    back_resolve
+    next()
+endp()
+
+; until  ( c: dest -- )  ( x -- )                         IMMEDIATE
+proc(until_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    mov     [DSP - cell], TOS
+    mov     TOS, -2
+    stk(0, 1)
+    call    qpairs
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xC5
+    mov     byte ptr [r8 + 3], 0x08
+    mov     byte ptr [r8 + 4], 0x48
+    mov     byte ptr [r8 + 5], 0x85
+    mov     byte ptr [r8 + 6], 0xC0
+    mov     byte ptr [r8 + 7], 0x48
+    mov     byte ptr [r8 + 8], 0x8B
+    mov     byte ptr [r8 + 9], 0x45
+    mov     byte ptr [r8 + 10], 0xF8
+    mov     byte ptr [r8 + 11], 0x0F
+    mov     byte ptr [r8 + 12], 0x84
+    mov     dword ptr [r8 + 13], 0
+    add     r8, 17
+    mov     [UP + user_HERE], r8
+    call    back_resolve
+    next()
+endp()
+
+; repeat  ( c: orig dest -- )                             IMMEDIATE
+proc(repeat_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    again_word
+    call    then_word
+    next()
+endp()
+
+; recurse  ( -- )                                         IMMEDIATE
+proc(recurse_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    latestxt
+    call    compile_comma
+    next()
+endp()
+
+; [  ( -- )                                               IMMEDIATE
+;     Enter interpret state immediately.
+proc(left_bracket_word)
+    mov     qword ptr [UP + user_STATE], 0
+    next()
+endp()
+
+; ]  ( -- )
+;     Enter compile state.
+proc(right_bracket_word)
+    mov     qword ptr [UP + user_STATE], 1
+    next()
+endp()
+
+; immediate  ( -- )
+;     Make the most recently created word immediate by setting CT=EXECUTE.
+proc(immediate_word)
+    mov     rdi, [UP + user_LATEST]
+    lea     r8, [rip + execute]
+    mov     [rdi + dh_ct], r8
+    next()
+endp()
+
+; '  ( -- xt )
+;     Parse the next name and return its interpret xt.
+proc(tick_word)
+    call    parse_name
+    test    TOS, TOS
+    jnz     .got_name
+
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    call    throw_namereqd_const
+    call    throw_word
+    next()
+
+.got_name:
+    call    find_name
+    test    TOS, TOS
+    jnz     .found
+
+    mov     TOS, -13
+    call    throw_word
+    next()
+
+.found:
+    mov     TOS, [DSP]
+    stk(1, 0)
+    call    name_to_interpret
+    next()
+endp()
+
+; [']  ( -<name>- )                                        IMMEDIATE
+;     Compile the interpret xt of the next word as a literal.
+proc(bracket_tick_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    tick_word
+    call    literal
+    next()
+endp()
+
+; literal  ( n -- )                                        IMMEDIATE
+;     Compile the current TOS as a runtime literal.
+proc(literal_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    literal
+    next()
+endp()
+
+; postpone  ( -<name>- )                                   IMMEDIATE
+;     Compile the compilation semantics of the next parsed word.
+proc(postpone_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    parse_name
+    test    TOS, TOS
+    jnz     .got_name
+
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    call    throw_namereqd_const
+    call    throw_word
+    next()
+
+.got_name:
+    call    find_name
+    test    TOS, TOS
+    jnz     .found
+
+    mov     TOS, -13
+    call    throw_word
+    next()
+
+.found:
+    mov     TOS, [DSP]
+    stk(1, 0)
+    call    name_to_compile                ; -> xt ct
+    call    swap_                          ; -> ct xt
+    call    literal                        ; compile xt as runtime literal, leave ct
+    call    compile_comma                  ; compile call to ct
+    next()
+endp()
+
+; Runtime helper for DOES>. Rewrites the most recently created word's
+; stub tail from RET+padding to JMP does-body, preserving the body
+; address push in the stub prefix.
+proc(does_runtime_patch)
+    mov     r8, [UP + user_LATESTXT]            ; xt of latest created word
+    lea     r9, [r8 + 23]                       ; IP after jmp rel32
+    mov     byte ptr [r8 + 18], 0xE9           ; JMP rel32 opcode
+    mov     r10, TOS                            ; target address
+    sub     r10, r9                             ; rel32 = target - next_ip
+    mov     dword ptr [r8 + 19], r10d
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; does>  ( -- )                                        IMMEDIATE
+;     End the create-time portion of a defining word. At runtime the
+;     defining word patches the newest created word to jump into the
+;     does-body, while created-word execution still pushes >BODY.
+proc(does_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+
+.in_compile:
+    mov     r8, [UP + user_HERE]                ; patch-call sequence start
+    lea     r9, [r8 + 16]                       ; target = code after ret
+
+    ; mov rax, imm64(target)
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0xB8
+    mov     qword ptr [r8 + 2], r9
+
+    ; call does_runtime_patch
+    mov     byte ptr [r8 + 10], 0xE8
+    lea     r10, [rip + does_runtime_patch]
+    lea     r11, [r8 + 15]
+    sub     r10, r11
+    mov     dword ptr [r8 + 11], r10d
+
+    ; ret -- created words are patched during create-time execution;
+    ; the does-body itself starts immediately after this return.
+    mov     byte ptr [r8 + 15], 0xC3
+
+    lea     r8, [r8 + 16]
+    mov     [UP + user_HERE], r8
+    next()
+endp()
+
+proc(compile_xt_from_rcx)
+    mov     [DSP - cell], TOS
+    mov     TOS, rcx
+    stk(0, 1)
+    call    compile_word
+    ret
+endp()
+
+proc(push_mark_const)
+    mov     [DSP - cell], TOS
+    mov     TOS, rcx
+    stk(0, 1)
+    ret
+endp()
+
+proc(emit_unloop_inline)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; add rsp, 16
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xC4
+    mov     byte ptr [r8 + 3], 0x10
+    add     r8, 4
+    mov     [UP + user_HERE], r8
+    ret
+endp()
+
+; unloop  ( -- )  [compile-time/runtime loop-frame drop]
+proc(unloop_word)
+    jmp     two_rdrop
+endp()
+
+; inline-unloop,  ( xt -- )
+proc(inline_unloop_comp)
+    call    emit_unloop_inline
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+proc(close_loop_common)
+    mov     rcx, -3
+    call    push_mark_const
+    call    qpairs                           ; leaves do-mark address on TOS
+    call    back_resolve                     ; patch raw loop branch back to do-bias
+ .resolve_leaves:
+    cmp     TOS, -5
+    jne     .emit_unloop
+    mov     TOS, -1                          ; mark-leave -> mark-if for THEN fixup
+    call    then_word
+    jmp     .resolve_leaves
+
+.emit_unloop:
+    lea     rcx, [rip + unloop_word]
+    call    compile_xt_from_rcx              ; drop the active loop frame
+    cmp     TOS, -4                          ; ?do leaves a second mark pair behind
+    jne     .done
+    mov     TOS, [DSP]                       ; raise the ?do forward-branch address
+    stk(1, 0)
+    call    forward_resolve
+.done:
+    ret
+endp()
+
+; do  ( c: -- do-sys )                                      IMMEDIATE
+proc(do_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    lea     rcx, [rip + do_part1]
+    call    compile_xt_from_rcx
+    lea     rcx, [rip + do_part2]
+    call    compile_xt_from_rcx
+    call    mark_to
+    mov     rcx, -3
+    call    push_mark_const
+    next()
+endp()
+
+; ?do  ( c: -- ?do-sys do-sys )                             IMMEDIATE
+proc(qdo_control_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    lea     rcx, [rip + do_part1]
+    call    compile_xt_from_rcx
+    lea     rcx, [rip + bra_qdo_word]
+    call    compile_xt_from_rcx
+    call    mark_to
+    mov     rcx, -4
+    call    push_mark_const
+    lea     rcx, [rip + do_part2]
+    call    compile_xt_from_rcx
+    call    mark_to
+    mov     rcx, -3
+    call    push_mark_const
+    next()
+endp()
+
+; loop  ( -- )  ( c: do-sys -- )                            IMMEDIATE
+proc(loop_control_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    lea     rcx, [rip + loop_word]
+    call    compile_xt_from_rcx
+    call    close_loop_common
+    next()
+endp()
+
+; +loop  ( n -- )  ( c: do-sys -- )                         IMMEDIATE
+proc(plus_loop_control_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    lea     rcx, [rip + plus_loop_word]
+    call    compile_xt_from_rcx
+    call    close_loop_common
+    next()
+endp()
+
+; -loop  ( n -- )  ( c: do-sys -- )                         IMMEDIATE
+proc(minus_loop_control_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    lea     rcx, [rip + minus_loop_word]
+    call    compile_xt_from_rcx
+    call    close_loop_common
+    next()
+endp()
+
+; leave  ( do-sys ... -- orig do-sys ... )                  IMMEDIATE
+proc(leave_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    lea     r8, [UP + user_DO_TMP1]          ; scratch: pairs above nearest do-sys
+    add     r8, cell
+    mov     r9, DSP                          ; scan addr pointer for pair 0
+    mov     r10, TOS                         ; scan marker
+    xor     r11d, r11d                       ; stripped pair count
+
+.scan:
+    cmp     r10, -3                          ; mark-do
+    je      .found_do
+    mov     [r8], r10                        ; save marker
+    mov     rcx, [r9]                        ; save addr
+    mov     [r8 + cell], rcx
+    add     r8, 2*cell
+    inc     r11
+    mov     r10, [r9 + cell]                 ; next marker
+    add     r9, 2*cell                       ; next addr
+    jmp     .scan
+
+.found_do:
+    mov     [UP + user_DO_TMP0], r11         ; save stripped pair count across calls
+    mov     TOS, r10                         ; expose do marker on top
+    mov     DSP, r9                          ; do addr now NOS
+    call    ahead_word                       ; -> mark-if/orig above do-sys
+    call    two_swap                         ; -> do-sys above leave placeholder
+    mov     qword ptr [DSP + cell], -5       ; mark-leave replaces mark-if
+
+    mov     r11, [UP + user_DO_TMP0]
+    test    r11, r11
+    jz      .done
+    lea     r8, [UP + user_DO_TMP1]
+    add     r8, cell
+    mov     rcx, r11
+    shl     rcx, 4                           ; 2 cells per saved pair
+    add     r8, rcx
+    sub     r8, 2*cell                       ; deepest stripped pair
+
+.restore:
+    mov     rcx, [r8 + cell]                 ; addr
+    mov     [DSP - cell], TOS
+    mov     TOS, rcx
+    stk(0, 1)
+    mov     rcx, [r8]                        ; marker
+    mov     [DSP - cell], TOS
+    mov     TOS, rcx
+    stk(0, 1)
+    sub     r8, 2*cell
+    dec     r11
+    jnz     .restore
+
+.done:
+    next()
+endp()
+
+; ?leave  ( f -- )                                           IMMEDIATE
+proc(qleave_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    if_word
+    call    leave_word
+    call    then_word
+    next()
+endp()
+
+; ?bra  ( n -- )  [compile-only runtime stub]
+proc(qbra_word)
+    jmp     comp_only_word
+endp()
+
+; -?bra  ( n -- n )  [compile-only runtime stub]
+proc(minus_qbra_word)
+    jmp     comp_only_word
+endp()
+
+; bra-?do  ( -- )  [compile-only runtime stub]
+proc(bra_qdo_word)
+    jmp     comp_only_word
+endp()
+
+; _loop  ( -- )  [compile-only runtime stub]
+proc(loop_word)
+    jmp     comp_only_word
+endp()
+
+; _+loop  ( n -- )  [compile-only runtime stub]
+proc(plus_loop_word)
+    jmp     comp_only_word
+endp()
+
+; _-loop  ( n -- )  [compile-only runtime stub]
+proc(minus_loop_word)
+    jmp     comp_only_word
+endp()
+
+; inline-bra,  ( xt -- )
+;     Emit `jmp rel32` with a zero displacement placeholder.
+proc(inline_bra_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0xE9
+    mov     dword ptr [r8 + 1], 0
+    add     r8, 5
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline--?bra,  ( xt -- )
+;     Emit non-destructive test-and-branch with a zero displacement.
+proc(inline_minus_qbra_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; test rax, rax
+    mov     byte ptr [r8 + 1], 0x85
+    mov     byte ptr [r8 + 2], 0xC0
+    mov     byte ptr [r8 + 3], 0x0F          ; jz rel32 0
+    mov     byte ptr [r8 + 4], 0x84
+    mov     dword ptr [r8 + 5], 0
+    add     r8, 9
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-?bra,  ( xt -- )
+;     Emit destructive test-and-branch with a zero displacement.
+proc(inline_qbra_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; add rbp, 8
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xC5
+    mov     byte ptr [r8 + 3], 0x08
+    mov     byte ptr [r8 + 4], 0x48          ; test rax, rax
+    mov     byte ptr [r8 + 5], 0x85
+    mov     byte ptr [r8 + 6], 0xC0
+    mov     byte ptr [r8 + 7], 0x48          ; mov rax, [rbp - 8]
+    mov     byte ptr [r8 + 8], 0x8B
+    mov     byte ptr [r8 + 9], 0x45
+    mov     byte ptr [r8 + 10], 0xF8
+    mov     byte ptr [r8 + 11], 0x0F         ; jz rel32 0
+    mov     byte ptr [r8 + 12], 0x84
+    mov     dword ptr [r8 + 13], 0
+    add     r8, 17
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-bra-?do,  ( xt -- )
+;     Emit the loop-entry compare-and-branch with a zero displacement.
+proc(inline_bra_qdo_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; cmp rdx, rcx
+    mov     byte ptr [r8 + 1], 0x39
+    mov     byte ptr [r8 + 2], 0xCA
+    mov     byte ptr [r8 + 3], 0x0F          ; jz rel32 0
+    mov     byte ptr [r8 + 4], 0x84
+    mov     dword ptr [r8 + 5], 0
+    add     r8, 9
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-_loop,  ( xt -- )
+;     Emit WF32's loop-step body with a zero displacement placeholder.
+proc(inline_loop_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; add qword ptr [rsp], 1
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0x04
+    mov     byte ptr [r8 + 3], 0x24
+    mov     byte ptr [r8 + 4], 0x01
+    mov     byte ptr [r8 + 5], 0x0F          ; jno rel32 0
+    mov     byte ptr [r8 + 6], 0x81
+    mov     dword ptr [r8 + 7], 0
+    add     r8, 11
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-_+loop,  ( xt -- )
+;     Emit WF32's +LOOP step body with a zero displacement placeholder.
+proc(inline_plus_loop_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; add rbp, 8
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xC5
+    mov     byte ptr [r8 + 3], 0x08
+    mov     byte ptr [r8 + 4], 0x48          ; add [rsp], rax
+    mov     byte ptr [r8 + 5], 0x01
+    mov     byte ptr [r8 + 6], 0x04
+    mov     byte ptr [r8 + 7], 0x24
+    mov     byte ptr [r8 + 8], 0x48          ; mov rax, [rbp - 8]
+    mov     byte ptr [r8 + 9], 0x8B
+    mov     byte ptr [r8 + 10], 0x45
+    mov     byte ptr [r8 + 11], 0xF8
+    mov     byte ptr [r8 + 12], 0x0F         ; jno rel32 0
+    mov     byte ptr [r8 + 13], 0x81
+    mov     dword ptr [r8 + 14], 0
+    add     r8, 18
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; inline-_-loop,  ( xt -- )
+;     Emit WF32's -LOOP step body with a zero displacement placeholder.
+proc(inline_minus_loop_comp)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48          ; add rbp, 8
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xC5
+    mov     byte ptr [r8 + 3], 0x08
+    mov     byte ptr [r8 + 4], 0x48          ; sub [rsp], rax
+    mov     byte ptr [r8 + 5], 0x29
+    mov     byte ptr [r8 + 6], 0x04
+    mov     byte ptr [r8 + 7], 0x24
+    mov     byte ptr [r8 + 8], 0x48          ; mov rax, [rbp - 8]
+    mov     byte ptr [r8 + 9], 0x8B
+    mov     byte ptr [r8 + 10], 0x45
+    mov     byte ptr [r8 + 11], 0xF8
+    mov     byte ptr [r8 + 12], 0x0F         ; jno rel32 0
+    mov     byte ptr [r8 + 13], 0x81
+    mov     dword ptr [r8 + 14], 0
+    add     r8, 18
+    mov     [UP + user_HERE], r8
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; literal  ( n -- )                    [compile-time only, not in dict]
+;     Compile the sequence  call do_lit ; .quad n   at HERE
+;     so that running the compiled word pushes n at this point.
+proc(literal)
+    mov     r8, [UP + user_HERE]             ; r8 = HERE
+    mov     byte ptr [r8], 0xE8              ; CALL opcode
+    lea     r9, [rip + do_lit]
+    sub     r9, r8
+    sub     r9, 5                            ; r9 = do_lit - (HERE + 5)
+    mov     dword ptr [r8 + 1], r9d
+    mov     [r8 + 5], TOS                    ; inline 8-byte literal
+    add     r8, 13
+    mov     [UP + user_HERE], r8
+    ; Drop n.
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; :  ( -- )
+;     Parse the next whitespace-delimited token, allocate a dict header
+;     at HERE with that name (via `(create)`), then set STATE=1. The
+;     new word is visible to `find_name` during its own compilation —
+;     so a definition can refer to itself (recursive by default,
+;     matching most modern Forths).
+proc(colon)
+    call    parse_name                       ; ( -- c-addr u )
+    test    TOS, TOS
+    jnz     .got_name
+
+    ; No name on this line. Drop (c-addr 0), restore the incoming TOS,
+    ; then THROW -16 (`throw_namereqd`).
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    call    throw_namereqd_const
+    call    throw_word
+    next()
+
+.got_name:
+    ; (create) consumes ( c-addr u ), builds the header, sets
+    ; LATEST → new header, HERE → body start.
+    call    create
+    mov     r8, [UP + user_LATEST]
+    mov     byte ptr [r8 + dh_tfa], tfa_tcol
+    ; Enter compile mode.
+    mov     qword ptr [UP + user_STATE], 1
+    next()
+endp()
+
+; ;  ( -- )                                          IMMEDIATE
+;     Finish the current definition: emit a single RET into the body
+;     and leave compile mode. The header was already linked into the
+;     chain by `(create)` when `:` ran, so no commit step is needed.
+proc(semicolon)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+
+    call    comp_only_word
+    next()
+
+.in_compile:
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8], 0xC3              ; RET
+    inc     r8
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_STATE], 0
+    next()
+endp()
+
+; create  ( -- )
+;     Parse the next name, build a CREATE-family header, then emit a
+;     tiny per-word stub at xt that pushes the word's body address.
+;     The body begins immediately after the aligned stub.
+proc(create_word)
+    call    parse_name                       ; ( -- c-addr u )
+    test    TOS, TOS
+    jnz     .got_name
+
+    ; No name on this line. Drop (c-addr 0), restore the incoming TOS,
+    ; then THROW -16 (`throw_namereqd`).
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    call    throw_namereqd_const
+    call    throw_word
+    next()
+
+.got_name:
+    call    create                           ; internal header builder
+    mov     r8, [UP + user_LATEST]
+    mov     byte ptr [r8 + dh_tfa], tfa_tcre
+
+    mov     r9, [UP + user_HERE]             ; xt
+    lea     r10, [r9 + create_stub_size]     ; body address
+
+    ; mov [rbp-8], rax
+    mov     byte ptr [r9 + 0], 0x48
+    mov     byte ptr [r9 + 1], 0x89
+    mov     byte ptr [r9 + 2], 0x45
+    mov     byte ptr [r9 + 3], 0xF8
+    ; mov rax, imm64
+    mov     byte ptr [r9 + 4], 0x48
+    mov     byte ptr [r9 + 5], 0xB8
+    mov     qword ptr [r9 + 6], r10
+    ; sub rbp, 8
+    mov     byte ptr [r9 + 14], 0x48
+    mov     byte ptr [r9 + 15], 0x83
+    mov     byte ptr [r9 + 16], 0xED
+    mov     byte ptr [r9 + 17], 0x08
+    ; ret
+    mov     byte ptr [r9 + 18], 0xC3
+    ; Clear the padding bytes so the body starts from known contents.
+    mov     dword ptr [r9 + 19], 0
+    mov     byte ptr [r9 + 23], 0
+
+    mov     [UP + user_HERE], r10
+    mov     [UP + user_LATESTXT], r9
+    next()
+endp()

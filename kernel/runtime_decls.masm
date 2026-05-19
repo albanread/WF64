@@ -1,0 +1,14 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — Rust runtime function declarations.
+;
+; The host (src/main.rs) registers each of these via
+; Jit::define_extern_fn, and bind_externs's host_resolver maps names
+; → function pointers in src/runtime.rs.
+; ─────────────────────────────────────────────────────────────────────
+
+@extern rt_print_int(1)         ; print a cell as signed decimal + space
+@extern rt_dot_s(4)             ; print the live stack from tos/dsp/sp0/rsp
+@extern rt_emit(1)              ; write one byte to current output
+@extern rt_type(2)              ; write u bytes from addr to current output
+@extern rt_bye(1)               ; legacy; bye is now cooperative (kept for binding)
+@extern rt_read_line(2)         ; read one line into buf (cap); returns bytes read

@@ -1,0 +1,29 @@
+[package]
+name = "wf64"
+version = "0.1.0"
+edition = "2021"
+description = "A 64-bit STC Forth, JIT-compiled via the JASM assembler"
+
+[dependencies]
+# Path dep on JASM while both projects co-evolve. Flip to a git or
+# crates.io dep once JASM stabilises.
+wfasm = { path = "../JASM/rust" }
+anyhow = "1"
+
+[lib]
+name = "wf64"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wf64"
+path = "src/main.rs"
+
+[[bin]]
+name = "port-wf32"
+path = "src/bin/port_wf32.rs"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+lto = "thin"

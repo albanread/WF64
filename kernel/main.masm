@@ -1,0 +1,146 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 — kernel entry point.
+;
+; The Rust driver allocates a 128 MB region near the kernel (within
+; ±2 GB so all calls fit in rel32), lays it out as data stack /
+; return stack / user area / dictionary heap, populates the dictionary
+; with one header per primitive, and calls forth_main:
+;
+;   forth_main(target_xt, logical_dsp_in, rsp_top, user_base) → 0
+;
+; This single entry point handles both REPL invocations (target_xt =
+; quit) and direct primitive invocations from Wf64Session::call(). On
+; return, [UP + user_DSP_SAVE] holds the new logical_dsp the caller
+; should adopt.
+; ─────────────────────────────────────────────────────────────────────
+
+.intel_syntax noprefix
+.text
+
+@include "macros.masm"
+@include "runtime_decls.masm"
+
+; NOTE: no `@include "win32/*.masm"` here. The kernel today calls only
+; the Rust runtime fns declared in runtime_decls.masm (rt_emit, rt_type,
+; rt_read_line, rt_print_int) — every I/O path goes through them. The
+; generated KERNEL32/USER32/etc. bindings under kernel/win32/ stay on
+; disk for whenever a primitive needs a direct Win32 call; include them
+; on demand. Dragging the full kernel32.masm in unconditionally cost us
+; ~1,165 macro expansions + 1,158 LoadLibrary/GetProcAddress/
+; LLVMAddFunction/LLVMAddGlobalMapping per session boot — a multi-second
+; tax for zero gain in the current configuration.
+
+@include "stack.masm"
+@include "rstack.masm"
+@include "memory.masm"
+@include "arith.masm"
+@include "logic.masm"
+@include "compare.masm"
+@include "strings.masm"
+@include "number.masm"
+@include "io.masm"
+@include "parse.masm"
+@include "dict.masm"
+@include "execute.masm"
+@include "compile.masm"
+@include "interp.masm"
+
+; forth_main(target_xt, logical_dsp_in, rsp_top, user_base)
+;
+; **Wire-format**: the data stack between Rust and the kernel is a
+; pure in-memory array of cells. At depth N: stack[0] (top) lives at
+; [logical_dsp + 0], stack[1] (NOS) at [logical_dsp + cell], etc.,
+; and logical_dsp = dsp_top - N*cell. Depth 0 ↔ logical_dsp == dsp_top.
+;
+; The kernel's internal convention (TOS cached in rax, kernel_DSP
+; points to NOS) is only valid *inside* the kernel — forth_main's
+; prologue/epilogue translate to/from the wire-format:
+;
+;   prologue:  mov TOS, [DSP]; add DSP, cell    ; cache top in rax
+;   epilogue:  sub DSP, cell; mov [DSP], TOS    ; spill top back
+;
+; With those bookends, `[UP + user_DSP_SAVE]` after return *is* the
+; logical_dsp the caller should adopt. The Rust harness counts depth
+; as (dsp_top - logical_dsp)/cell — no separate counter needed.
+;
+; The prologue's read of [DSP] on a depth-0 entry reads from the first
+; cell of the return-stack region (harmless — it's mapped memory and
+; the value is don't-care). The epilogue's write on a depth-0 return
+; lands at the last cell of the data-stack region (also harmless —
+; nothing reads it again).
+;
+; Win64 ABI: rcx=target_xt, rdx=logical_dsp_in, r8=rsp_top, r9=user_base.
+; All callee-saved GPRs are preserved; xmm6-15 are untouched.
+proc(forth_main)
+    push    rbx
+    push    rbp
+    push    rdi
+    push    rsi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+
+    ; Install Forth registers.
+    mov     UP,  r9
+    mov     [UP + user_HOST_RSP], rsp
+    mov     DSP, rdx
+    ; Restore the Forth return-stack pointer so any cells `>r` left
+    ; from a previous forth_main invocation are still visible. The
+    ; r8 argument (rsp_top) is ignored — the boot path seeds
+    ; user_RSP_CURRENT with rsp_top once, and the kernel maintains it
+    ; from then on.
+    mov     rsp, [UP + user_RSP_CURRENT]
+
+    ; Prologue: cache top-of-memory-stack into TOS, bump DSP.
+    mov     TOS, [DSP]
+    add     DSP, cell
+
+    ; Install a synthetic root catch/throw frame in the user area so
+    ; uncaught THROWs unwind back through forth_main without polluting
+    ; the live Forth return stack seen by rstack words.
+    mov     r10, [UP + user_HANDLER]
+    lea     r11, [UP + user_ROOT_HANDLER]
+    mov     [r11], r10
+    mov     [r11 + cell], DSP
+    lea     r10, [rip + .throw_return]
+    mov     [r11 + 2*cell], r10
+    mov     [UP + user_HANDLER], r11
+    mov     qword ptr [UP + user_THROW_CODE], 0
+
+    call    rcx
+
+    ; Normal return: tear down the root handler frame.
+    mov     r10, [UP + user_ROOT_HANDLER]
+    mov     [UP + user_HANDLER], r10
+    jmp     .spill_and_return
+
+.throw_return:
+    ; Uncaught THROW landed here. DSP was restored by THROW and TOS is
+    ; the throw code. Record it for the Rust host and restore the
+    ; outer Forth return stack pointer.
+    mov     [UP + user_THROW_CODE], TOS
+    mov     rsp, [UP + user_RSP_CURRENT]
+
+.spill_and_return:
+    ; Epilogue: spill TOS back to memory, leave DSP pointing at top.
+    sub     DSP, cell
+    mov     [DSP], TOS
+    mov     [UP + user_DSP_SAVE], DSP
+
+    ; Persist the Forth rstack pointer for the next call.
+    mov     [UP + user_RSP_CURRENT], rsp
+
+    ; Restore host's RSP and callee-saved regs.
+    mov     rsp, [UP + user_HOST_RSP]
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rsi
+    pop     rdi
+    pop     rbp
+    pop     rbx
+    xor     eax, eax
+    ret
+endp()

@@ -1,0 +1,2022 @@
+//! Integration tests covering the M3/M4 behaviour through both
+//! execution modes:
+//!
+//!   * `eval(text)` — full REPL pipeline (accept/parse/dispatch). Pins
+//!     the user-visible behaviour against regressions.
+//!
+//!   * `push(v)` + `call(asm_sym)` + `pop()` — direct primitive
+//!     invocation with no parser in the loop. Lets us test the
+//!     semantics of each primitive cell-accurately.
+//!
+//! Each `#[test]` owns its own `Wf64Session` so failures are isolated.
+
+use std::ffi::OsStr;
+use std::fs;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::arch::x86_64::__cpuid;
+
+use wf64::Wf64Session;
+
+/// One Wf64Session is built per test binary and shared across every
+/// test via `sess()`. Each `#[test]` call grabs the lock, gets a
+/// freshly-`reset()`-ed session, and drops the guard on the way out.
+///
+/// Why: each `with_kernel` boot does JASM expansion + LLVM module
+/// load + MCJIT finalize + extern binding + symbol registration + the
+/// 45-call dictionary bootstrap. With ~50 tests that boot cost dominated
+/// total run time many times over. Reusing the session collapses it to
+/// a one-time cost amortised across the suite, while `reset()` makes
+/// each test's view of the world look as if it had its own session.
+///
+/// Safety pre-condition: tests must run single-threaded. Enforced by
+/// `.cargo/config.toml` setting `RUST_TEST_THREADS = "1"`. The Mutex
+/// is uncontested in practice but provides the discipline anyway.
+static SHARED: OnceLock<Mutex<Wf64Session>> = OnceLock::new();
+
+fn sess() -> SessionGuard {
+    let m = SHARED.get_or_init(|| {
+        let kernel = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernel")
+            .join("main.masm");
+        Mutex::new(Wf64Session::with_kernel(kernel).expect("session boot"))
+    });
+    // `into_inner` salvages access from a poisoned mutex (i.e., a
+    // panicking test). The state is whatever the panicking test left
+    // behind; `reset()` makes that irrelevant before the next test
+    // touches it.
+    let mut guard = m.lock().unwrap_or_else(|p| p.into_inner());
+    guard.reset();
+    SessionGuard(guard)
+}
+
+/// Deref-mut wrapper so the existing `s.push()`, `s.call()`, `s.eval()`
+/// call sites compile unchanged.
+struct SessionGuard(MutexGuard<'static, Wf64Session>);
+impl Deref for SessionGuard {
+    type Target = Wf64Session;
+    fn deref(&self) -> &Wf64Session { &*self.0 }
+}
+impl DerefMut for SessionGuard {
+    fn deref_mut(&mut self) -> &mut Wf64Session { &mut *self.0 }
+}
+
+// ── eval-mode (full REPL pipeline) ───────────────────────────────────
+
+#[test]
+fn eval_empty_input_just_prints_ok() {
+    let mut s = sess();
+    // Empty line then EOF → one "ok" then implicit bye.
+    let out = s.eval("\n").unwrap();
+    assert_eq!(out, " ok\n");
+}
+
+#[test]
+fn eval_bye_terminates_cleanly() {
+    let mut s = sess();
+    let out = s.eval("bye\n").unwrap();
+    // bye runs *before* end-of-line, so we never print " ok" for this
+    // line. That's WF32 behaviour too.
+    assert_eq!(out, "");
+}
+
+#[test]
+fn eval_number_then_dot() {
+    let mut s = sess();
+    let out = s.eval("5 .\nbye\n").unwrap();
+    assert_eq!(out, "5  ok\n");
+}
+
+#[test]
+fn eval_arithmetic() {
+    let mut s = sess();
+    let out = s.eval("5 3 + .\n2 7 * .\nbye\n").unwrap();
+    assert_eq!(out, "8  ok\n14  ok\n");
+}
+
+#[test]
+fn eval_brk_and_int3_are_callable() {
+    let mut s = sess();
+    let out = s.eval("BRK\nINT3\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n");
+}
+
+#[test]
+fn eval_colon_def_square() {
+    let mut s = sess();
+    let out = s.eval(": square dup * ;\n5 square .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n25  ok\n");
+}
+
+#[test]
+fn eval_colon_without_name_throws_minus_16() {
+    let mut s = sess();
+    let err = s.eval(":\n").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -16"), "got {err:?}");
+}
+
+#[test]
+fn eval_nested_colon_defs() {
+    let mut s = sess();
+    let out = s
+        .eval(": double 2 * ;\n: quad double double ;\n3 quad .\nbye\n")
+        .unwrap();
+    assert_eq!(out, " ok\n ok\n12  ok\n");
+}
+
+#[test]
+fn eval_literal_inside_def() {
+    let mut s = sess();
+    let out = s.eval(": add5 5 + ;\n10 add5 .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n15  ok\n");
+}
+
+#[test]
+fn eval_brackets_and_literal_compile_interpreted_value() {
+    let mut s = sess();
+    let out = s.eval(": eleven [ 5 6 + ] literal ;\neleven .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n11  ok\n");
+}
+
+#[test]
+fn eval_tick_pushes_interpret_xt() {
+    let mut s = sess();
+    let out = s.eval("5 ' dup execute . .\nbye\n").unwrap();
+    assert_eq!(out, "5 5  ok\n");
+}
+
+#[test]
+fn eval_bracket_tick_compiles_xt_literal() {
+    let mut s = sess();
+    let out = s.eval(": run-dup ['] dup execute ;\n7 run-dup . .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n7 7  ok\n");
+}
+
+#[test]
+fn eval_immediate_and_postpone_enable_forth_defined_compiler_words() {
+    let mut s = sess();
+    let out = s.eval(": twice postpone dup postpone dup ; immediate\n: demo twice ;\n4 demo . . .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n4 4 4  ok\n");
+}
+
+#[test]
+fn eval_dot_s_prints_stack_live_without_consuming_it() {
+    let mut s = sess();
+    let out = s.eval("1 2 3 .s . . .\nbye\n").unwrap();
+    assert!(out.starts_with("[3 sp=0x"), "got {out:?}");
+    assert!(out.contains(" rp=0x"), "got {out:?}");
+    assert!(out.contains("] 3 2 1 3 2 1  ok\n"), "got {out:?}");
+}
+
+#[test]
+fn eval_forget_last_rolls_back_and_allows_regrowth_live() {
+    let mut s = sess();
+    let out = s.eval(": a 1 ;\na .\nforget_last\na\n: a 2 ;\na .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n1  ok\n ok\n?  ok\n ok\n2  ok\n");
+}
+
+#[test]
+fn eval_backslash_comment_ignores_rest_of_line() {
+    let mut s = sess();
+    let out = s.eval("1 \\ keep this out of the token stream\n2 + .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n3  ok\n");
+}
+
+#[test]
+fn eval_paren_comment_ignores_inline_text() {
+    let mut s = sess();
+    let out = s.eval("1 ( comment in source ) 2 + .\nbye\n").unwrap();
+    assert_eq!(out, "3  ok\n");
+}
+
+#[test]
+fn load_source_file_makes_saved_words_available() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("5 square .\n3 cube .\n2 quad .\n2 sixth .\nbye\n").unwrap();
+    assert_eq!(out, "25  ok\n27  ok\n16  ok\n64  ok\n");
+}
+
+#[test]
+fn load_source_file_supports_live_growth_after_startup() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval(": sixth quad square ;\n2 sixth .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n256  ok\n");
+}
+
+#[test]
+fn load_source_file_provides_bl_space_and_spaces() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("bl .\nspace 88 emit\n3 spaces 89 emit\n-2 spaces 90 emit\nbye\n").unwrap();
+    assert_eq!(out, "32  ok\n X ok\n   Y ok\nZ ok\n");
+}
+
+#[test]
+fn load_source_file_provides_variable_defining_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("variable foo\n7 foo !\nfoo @ .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n7  ok\n");
+}
+
+#[test]
+fn load_source_file_provides_constant_defining_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("10 constant ten\nten .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n10  ok\n");
+}
+
+#[test]
+fn load_source_file_provides_value_defining_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("5 value five\nfive .\n: use-five five ;\nuse-five .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n5  ok\n ok\n5  ok\n");
+}
+
+#[test]
+fn load_source_file_provides_defer_defining_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval("defer hook\n' dup ' hook defer!\n7 hook . .\n: run-hook hook ;\n9 run-hook . .\nbye\n")
+        .unwrap();
+    assert_eq!(out, " ok\n ok\n7 7  ok\n ok\n9 9  ok\n");
+}
+
+#[test]
+fn load_source_file_defer_defaults_to_uninitialized_throw() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let err = s.eval("defer hook\nhook\nbye\n").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -261"), "got {err:?}");
+}
+
+#[test]
+fn eval_here_and_allot_move_dictionary_pointer() {
+    let mut s = sess();
+    let out = s.eval("here here 1 cells allot here rot - . drop\nbye\n").unwrap();
+    assert_eq!(out, "8  ok\n");
+}
+
+#[test]
+fn eval_source_defined_variable_roundtrips_through_fetch_store() {
+    let mut s = sess();
+    let out = s.eval(": , here ! 1 cells allot ;\n: align here aligned here - allot ;\n: variable create 0 , ;\nvariable foo\n7 foo !\nfoo @ .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n7  ok\n");
+}
+
+#[test]
+fn eval_does_builder_word_customizes_created_runtime() {
+    let mut s = sess();
+    let out = s.eval(": , here ! 1 cells allot ;\n: constant create , does> @ ;\n10 constant ten\nten .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n10  ok\n");
+}
+
+#[test]
+fn eval_colon_defs_register_debug_words() {
+    let mut s = sess();
+    let out = s.eval(": square dup * ;\n: quad square square ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n");
+
+    let words = s.debug_words();
+    assert_eq!(words.len(), 2);
+
+    let square = words.iter().find(|(name, _, _)| name == "square").unwrap();
+    let quad = words.iter().find(|(name, _, _)| name == "quad").unwrap();
+
+    assert!(square.1 < square.2);
+    assert!(quad.1 < quad.2);
+    assert_eq!(s.resolve_word_addr(square.1).as_deref(), Some("square"));
+    assert_eq!(s.resolve_word_addr(square.1 + 1).as_deref(), Some("square+0x1"));
+    assert_eq!(s.resolve_word_addr(quad.1).as_deref(), Some("quad"));
+
+    s.reset();
+    assert!(s.debug_words().is_empty());
+    assert!(s.resolve_word_addr(square.1).is_none());
+}
+
+#[test]
+fn eval_create_without_name_throws_minus_16() {
+    let mut s = sess();
+    let err = s.eval("create\n").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -16"), "got {err:?}");
+}
+
+#[test]
+fn eval_semicolon_in_interpret_state_throws_minus_14() {
+    let mut s = sess();
+    let err = s.eval(";\n").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+}
+
+#[test]
+fn eval_unknown_word_prints_question_mark() {
+    let mut s = sess();
+    let out = s.eval("nonsuch\nbye\n").unwrap();
+    assert_eq!(out, "?  ok\n");
+}
+
+#[test]
+fn eval_session_is_reusable_across_calls() {
+    // Two consecutive evals on the same session: the dict from the
+    // first call must survive into the second.
+    let mut s = sess();
+    let out1 = s.eval(": triple 3 * ;\n").unwrap();
+    assert_eq!(out1, " ok\n");
+    let out2 = s.eval("4 triple .\nbye\n").unwrap();
+    assert_eq!(out2, "12  ok\n");
+}
+
+// ── direct-stack mode ────────────────────────────────────────────────
+
+#[test]
+fn direct_push_pop_round_trip() {
+    let mut s = sess();
+    s.push(42);
+    s.push(-17);
+    assert_eq!(s.depth(), 2);
+    assert_eq!(s.stack(), vec![-17, 42]);  // top first
+    assert_eq!(s.pop(), -17);
+    assert_eq!(s.pop(), 42);
+    assert_eq!(s.depth(), 0);
+}
+
+#[test]
+fn direct_dup() {
+    let mut s = sess();
+    s.push(7);
+    s.call("dup_").unwrap();
+    assert_eq!(s.stack(), vec![7, 7]);
+}
+
+#[test]
+fn direct_drop() {
+    let mut s = sess();
+    s.push(11);
+    s.push(22);
+    s.call("drop_").unwrap();
+    assert_eq!(s.stack(), vec![11]);
+}
+
+#[test]
+fn direct_swap() {
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.call("swap_").unwrap();
+    assert_eq!(s.stack(), vec![1, 2]);
+}
+
+#[test]
+fn direct_over() {
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.call("over_").unwrap();
+    assert_eq!(s.stack(), vec![1, 2, 1]);
+}
+
+#[test]
+fn direct_plus() {
+    let mut s = sess();
+    s.push(40);
+    s.push(2);
+    s.call("plus").unwrap();
+    assert_eq!(s.stack(), vec![42]);
+}
+
+#[test]
+fn direct_times() {
+    let mut s = sess();
+    s.push(6);
+    s.push(7);
+    s.call("times").unwrap();
+    assert_eq!(s.stack(), vec![42]);
+}
+
+#[test]
+fn direct_times_signed() {
+    let mut s = sess();
+    s.push(-3);
+    s.push(5);
+    s.call("times").unwrap();
+    assert_eq!(s.stack(), vec![-15]);
+}
+
+#[test]
+fn direct_perform_dispatches_xt_loaded_from_memory() {
+    let mut s = sess();
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+    let xt_slot = (s.user_base + 0x180) as i64;
+
+    s.push(dup_xt);
+    s.push(xt_slot);
+    s.call("store").unwrap();
+    assert_eq!(s.depth(), 0);
+
+    s.push(42);
+    s.push(xt_slot);
+    s.call("perform").unwrap();
+    assert_eq!(s.stack(), vec![42, 42]);
+}
+
+#[test]
+fn direct_catch_returns_zero_on_success() {
+    let mut s = sess();
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+
+    s.push(7);
+    s.push(dup_xt);
+    s.call("catch_word").unwrap();
+    assert_eq!(s.stack(), vec![0, 7, 7]);
+}
+
+#[test]
+fn direct_catch_returns_throw_code() {
+    let mut s = sess();
+    let throw_xt = s.xt_of("throw_word").unwrap() as i64;
+
+    s.push(-31);
+    s.push(throw_xt);
+    s.call("catch_word").unwrap();
+    assert_eq!(s.stack(), vec![-31, -31]);
+}
+
+#[test]
+fn direct_uncaught_throw_returns_error_to_host() {
+    let mut s = sess();
+    s.push(-31);
+    let err = s.call("throw_word").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -31"), "got {err:?}");
+}
+
+#[test]
+fn direct_qthrow_drops_inputs_when_flag_is_zero() {
+    let mut s = sess();
+    s.push(99);
+    s.push(0);
+    s.push(-31);
+    s.call("qthrow_word").unwrap();
+    assert_eq!(s.stack(), vec![99]);
+}
+
+#[test]
+fn direct_qthrow_throws_when_flag_is_nonzero() {
+    let mut s = sess();
+    let qthrow_xt = s.xt_of("qthrow_word").unwrap() as i64;
+
+    s.push(1);
+    s.push(-31);
+    s.push(qthrow_xt);
+    s.call("catch_word").unwrap();
+    assert_eq!(s.stack(), vec![-31, -31, 1]);
+}
+
+#[test]
+fn direct_abort_returns_error_to_host() {
+    let mut s = sess();
+    let err = s.call("abort_word").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -1"), "got {err:?}");
+}
+
+#[test]
+fn direct_named_throw_constants_push_expected_codes() {
+    let mut s = sess();
+
+    s.call("throw_abort_const").unwrap();
+    assert_eq!(s.pop(), -1);
+
+    s.call("throw_abortq_const").unwrap();
+    assert_eq!(s.pop(), -2);
+
+    s.call("throw_componly_const").unwrap();
+    assert_eq!(s.pop(), -14);
+
+    s.call("throw_namereqd_const").unwrap();
+    assert_eq!(s.pop(), -16);
+
+    s.call("throw_mismatch_const").unwrap();
+    assert_eq!(s.pop(), -22);
+}
+
+#[test]
+fn direct_comp_only_throws_minus_14() {
+    let mut s = sess();
+    let comp_only_xt = s.xt_of("comp_only_word").unwrap() as i64;
+
+    s.push(comp_only_xt);
+    s.call("catch_word").unwrap();
+    assert_eq!(s.stack(), vec![-14]);
+}
+
+#[test]
+fn direct_cpuid_writes_expected_register_block() {
+    let mut s = sess();
+    let buf = (s.user_base + 0x1a0) as i64;
+    let expected = __cpuid(0);
+
+    s.push(buf);
+    s.push(0);
+    s.call("cpuid_word").unwrap();
+    assert_eq!(s.depth(), 0);
+
+    s.push(buf);
+    s.call("l_fetch").unwrap();
+    assert_eq!(s.pop() as u32, expected.eax);
+
+    s.push(buf + 4);
+    s.call("l_fetch").unwrap();
+    assert_eq!(s.pop() as u32, expected.ebx);
+
+    s.push(buf + 8);
+    s.call("l_fetch").unwrap();
+    assert_eq!(s.pop() as u32, expected.ecx);
+
+    s.push(buf + 12);
+    s.call("l_fetch").unwrap();
+    assert_eq!(s.pop() as u32, expected.edx);
+}
+
+#[test]
+fn direct_rdtsc_returns_a_nondecreasing_counter() {
+    let mut s = sess();
+
+    s.call("rdtsc_word").unwrap();
+    let hi1 = s.pop() as u64;
+    let lo1 = s.pop() as u64;
+    let t1 = (hi1 << 32) | (lo1 & 0xffff_ffff);
+
+    s.call("rdtsc_word").unwrap();
+    let hi2 = s.pop() as u64;
+    let lo2 = s.pop() as u64;
+    let t2 = (hi2 << 32) | (lo2 & 0xffff_ffff);
+
+    assert!(t1 > 0);
+    assert!(t2 >= t1);
+}
+
+#[test]
+fn direct_rot_three_items() {
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.push(3);
+    s.call("rot_").unwrap();
+    // ( 1 2 3 -- 2 3 1 ); top first → [1, 3, 2]
+    assert_eq!(s.stack(), vec![1, 3, 2]);
+}
+
+#[test]
+fn direct_nip() {
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.call("nip_").unwrap();
+    assert_eq!(s.stack(), vec![2]);
+}
+
+#[test]
+fn direct_tuck() {
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.call("tuck_").unwrap();
+    // ( 1 2 -- 2 1 2 ); top first → [2, 1, 2]
+    assert_eq!(s.stack(), vec![2, 1, 2]);
+}
+
+#[test]
+fn direct_neg_rot() {
+    // -rot: ( n1 n2 n3 -- n3 n1 n2 )
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.push(3);
+    s.call("neg_rot").unwrap();
+    // After -rot: top first → [2, 1, 3]
+    assert_eq!(s.stack(), vec![2, 1, 3]);
+}
+
+#[test]
+fn direct_qdup_zero_does_nothing() {
+    let mut s = sess();
+    s.push(0);
+    s.call("qdup").unwrap();
+    assert_eq!(s.stack(), vec![0]);
+}
+
+#[test]
+fn direct_qdup_nonzero_duplicates() {
+    let mut s = sess();
+    s.push(99);
+    s.call("qdup").unwrap();
+    assert_eq!(s.stack(), vec![99, 99]);
+}
+
+#[test]
+fn direct_pick_zero_is_dup() {
+    let mut s = sess();
+    s.push(11);
+    s.push(22);
+    s.push(0);
+    s.call("pick").unwrap();
+    // ( 11 22 0 -- 11 22 22 )
+    assert_eq!(s.stack(), vec![22, 22, 11]);
+}
+
+#[test]
+fn direct_pick_one_is_over() {
+    let mut s = sess();
+    s.push(11);
+    s.push(22);
+    s.push(1);
+    s.call("pick").unwrap();
+    // ( 11 22 1 -- 11 22 11 )
+    assert_eq!(s.stack(), vec![11, 22, 11]);
+}
+
+#[test]
+fn direct_pick_two() {
+    let mut s = sess();
+    s.push(10);
+    s.push(20);
+    s.push(30);
+    s.push(2);
+    s.call("pick").unwrap();
+    // ( 10 20 30 2 -- 10 20 30 10 )
+    assert_eq!(s.stack(), vec![10, 30, 20, 10]);
+}
+
+#[test]
+fn direct_depth_counts_cells() {
+    let mut s = sess();
+    // Phase 1: empty stack — `depth` should push 0.
+    assert_eq!(s.depth(), 0);
+    s.call("depth").unwrap();
+    assert_eq!(s.stack(), vec![0]);
+
+    // Phase 2: three values — `depth` should push 3 on top of them.
+    // (Used to re-call `sess()` here — under the shared-session harness
+    // that's a self-deadlock. `reset()` does the same thing without
+    // releasing the lock.)
+    s.reset();
+    s.push(10);
+    s.push(20);
+    s.push(30);
+    s.call("depth").unwrap();
+    // ( 10 20 30 -- 10 20 30 3 )
+    assert_eq!(s.stack(), vec![3, 30, 20, 10]);
+}
+
+// ── return-stack primitives ──────────────────────────────────────────
+
+#[test]
+fn direct_to_r_then_r_from_roundtrips() {
+    let mut s = sess();
+    s.push(42);
+    s.call("to_r").unwrap();
+    assert_eq!(s.depth(), 0);
+    s.call("r_from").unwrap();
+    assert_eq!(s.stack(), vec![42]);
+}
+
+#[test]
+fn direct_r_fetch_peeks_without_popping() {
+    let mut s = sess();
+    s.push(99);
+    s.call("to_r").unwrap();
+    s.call("r_fetch").unwrap();
+    // ( -- 99 ); r-stack still has 99.
+    assert_eq!(s.stack(), vec![99]);
+    s.call("r_from").unwrap();
+    assert_eq!(s.stack(), vec![99, 99]);
+}
+
+#[test]
+fn direct_dup_to_r_keeps_data_stack_value() {
+    let mut s = sess();
+    s.push(7);
+    s.call("dup_to_r").unwrap();
+    // data stack still has 7, r-stack also has 7.
+    assert_eq!(s.stack(), vec![7]);
+    s.call("r_from").unwrap();
+    assert_eq!(s.stack(), vec![7, 7]);
+}
+
+#[test]
+fn direct_rdrop_clears_rstack_only() {
+    let mut s = sess();
+    s.push(11);
+    s.call("to_r").unwrap();
+    s.push(22);  // unrelated cell on data stack
+    s.call("rdrop").unwrap();
+    assert_eq!(s.stack(), vec![22]);
+}
+
+#[test]
+fn direct_two_to_r_and_two_r_from_roundtrip() {
+    let mut s = sess();
+    s.push(100);
+    s.push(200);
+    s.call("two_to_r").unwrap();
+    assert_eq!(s.depth(), 0);
+    s.call("two_r_from").unwrap();
+    assert_eq!(s.stack(), vec![200, 100]);  // top = 200, NOS = 100
+}
+
+#[test]
+fn direct_two_r_fetch_peeks_pair() {
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.call("two_to_r").unwrap();
+    s.call("two_r_fetch").unwrap();
+    // ( -- 1 2 ); r-stack still has the pair.
+    assert_eq!(s.stack(), vec![2, 1]);
+    s.call("two_r_from").unwrap();
+    assert_eq!(s.stack(), vec![2, 1, 2, 1]);
+}
+
+#[test]
+fn direct_i_reads_top_loop_frame_sum() {
+    let mut s = sess();
+    s.push(30);
+    s.push(70);
+    s.call("two_to_r").unwrap();
+    s.call("i_word").unwrap();
+    assert_eq!(s.stack(), vec![100]);
+}
+
+#[test]
+fn direct_j_reads_next_outer_loop_frame_sum() {
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.call("two_to_r").unwrap();
+    s.push(10);
+    s.push(20);
+    s.call("two_to_r").unwrap();
+    s.call("j_word").unwrap();
+    assert_eq!(s.stack(), vec![3]);
+}
+
+#[test]
+fn direct_do_part_helpers_build_top_loop_frame() {
+    let mut s = sess();
+    s.push(20);
+    s.push(10);
+    s.call("do_part1").unwrap();
+    assert_eq!(s.depth(), 0);
+    s.call("do_part2").unwrap();
+    s.call("i_word").unwrap();
+    assert_eq!(s.stack(), vec![10]);
+}
+
+#[test]
+fn direct_nested_do_part_helpers_make_j_visible() {
+    let mut s = sess();
+    s.push(20);
+    s.push(3);
+    s.call("do_part1").unwrap();
+    s.call("do_part2").unwrap();
+    s.push(50);
+    s.push(10);
+    s.call("do_part1").unwrap();
+    s.call("do_part2").unwrap();
+    s.call("j_word").unwrap();
+    assert_eq!(s.stack(), vec![3]);
+}
+
+#[test]
+fn direct_mark_to_returns_current_here() {
+    let mut s = sess();
+    let here = s.here();
+    s.call("mark_to").unwrap();
+    assert_eq!(s.pop() as u64, here);
+}
+
+#[test]
+fn direct_forward_resolve_patches_rel32_from_mark_to_here() {
+    let mut s = sess();
+    s.push(0);
+    s.call("inline_bra_comp").unwrap();
+    s.call("mark_to").unwrap();
+    let orig = s.pop() as u64;
+
+    s.push(0);
+    s.call("inline_bra_comp").unwrap();
+    let here = s.here();
+
+    s.push(orig as i64);
+    s.call("forward_resolve").unwrap();
+
+    let disp = unsafe { ((orig - 4) as *const i32).read_unaligned() };
+    assert_eq!(disp as i64, here as i64 - orig as i64);
+}
+
+#[test]
+fn direct_back_resolve_patches_current_rel32_back_to_dest() {
+    let mut s = sess();
+    let dest = s.here();
+
+    s.push(0);
+    s.call("inline_bra_comp").unwrap();
+    let here = s.here();
+
+    s.push(dest as i64);
+    s.call("back_resolve").unwrap();
+
+    let disp = unsafe { ((here - 4) as *const i32).read_unaligned() };
+    assert_eq!(disp as i64, dest as i64 - here as i64);
+}
+
+#[test]
+fn direct_qpairs_drops_matching_marks() {
+    let mut s = sess();
+    s.push(-2);
+    s.push(-2);
+    s.call("qpairs").unwrap();
+    assert!(s.stack().is_empty());
+}
+
+#[test]
+fn direct_qpairs_throws_minus_22_on_mismatch() {
+    let mut s = sess();
+    let qpairs_xt = s.xt_of("qpairs").unwrap() as i64;
+    s.push(-1);
+    s.push(-2);
+    s.push(qpairs_xt);
+    s.call("catch_word").unwrap();
+    assert_eq!(s.pop(), -22);
+}
+
+#[test]
+fn direct_leave_under_if_restores_control_stack_shape() {
+    const USER_STATE: u64 = 0x08;
+
+    let mut s = sess();
+    let state_addr = (s.user_base + USER_STATE) as i64;
+    s.push(1);
+    s.push(state_addr);
+    s.call("store").unwrap();
+
+    let do_addr = 0x1111_i64;
+    let if_orig = 0x2222_i64;
+    s.push(do_addr);
+    s.push(-3);
+    s.push(if_orig);
+    s.push(-1);
+
+    s.call("leave_word").unwrap();
+    let stack = s.stack();
+    assert_eq!(&stack[..5], &[-1, if_orig, -3, do_addr, -5]);
+    assert_eq!(stack[5] as u64, s.here());
+}
+
+#[test]
+fn direct_high_level_control_words_are_compile_only() {
+    let mut s = sess();
+    let cases = [
+        "ahead_word",
+        "if_word",
+        "minus_if_word",
+        "then_word",
+        "else_word",
+        "begin_word",
+        "while_word",
+        "again_word",
+        "until_word",
+        "repeat_word",
+        "recurse_word",
+        "do_word",
+        "qdo_control_word",
+        "loop_control_word",
+        "plus_loop_control_word",
+        "minus_loop_control_word",
+        "leave_word",
+        "qleave_word",
+    ];
+
+    for asm in cases {
+        let xt = s.xt_of(asm).unwrap() as i64;
+        s.push(xt);
+        s.call("catch_word").unwrap();
+        assert_eq!(s.pop(), -14, "{asm} should THROW -14 outside compile state");
+    }
+}
+
+#[test]
+fn direct_raw_control_emitters_are_compile_only() {
+    let mut s = sess();
+    let cases = [
+        "bra_word",
+        "qbra_word",
+        "minus_qbra_word",
+        "bra_qdo_word",
+        "loop_word",
+        "plus_loop_word",
+        "minus_loop_word",
+    ];
+
+    for asm in cases {
+        let xt = s.xt_of(asm).unwrap() as i64;
+        s.push(xt);
+        s.call("catch_word").unwrap();
+        assert_eq!(s.pop(), -14, "{asm} should THROW -14 outside compile state");
+    }
+}
+
+#[test]
+fn direct_n_to_r_then_nr_from_roundtrip() {
+    let mut s = sess();
+    s.push(10);
+    s.push(20);
+    s.push(2);
+    s.call("n_to_r").unwrap();
+    assert_eq!(s.depth(), 0);
+
+    s.call("nr_from").unwrap();
+    assert_eq!(s.stack(), vec![2, 20, 10]);
+}
+
+#[test]
+fn direct_n_to_r_and_nr_from_preserve_deeper_stack() {
+    let mut s = sess();
+    s.push(99);
+    s.push(10);
+    s.push(20);
+    s.push(2);
+    s.call("n_to_r").unwrap();
+    assert_eq!(s.stack(), vec![99]);
+
+    s.call("nr_from").unwrap();
+    assert_eq!(s.stack(), vec![2, 20, 10, 99]);
+}
+
+#[test]
+fn direct_two_rdrop_clears_pair() {
+    let mut s = sess();
+    s.push(1);
+    s.push(2);
+    s.call("two_to_r").unwrap();
+    s.push(99);
+    s.call("two_rdrop").unwrap();
+    assert_eq!(s.stack(), vec![99]);
+}
+
+#[test]
+fn eval_to_r_through_repl() {
+    // Round-trip through the return stack from inside a compiled word.
+    // dup so the inner `.` has something to print; >r/r> shuttle the
+    // copy so the outer `.` finds it again. The two "5 "s prove both
+    // halves of the trip survived a compiled-body context (which is
+    // where the rstack-juggle in to_r/r_from gets exercised hardest).
+    let mut s = sess();
+    let out = s.eval(": ferry dup >r . r> ;\n5 ferry .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n5 5  ok\n");
+}
+
+#[test]
+fn direct_sp_fetch_returns_address() {
+    let mut s = sess();
+    s.push(10);
+    s.push(20);
+    s.call("sp_fetch").unwrap();
+    let top = s.pop();
+    // The pushed address should be within the data stack region and
+    // very near current dsp (off by exactly one cell because sp@
+    // first reserves a cell, then writes its result).
+    let region_lo = s.user_base - 0x80000;  // base of region
+    assert!((top as u64) > region_lo);
+    assert!((top as u64) <= s.dsp_top);
+    // The remaining stack should be the two original values.
+    assert_eq!(s.stack(), vec![20, 10]);
+}
+
+#[test]
+fn eval_depth_via_interpreter() {
+    let mut s = sess();
+    let out = s.eval("1 2 3 depth . . . . .\nbye\n").unwrap();
+    // Pushes 1 2 3 then depth=3. Dots print top first: 3 3 2 1 + one
+    // garbage cell from underflow. We just check the first 4 prints.
+    assert!(out.starts_with("3 3 2 1 "), "got {out:?}");
+}
+
+// ── memory primitives via direct invocation ─────────────────────────
+
+#[test]
+fn direct_fetch_store_cell() {
+    let mut s = sess();
+    // Use a PAD slot at user_base+0x100 for scratch.
+    let scratch = s.user_base + 0x100;
+    s.push(0xdeadbeef);
+    s.push(scratch as i64);
+    s.call("store").unwrap();   // ( v addr -- )
+    assert_eq!(s.depth(), 0);
+    s.push(scratch as i64);
+    s.call("fetch").unwrap();   // ( addr -- v )
+    assert_eq!(s.pop(), 0xdeadbeef);
+}
+
+#[test]
+fn direct_c_fetch_store() {
+    let mut s = sess();
+    let scratch = s.user_base + 0x110;
+    s.push(0x5a);
+    s.push(scratch as i64);
+    s.call("c_store").unwrap();
+    s.push(scratch as i64);
+    s.call("c_fetch").unwrap();
+    assert_eq!(s.pop(), 0x5a);
+}
+
+// ── mixed: build via eval, then poke via direct ─────────────────────
+
+// ── dictionary primitives (Phase 2) ─────────────────────────────────
+
+#[test]
+fn create_and_set_xt_builds_a_callable_header() {
+    // Drive the kernel-side dict primitives directly: build a fake
+    // header pointing at `dup_` and named "FOO", then call FOO via the
+    // REPL and confirm it duplicates.
+    let mut s = sess();
+    let pad = s.user_base + 0x100;
+    let name = b"FOO";
+    unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len()); }
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("create").unwrap();
+    let dup_xt = s.xt_of("dup_").unwrap();
+    s.push(dup_xt as i64);
+    s.call("set_xt").unwrap();
+    assert_eq!(s.depth(), 0);
+    // Now FOO should be in the dict, with the same effect as DUP.
+    let out = s.eval("7 FOO . .\nbye\n").unwrap();
+    assert_eq!(out, "7 7  ok\n");
+}
+
+#[test]
+fn to_name_resolves_primitive_xt_to_counted_name() {
+    let mut s = sess();
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+
+    s.push(dup_xt);
+    s.call("to_name").unwrap();
+    let nt = s.pop() as u64;
+
+    let len = unsafe { (nt as *const u8).read() };
+    let bytes = unsafe { std::slice::from_raw_parts((nt + 1) as *const u8, len as usize) };
+    assert_eq!(len, 3);
+    assert_eq!(bytes, b"dup");
+}
+
+#[test]
+fn primitive_xt_has_ct_backoffset_slot() {
+    const DH_CT: u64 = 8;
+
+    let mut s = sess();
+    let dup_xt = s.xt_of("dup_").unwrap() as u64;
+    s.push(dup_xt as i64);
+    s.call("to_name").unwrap();
+    let nt = s.pop() as u64;
+    let ct = nt - ((5 * 8) + 2 + 2 + 2 + 1) + DH_CT;
+    let backoff = unsafe { ((dup_xt - 8) as *const i64).read() };
+
+    assert_eq!(dup_xt.wrapping_add_signed(backoff), ct);
+}
+
+#[test]
+fn colon_defined_latestxt_has_ct_backoffset_slot() {
+    const DH_CT: u64 = 8;
+    const DH_NT: u64 = (5 * 8) + 2 + 2 + 2 + 1;
+
+    let mut s = sess();
+    let out = s.eval(": quux 1 ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let backoff = unsafe { ((xt - 8) as *const i64).read() };
+    let ct = xt.wrapping_add_signed(backoff);
+    let nt = ct - DH_CT + DH_NT;
+    let len = unsafe { (nt as *const u8).read() };
+    let bytes = unsafe { std::slice::from_raw_parts((nt + 1) as *const u8, len as usize) };
+
+    assert_eq!(bytes, b"quux");
+
+    s.push(xt as i64);
+    s.call("to_name").unwrap();
+    let nt_from_to_name = s.pop() as u64;
+    assert_eq!(nt_from_to_name, nt);
+}
+
+#[test]
+fn to_ct_and_to_comp_recover_header_fields_from_xt() {
+    const DH_CT: u64 = 8;
+    const DH_COMP: u64 = 24;
+
+    let mut s = sess();
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+
+    s.push(dup_xt);
+    s.call("to_name").unwrap();
+    let nt = s.pop() as u64;
+    let expected_ct = nt - ((5 * 8) + 2 + 2 + 2 + 1) + DH_CT;
+
+    s.push(dup_xt);
+    s.call("to_ct").unwrap();
+    assert_eq!(s.pop() as u64, expected_ct);
+
+    s.push(dup_xt);
+    s.call("to_comp").unwrap();
+    assert_eq!(s.pop() as u64, expected_ct - DH_CT + DH_COMP);
+}
+
+#[test]
+fn dup_primitive_comp_field_points_to_inline_dup_helper() {
+    let mut s = sess();
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+    let inline_dup_xt = s.xt_of("inline_dup_comp").unwrap() as i64;
+
+    s.push(dup_xt);
+    s.call("to_comp").unwrap();
+    s.call("fetch").unwrap();
+    assert_eq!(s.pop(), inline_dup_xt);
+}
+
+#[test]
+fn simple_stack_primitives_comp_fields_point_to_inline_helpers() {
+    let mut s = sess();
+
+    let cases = [
+        ("drop_", "inline_drop_comp"),
+        ("swap_", "inline_swap_comp"),
+        ("over_", "inline_over_comp"),
+    ];
+
+    for (word_xt, comp_xt) in cases {
+        let xt = s.xt_of(word_xt).unwrap() as i64;
+        let helper = s.xt_of(comp_xt).unwrap() as i64;
+        s.push(xt);
+        s.call("to_comp").unwrap();
+        s.call("fetch").unwrap();
+        assert_eq!(s.pop(), helper, "wrong comp helper for {word_xt}");
+    }
+}
+
+#[test]
+fn return_stack_primitives_comp_fields_point_to_inline_helpers() {
+    let mut s = sess();
+
+    let cases = [
+        ("to_r", "inline_to_r_comp"),
+        ("r_from", "inline_r_from_comp"),
+        ("r_fetch", "inline_r_fetch_comp"),
+        ("two_to_r", "inline_two_to_r_comp"),
+        ("two_r_from", "inline_two_r_from_comp"),
+        ("two_r_fetch", "inline_two_r_fetch_comp"),
+        ("i_word", "inline_i_comp"),
+        ("j_word", "inline_j_comp"),
+        ("do_part1", "inline_do_part1_comp"),
+        ("do_part2", "inline_do_part2_comp"),
+        ("bra_word", "inline_bra_comp"),
+        ("qbra_word", "inline_qbra_comp"),
+        ("minus_qbra_word", "inline_minus_qbra_comp"),
+        ("bra_qdo_word", "inline_bra_qdo_comp"),
+        ("loop_word", "inline_loop_comp"),
+        ("plus_loop_word", "inline_plus_loop_comp"),
+        ("minus_loop_word", "inline_minus_loop_comp"),
+    ];
+
+    for (word_xt, comp_xt) in cases {
+        let xt = s.xt_of(word_xt).unwrap() as i64;
+        let helper = s.xt_of(comp_xt).unwrap() as i64;
+        s.push(xt);
+        s.call("to_comp").unwrap();
+        s.call("fetch").unwrap();
+        assert_eq!(s.pop(), helper, "wrong comp helper for {word_xt}");
+    }
+}
+
+#[test]
+fn eval_i_and_j_through_nested_rstack_frames() {
+    let mut s = sess();
+    let out = s.eval(": ijtest 1 2 2>r 10 20 2>r i . j . 2r> 2drop 2r> 2drop ;\nijtest\nbye\n").unwrap();
+    assert_eq!(out, " ok\n30 3  ok\n");
+}
+
+#[test]
+fn eval_do_part_helpers_feed_i_and_j() {
+    let mut s = sess();
+    let out = s.eval(": dijtest 20 3 do-part1 do-part2 50 10 do-part1 do-part2 i . j . 2rdrop 2rdrop ;\ndijtest\nbye\n").unwrap();
+    assert_eq!(out, " ok\n10 3  ok\n");
+}
+
+#[test]
+fn compiled_raw_branch_emitters_have_expected_bytes() {
+    let mut s = sess();
+    let out = s.eval(": rawcf bra ?bra -?bra bra-?do ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 5 + 17 + 9 + 9 + 1) };
+    assert_eq!(&bytes[0..5], &[0xE9, 0, 0, 0, 0]);
+    assert_eq!(&bytes[5..22], &[0x48, 0x83, 0xC5, 0x08, 0x48, 0x85, 0xC0, 0x48, 0x8B, 0x45, 0xF8, 0x0F, 0x84, 0, 0, 0, 0]);
+    assert_eq!(&bytes[22..31], &[0x48, 0x85, 0xC0, 0x0F, 0x84, 0, 0, 0, 0]);
+    assert_eq!(&bytes[31..40], &[0x48, 0x39, 0xCA, 0x0F, 0x84, 0, 0, 0, 0]);
+    assert_eq!(bytes[40], 0xC3);
+}
+
+#[test]
+fn eval_raw_branch_placeholders_preserve_stack_effects() {
+    let mut s = sess();
+    let out = s.eval(
+        ": bra-test bra 7 ;\n\
+         : qbra-test ?bra depth ;\n\
+         : nqbra-test -?bra depth swap drop ;\n\
+         bra-test .\n\
+         0 qbra-test .\n\
+         5 qbra-test .\n\
+         0 nqbra-test .\n\
+         5 nqbra-test .\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n7  ok\n0  ok\n0  ok\n1  ok\n1  ok\n");
+}
+
+#[test]
+fn eval_compiled_loop_steps_update_i() {
+    let mut s = sess();
+    let out = s.eval(
+        ": step1 20 3 do-part1 do-part2 _loop i . 2rdrop ;\n\
+         : stepplus 20 3 do-part1 do-part2 2 _+loop i . 2rdrop ;\n\
+         : stepminus 20 10 do-part1 do-part2 2 _-loop i . 2rdrop ;\n\
+         step1\n\
+         stepplus\n\
+         stepminus\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n4  ok\n5  ok\n8  ok\n");
+}
+
+#[test]
+fn eval_if_else_then_and_minus_if_work() {
+    let mut s = sess();
+    let out = s.eval(
+        ": choose if 111 else 222 then ;\n\
+         : keepflag -if 7 else 9 then ;\n\
+         0 choose .\n\
+         5 choose .\n\
+         0 keepflag . .\n\
+         5 keepflag . .\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n222  ok\n111  ok\n9 0  ok\n7 5  ok\n");
+}
+
+#[test]
+fn eval_begin_until_loops() {
+    let mut s = sess();
+    let out = s.eval(": down0 begin 1- dup 0= until ;\n3 down0 .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n0  ok\n");
+}
+
+#[test]
+fn eval_begin_while_repeat_loops() {
+    let mut s = sess();
+    let out = s.eval(": peel begin dup while 1- repeat ;\n3 peel .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n0  ok\n");
+}
+
+#[test]
+fn eval_recurse_compiles_current_definition() {
+    let mut s = sess();
+    let out = s.eval(": count0 dup 0= if drop 0 else 1- recurse 1+ then ;\n3 count0 .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n3  ok\n");
+}
+
+#[test]
+fn eval_do_loop_counts_up() {
+    let mut s = sess();
+    let out = s.eval(": countup 5 0 do i . loop ;\ncountup\nbye\n").unwrap();
+    assert_eq!(out, " ok\n0 1 2 3 4  ok\n");
+}
+
+#[test]
+fn eval_qdo_skips_zero_trip_and_runs_nonzero_trip() {
+    let mut s = sess();
+    let out = s.eval(
+        ": maybecount 0 ?do i . loop ;\n\
+         5 maybecount\n\
+         0 maybecount\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n0 1 2 3 4  ok\n ok\n");
+}
+
+#[test]
+fn eval_plus_loop_steps_by_stride() {
+    let mut s = sess();
+    let out = s.eval(": evens 10 0 do i . 2 +loop ;\nevens\nbye\n").unwrap();
+    assert_eq!(out, " ok\n0 2 4 6 8  ok\n");
+}
+
+#[test]
+fn eval_minus_loop_counts_down() {
+    let mut s = sess();
+    let out = s.eval(": countdown 0 5 do i . 1 -loop ;\ncountdown\nbye\n").unwrap();
+    assert_eq!(out, " ok\n5 4 3 2 1 0  ok\n");
+}
+
+#[test]
+fn eval_leave_exits_loop_early() {
+    let mut s = sess();
+    let out = s.eval(": quit-at-2 5 0 do i . i 2 = if leave then loop ;\nquit-at-2\nbye\n").unwrap();
+    assert_eq!(out, " ok\n0 1 2  ok\n");
+}
+
+#[test]
+fn eval_qleave_exits_when_flag_is_true() {
+    let mut s = sess();
+    let out = s.eval(": qquit-at-2 5 0 do i . i 2 = ?leave loop ;\nqquit-at-2\nbye\n").unwrap();
+    assert_eq!(out, " ok\n0 1 2  ok\n");
+}
+
+#[test]
+fn eval_two_r_roundtrip_through_repl() {
+    let mut s = sess();
+    let out = s.eval(": ferry2 2>r 2r@ . . 2r> ;\n10 20 ferry2 . .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n20 10 20 10  ok\n");
+}
+
+#[test]
+fn eval_compiled_inline_stack_words_work() {
+    let mut s = sess();
+    let out = s.eval(": stackplay over swap drop ;\n7 9 stackplay . .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n7 7  ok\n");
+}
+
+#[test]
+fn tfa_fetch_distinguishes_colon_defs_from_primitives() {
+    let mut s = sess();
+
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+    s.push(dup_xt);
+    s.call("to_name").unwrap();
+    let dup_nt = s.pop();
+    s.push(dup_nt);
+    s.call("tfa_fetch").unwrap();
+    assert_eq!(s.pop(), 0);
+
+    let out = s.eval(": typed 1 ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    s.call("latestxt").unwrap();
+    let xt = s.pop();
+    s.push(xt);
+    s.call("to_name").unwrap();
+    let nt = s.pop();
+    s.push(nt);
+    s.call("tfa_fetch").unwrap();
+    assert_eq!(s.pop(), 0x82);
+}
+
+#[test]
+fn create_builds_a_created_word_that_pushes_its_body() {
+    let mut s = sess();
+    let out = s.eval("create made\nmade\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n");
+
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let body = s.pop() as u64;
+    assert_eq!(body, xt + 24);
+
+    s.push(xt as i64);
+    s.call("to_name").unwrap();
+    let nt = s.pop();
+    s.push(nt);
+    s.call("tfa_fetch").unwrap();
+    assert_eq!(s.pop(), 0x91);
+
+    s.push(xt as i64);
+    s.call("to_body").unwrap();
+    assert_eq!(s.pop() as u64, body);
+}
+
+#[test]
+fn to_body_throws_minus_31_on_colon_definition() {
+    let mut s = sess();
+    let out = s.eval(": bodyfail 1 ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    s.call("latestxt").unwrap();
+    let xt = s.pop();
+    let to_body_xt = s.xt_of("to_body").unwrap() as i64;
+    s.push(xt);
+    s.push(to_body_xt);
+    s.call("catch_word").unwrap();
+    assert_eq!(s.stack(), vec![-31, xt]);
+}
+
+#[test]
+fn forth_visible_body_word_resolves_to_kernel_to_body_xt() {
+    let mut s = sess();
+    let out = s.eval("' >body\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    let forth_xt = s.pop() as u64;
+    let kernel_xt = s.xt_of("to_body").unwrap() as u64;
+    assert_eq!(forth_xt, kernel_xt);
+}
+
+#[test]
+fn execute_of_to_body_xt_matches_direct_call() {
+    let mut s = sess();
+    let out = s.eval("create made\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    s.call("latestxt").unwrap();
+    let xt = s.pop();
+    let to_body_xt = s.xt_of("to_body").unwrap() as i64;
+
+    s.push(xt);
+    s.push(to_body_xt);
+    s.call("execute").unwrap();
+    assert_eq!(s.pop(), xt + 24);
+}
+
+#[test]
+fn eval_body_word_leaves_created_body_address_on_stack() {
+    let mut s = sess();
+    let out = s.eval("create made\n' made >body\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n");
+
+    s.call("latestxt").unwrap();
+    let xt = s.pop();
+    let body = s.pop();
+
+    assert_eq!(body, xt + 24);
+}
+
+#[test]
+fn compiled_body_word_returns_created_body_address() {
+    let mut s = sess();
+    let out = s.eval(": bodyword >body ;\ncreate made\n' made bodyword\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+
+    s.call("latestxt").unwrap();
+    let xt = s.pop();
+    let body = s.pop();
+
+    assert_eq!(body, xt + 24);
+}
+
+#[test]
+fn defer_hook_does_not_corrupt_to_body_code() {
+    let mut s = sess();
+    let to_body_xt = s.xt_of("to_body").unwrap() as u64;
+    let before = unsafe { std::slice::from_raw_parts(to_body_xt as *const u8, 24).to_vec() };
+
+    let out = s
+        .eval(": , here ! 1 cells allot ;\n: variable create 0 , ;\n: constant create , does> @ ;\n: value create , does> @ ;\n: defer@ >body @ ;\n: defer! >body ! ;\n: defer-err -261 throw ;\n: defer create ['] defer-err , does> @ execute ;\ndefer hook\nbye\n")
+        .unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n ok\n ok\n ok\n ok\n");
+
+    let after = unsafe { std::slice::from_raw_parts(to_body_xt as *const u8, 24).to_vec() };
+    assert_eq!(after, before);
+}
+
+#[test]
+fn link_to_name_returns_latest_header_name_token() {
+    let mut s = sess();
+    let pad = s.user_base + 0x100;
+    let name = b"BAR";
+    unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len()); }
+
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("create").unwrap();
+    let latest = s.latest() as i64;
+
+    s.push(latest);
+    s.call("link_to_name").unwrap();
+    let nt = s.pop() as u64;
+
+    let len = unsafe { (nt as *const u8).read() };
+    let bytes = unsafe { std::slice::from_raw_parts((nt + 1) as *const u8, len as usize) };
+    assert_eq!(len, name.len() as u8);
+    assert_eq!(bytes, name);
+}
+
+#[test]
+fn name_to_interpret_and_name_to_compile_roundtrip_header_tokens() {
+    let mut s = sess();
+    let pad = s.user_base + 0x100;
+    let name = b"BAZ";
+    unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len()); }
+
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("create").unwrap();
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+    let compile_xt = s.xt_of("compile_word").unwrap() as i64;
+    s.push(dup_xt);
+    s.call("set_xt").unwrap();
+
+    s.push(dup_xt);
+    s.call("to_name").unwrap();
+    let nt = s.pop();
+
+    s.push(nt);
+    s.call("name_to_interpret").unwrap();
+    assert_eq!(s.pop(), dup_xt);
+
+    s.push(nt);
+    s.call("name_to_compile").unwrap();
+    assert_eq!(s.pop(), compile_xt);
+    assert_eq!(s.pop(), dup_xt);
+}
+
+#[test]
+fn latestxt_tracks_latest_definition_and_resets() {
+    let mut s = sess();
+    s.call("latestxt").unwrap();
+    let boot_latestxt = s.pop();
+
+    let pad = s.user_base + 0x100;
+    let name = b"QUX";
+    unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len()); }
+
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("create").unwrap();
+    s.call("latestxt").unwrap();
+    let created_xt = s.pop();
+    assert_ne!(created_xt, boot_latestxt);
+
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+    s.push(dup_xt);
+    s.call("set_xt").unwrap();
+    s.call("latestxt").unwrap();
+    assert_eq!(s.pop(), dup_xt);
+
+    s.reset();
+    s.call("latestxt").unwrap();
+    assert_eq!(s.pop(), boot_latestxt);
+}
+
+#[test]
+fn find_name_returns_counted_name_token() {
+    const DH_NT: u64 = (5 * 8) + 2 + 2 + 2 + 1;
+
+    let mut s = sess();
+    let pad = s.user_base + 0x100;
+    let name = b"BAR";
+    unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len()); }
+
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("create").unwrap();
+
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("find_name").unwrap();
+
+    assert_eq!(s.pop(), -1);
+    let nt = s.pop() as u64;
+    assert_eq!(nt, s.latest() + DH_NT);
+
+    let len = unsafe { (nt as *const u8).read() };
+    let bytes = unsafe { std::slice::from_raw_parts((nt + 1) as *const u8, len as usize) };
+    assert_eq!(len, name.len() as u8);
+    assert_eq!(bytes, name);
+}
+
+#[test]
+fn set_flags_marks_word_immediate() {
+    // Build a word "IMM" pointing at `cr_word` (no-op for the data
+    // stack, just emits a newline), then mark it IMMEDIATE. In compile
+    // mode it should run NOW (emitting a newline at compile time)
+    // rather than getting compiled into the definition.
+    let mut s = sess();
+    let pad = s.user_base + 0x100;
+    let name = b"IMM";
+    unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len()); }
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("create").unwrap();
+    let cr_xt = s.xt_of("cr_word").unwrap();
+    s.push(cr_xt as i64);
+    s.call("set_xt").unwrap();
+    s.push(1);
+    s.call("set_flags").unwrap();
+
+    // Compile a definition that has IMM in its body. Because IMM is
+    // immediate, the CR fires at compile time, not when bar runs.
+    let out = s.eval(": bar IMM 5 ;\nbar .\nbye\n").unwrap();
+    // The first " ok" comes after the colon-def line, with a CR
+    // emitted in the middle (between `:` and the ` ok`):
+    assert!(out.contains('\n'), "expected an immediate-fire newline; got {out:?}");
+    // bar . prints `5 `, then ok.
+    assert!(out.ends_with("5  ok\n"), "got {out:?}");
+}
+
+#[test]
+fn mixed_define_then_call_directly() {
+    let mut s = sess();
+    s.eval(": cube dup dup * * ;\n").unwrap();
+    // Look up `cube`'s xt by walking the dict — easier route is via the
+    // REPL: `' cube` doesn't exist yet; do it through eval:
+    s.push(4);
+    // We don't have `' word` (tick) yet so fall back to eval for the call.
+    // This test mainly exercises that the dict mutation from eval is
+    // visible to subsequent eval calls.
+    let out = s.eval("4 cube .\nbye\n").unwrap();
+    assert_eq!(out, "64  ok\n");
+    let _ = s.pop();  // drop the 4 we pushed up top — not consumed by the eval
+}
+
+// ── data-driven tests ───────────────────────────────────────────────
+//
+// Adding a new primitive should never need a Rust recompile. These
+// two `#[test]` fns walk the corresponding subdirectories under
+// `tests/data/`, classify each case as PASS / FAIL / NYIMP, and emit
+// a summary. Only FAILs cause the test to fail; NYIMP and PASS are
+// both "the suite ran cleanly."
+//
+// Workflow this enables (test-first):
+//
+//   1. Write test files for the next batch of primitives — words that
+//      may not yet exist in the kernel.
+//   2. `cargo test --test harness` — failing primitives show as NYIMP,
+//      not FAIL. Suite still passes.
+//   3. Port one primitive (via `cargo run --bin port-wf32 …`), paste
+//      into kernel/*.masm, add to PRIMITIVES.
+//   4. Re-run. The corresponding NYIMP flips to PASS automatically.
+//
+// `tests/data/direct/*.t` — direct primitive test, line-oriented DSL.
+//                            NYIMP detected by pre-scanning `call <sym>`
+//                            lines and looking each up via `xt_of`.
+// `tests/data/eval/*.in`  — Forth source fed through the REPL.
+// `tests/data/eval/*.out` — expected stdout, exact match.
+//                            NYIMP detected by an optional comment line
+//                            `# requires: word1 word2 ...` listing the
+//                            Forth-side names; missing any → NYIMP.
+
+#[derive(Debug)]
+enum Outcome {
+    Pass,
+    Nyimp(Vec<String>), // missing-symbol/word list
+    Fail(String),       // human-readable failure detail
+}
+
+#[test]
+fn data_driven_direct_tests() {
+    let dir = data_dir().join("direct");
+    let cases = collect_files(&dir, "t");
+    if cases.is_empty() {
+        eprintln!("note: no .t files under {} — nothing to run", dir.display());
+        return;
+    }
+    let results: Vec<(PathBuf, Outcome)> = cases
+        .iter()
+        .map(|p| (p.clone(), classify_direct(p)))
+        .collect();
+    summarize_and_assert("direct", &results);
+}
+
+#[test]
+fn data_driven_eval_tests() {
+    let dir = data_dir().join("eval");
+    let cases = collect_files(&dir, "in");
+    if cases.is_empty() {
+        eprintln!("note: no .in files under {} — nothing to run", dir.display());
+        return;
+    }
+    let results: Vec<(PathBuf, Outcome)> = cases
+        .iter()
+        .map(|p| {
+            let out = p.with_extension("out");
+            (p.clone(), classify_eval(p, &out))
+        })
+        .collect();
+    summarize_and_assert("eval", &results);
+}
+
+fn summarize_and_assert(kind: &str, results: &[(PathBuf, Outcome)]) {
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut nyimp = 0;
+    let mut nyimp_list: Vec<String> = Vec::new();
+    let mut fail_list: Vec<(String, String)> = Vec::new();
+    for (path, outcome) in results {
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match outcome {
+            Outcome::Pass => pass += 1,
+            Outcome::Nyimp(missing) => {
+                nyimp += 1;
+                nyimp_list.push(format!("{} [missing: {}]", name, missing.join(" ")));
+            }
+            Outcome::Fail(msg) => {
+                fail += 1;
+                fail_list.push((name, msg.clone()));
+            }
+        }
+    }
+    eprintln!(
+        "── {kind} tests: {pass} PASS, {fail} FAIL, {nyimp} NYIMP ──"
+    );
+    if !nyimp_list.is_empty() {
+        eprintln!("  NYIMP:");
+        for line in &nyimp_list {
+            eprintln!("    {line}");
+        }
+    }
+    if !fail_list.is_empty() {
+        eprintln!("  FAIL:");
+        for (name, msg) in &fail_list {
+            eprintln!("    {name}: {msg}");
+        }
+        panic!("{fail} {kind} test(s) failed (see stderr for detail)");
+    }
+}
+
+fn data_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+}
+
+fn collect_files(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = match fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|r| r.ok().map(|e| e.path())).collect(),
+        Err(_) => return Vec::new(),
+    };
+    v.retain(|p| p.extension() == Some(OsStr::new(ext)));
+    v.sort();
+    v
+}
+
+// ── direct (.t) ──────────────────────────────────────────────────────
+
+/// Direct-DSL line-oriented commands:
+///
+/// - `#`/`;` — comment to end of line
+/// - `push <int>` — push a cell (decimal, `0xFF` hex, or negative)
+/// - `push_pad <offset>` — push `user_base + USER_PAD + offset`, where
+///   USER_PAD = 0x100. Lets a test write to scratch memory without
+///   hardcoding session addresses.
+/// - `poke <pad-off> <hex-bytes>` — write a sequence of bytes into
+///   the user-area PAD region at `pad-off`. `<hex-bytes>` is a
+///   contiguous string of hex pairs (e.g. `48656c6c6f` for "Hello").
+///   Used by string-primitive tests that need to seed a buffer
+///   before calling `cmove`, `compare`, etc.
+/// - `expect_bytes <pad-off> <hex-bytes>` — opposite of `poke`: read
+///   `N` bytes from PAD+off and assert they match the hex string.
+/// - `call <sym>` — invoke a primitive by its asm symbol
+/// - `expect <int>...` — assert stack equals these values, **bottom-first**
+///   (Forth notation: `expect 1 2 3` means `1` is deepest, `3` is TOS).
+///   `expect` with no args means "stack should be empty."
+/// - `reset` — restore the session to post-bootstrap state
+fn classify_direct(path: &Path) -> Outcome {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => return Outcome::Fail(format!("read failed: {e}")),
+    };
+
+    // Pre-scan for missing asm symbols.
+    let mut s = sess();
+    let mut missing: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = strip_comment(line).trim();
+        if let Some(rest) = trimmed.strip_prefix("call ") {
+            let sym = rest.split_whitespace().next().unwrap_or("");
+            if s.xt_of(sym).is_err() && !missing.contains(&sym.to_string()) {
+                missing.push(sym.to_string());
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Outcome::Nyimp(missing);
+    }
+
+    // Run.
+    let pad_base = s.user_base + 0x100; // USER_PAD offset, mirrors kernel/macros.masm
+    for (i, line) in text.lines().enumerate() {
+        let lineno = i + 1;
+        let body = strip_comment(line).trim();
+        if body.is_empty() {
+            continue;
+        }
+        let mut parts = body.split_whitespace();
+        let cmd = parts.next().unwrap();
+        let res = (|| -> Result<(), String> {
+            match cmd {
+                "push" => {
+                    let raw = parts.next().ok_or("push needs a value")?;
+                    let v = parse_int(raw).ok_or_else(|| format!("bad int `{raw}`"))?;
+                    s.push(v);
+                }
+                "push_pad" => {
+                    let raw = parts.next().ok_or("push_pad needs an offset")?;
+                    let off = parse_int(raw).ok_or_else(|| format!("bad int `{raw}`"))?;
+                    s.push((pad_base as i64).wrapping_add(off));
+                }
+                "poke" => {
+                    let off_raw = parts.next().ok_or("poke needs an offset")?;
+                    let hex = parts.next().ok_or("poke needs hex bytes")?;
+                    let off = parse_int(off_raw)
+                        .ok_or_else(|| format!("bad offset `{off_raw}`"))?;
+                    let bytes = parse_hex_bytes(hex)
+                        .ok_or_else(|| format!("bad hex bytes `{hex}`"))?;
+                    let dst = (pad_base as i64).wrapping_add(off) as *mut u8;
+                    // SAFETY: pad region lives inside the 128 MB
+                    // session-allocated block; tests address it via
+                    // bounded offsets.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            dst,
+                            bytes.len(),
+                        );
+                    }
+                }
+                "expect_bytes" => {
+                    let off_raw = parts.next().ok_or("expect_bytes needs an offset")?;
+                    let hex = parts.next().ok_or("expect_bytes needs hex bytes")?;
+                    let off = parse_int(off_raw)
+                        .ok_or_else(|| format!("bad offset `{off_raw}`"))?;
+                    let want = parse_hex_bytes(hex)
+                        .ok_or_else(|| format!("bad hex bytes `{hex}`"))?;
+                    let src = (pad_base as i64).wrapping_add(off) as *const u8;
+                    // SAFETY: same as `poke` above.
+                    let got: Vec<u8> = unsafe {
+                        std::slice::from_raw_parts(src, want.len()).to_vec()
+                    };
+                    if got != want {
+                        return Err(format!(
+                            "bytes mismatch at PAD+{off:#x}\n      expected: {}\n      got     : {}",
+                            hex_bytes(&want),
+                            hex_bytes(&got)
+                        ));
+                    }
+                }
+                "call" => {
+                    let sym = parts.next().ok_or("call needs a symbol")?;
+                    s.call(sym).map_err(|e| format!("call {sym}: {e}"))?;
+                }
+                "expect" => {
+                    let want_bot_first: Vec<i64> = parts
+                        .map(|t| parse_int(t).ok_or_else(|| format!("bad int `{t}`")))
+                        .collect::<Result<_, _>>()?;
+                    let want: Vec<i64> =
+                        want_bot_first.iter().rev().copied().collect();
+                    let got = s.stack();
+                    if got != want {
+                        return Err(format!(
+                            "stack mismatch\n      expected (bottom→top): {:?}\n      got      (top→bottom): {:?}",
+                            want_bot_first, got
+                        ));
+                    }
+                }
+                "reset" => s.reset(),
+                other => return Err(format!("unknown command `{other}`")),
+            }
+            Ok(())
+        })();
+        if let Err(msg) = res {
+            return Outcome::Fail(format!("line {lineno}: {msg}"));
+        }
+    }
+    Outcome::Pass
+}
+
+// ── eval (.in / .out) ────────────────────────────────────────────────
+
+fn classify_eval(in_path: &Path, out_path: &Path) -> Outcome {
+    let input = match fs::read_to_string(in_path) {
+        Ok(t) => t.replace("\r\n", "\n"),
+        Err(e) => return Outcome::Fail(format!("read .in: {e}")),
+    };
+    let expected = match fs::read_to_string(out_path) {
+        Ok(t) => t.replace("\r\n", "\n"),
+        Err(e) => return Outcome::Fail(format!("read .out: {e}")),
+    };
+
+    // NYIMP detection: `# requires: word1 word2 …` lines list Forth
+    // names this test depends on. Missing any → NYIMP. (Tests that
+    // don't declare requirements run unconditionally — fine for words
+    // we KNOW are present, like the M3/M4 baseline.)
+    let mut required: Vec<String> = Vec::new();
+    for line in input.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t
+            .strip_prefix("#")
+            .or_else(|| t.strip_prefix(";"))
+            .map(|r| r.trim_start())
+        {
+            if let Some(list) = rest.strip_prefix("requires:") {
+                required.extend(list.split_whitespace().map(String::from));
+            }
+        }
+    }
+    let missing: Vec<String> = required
+        .into_iter()
+        .filter(|w| !wf64::PRIMITIVES.iter().any(|&(name, _, _)| name == w))
+        .collect();
+    if !missing.is_empty() {
+        return Outcome::Nyimp(missing);
+    }
+
+    // Strip harness-only metadata lines (those starting with `#`) so
+    // the kernel doesn't see them as Forth source. Forth's own comment
+    // syntax (`\` to end-of-line, `( … )` inline) passes through
+    // unchanged.
+    let forth_source: String = input
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<&str>>()
+        .join("\n")
+        + "\n";
+
+    let mut s = sess();
+    match s.eval(&forth_source) {
+        Ok(actual) if actual == expected => Outcome::Pass,
+        Ok(actual) => Outcome::Fail(format!(
+            "output mismatch\n      expected: {:?}\n      got     : {:?}",
+            expected, actual
+        )),
+        Err(e) => Outcome::Fail(format!("eval failed: {e}")),
+    }
+}
+
+// ── shared helpers ───────────────────────────────────────────────────
+
+fn strip_comment(line: &str) -> &str {
+    let cut = line
+        .find(|c| c == '#' || c == ';')
+        .unwrap_or(line.len());
+    &line[..cut]
+}
+
+/// Parse a contiguous hex string like `"48656c6c6f"` into bytes.
+/// Ignores optional underscores so longer strings can be grouped for
+/// readability (`"4865_6c6c_6f"`).
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+    if cleaned.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    for pair in cleaned.as_bytes().chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
+fn parse_int(s: &str) -> Option<i64> {
+    // Strip `_` separators so values like `0xCAFEBABE_DEADBEEF` are
+    // readable in tests. Decimal benefits too (`1_000_000`).
+    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+    let s: &str = &cleaned;
+    // Parse hex via u64 so the full 64-bit range is reachable. `0x8…`
+    // values above i64::MAX are bit-cast as the corresponding negative
+    // i64. Negative hex (`-0x8000…`) handles i64::MIN by computing the
+    // wrapping negation; this is the only way to express i64::MIN as
+    // a literal that survives Rust's overflow checks.
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok().map(|u| u as i64)
+    } else if let Some(neg_hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
+        u64::from_str_radix(neg_hex, 16).ok().map(|u| (u as i64).wrapping_neg())
+    } else {
+        s.parse().ok()
+    }
+}

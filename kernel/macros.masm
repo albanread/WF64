@@ -1,0 +1,155 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — shared macros and register convention.
+;
+; Register conventions (carried over from the WF32 plan):
+;   RAX = TOS    (top of data stack — always cached in a register)
+;   RBP = DSP    (data stack pointer, points at NOS, grows downward)
+;   RBX = UP     (user area pointer — per-task state)
+;   RSP = rstack (return stack — also CPU call/ret stack since we STC)
+;   R12 = callee-saved scratch for Win64 callouts (RSP-save slot)
+;
+; Subroutine-threaded: every primitive ends with `ret` and every Forth
+; word called from a colon definition is invoked via `call`. There is
+; no inner interpreter dispatch loop — the CPU's call/ret IS the dispatch.
+; ─────────────────────────────────────────────────────────────────────
+
+@assign cell = 8
+@assert cell == 8, "WF64 requires 8-byte cells (this is x86-64)"
+
+@define TOS  rax
+@define DSP  rbp
+@define UP   rbx
+
+; ── User-area layout ─────────────────────────────────────────────────
+; All offsets are from RBX (the UP register). Variables are cell-sized
+; unless noted. The driver allocates a 128 MB region via VirtualAlloc2
+; with MEM_ADDRESS_REQUIREMENTS (within ±2 GB of the kernel), then
+; passes us four pointers: dsp_top, rsp_top, user_base, dict_base.
+;
+; Region layout:
+;   [base + 0x00000] — data stack region (256 KB; RBP starts at +0x40000, grows down)
+;   [base + 0x40000] — return stack region (256 KB; RSP starts at +0x80000, grows down)
+;   [base + 0x80000] — user area (256 KB; UP = +0x80000)
+;   [base + 0xC0000] — dictionary heap (127.25 MB; HERE starts here, grows up)
+@assign user_BASE        = 0x00      ; numeric base (10 default)
+@assign user_STATE       = 0x08      ; 0 = interpret, 1 = compile
+@assign user_LATEST      = 0x10      ; head of dictionary chain
+@assign user_HERE        = 0x18      ; bump pointer into dict heap
+@assign user_DICT_END    = 0x20      ; high limit of dict heap (overflow check)
+@assign user_SOURCE_ID   = 0x28      ; -1 = evaluate, 0 = stdin, n = file
+@assign user_SOURCE_ADDR = 0x30      ; pointer to source text
+@assign user_SOURCE_LEN  = 0x38      ; length of source text
+@assign user_TO_IN       = 0x40      ; current parse offset (>IN)
+@assign user_BYE_REQ     = 0x50      ; `bye` writes 1 here; quit checks it cooperatively
+@assign user_HOST_RSP    = 0x58      ; forth_main stashes host's RSP here on entry
+@assign user_DSP_SAVE    = 0x60      ; forth_main writes final logical_dsp here on exit
+@assign user_SP0         = 0x68      ; initial DSP at session boot (= dsp_top); read by `depth`
+@assign user_RSP_CURRENT = 0x70      ; forth's RSP across forth_main calls (so rstack persists)
+@assign user_LATESTXT    = 0x78      ; xt of the most recently created/updated definition
+@assign user_HANDLER     = 0x80      ; catch/throw handler chain head on the rstack
+@assign user_THROW_CODE  = 0x88      ; uncaught THROW code returned to the host
+@assign user_ROOT_HANDLER= 0x90      ; 3-cell synthetic root handler frame
+@assign user_FORGET_FENCE= 0x98      ; newest header that must not be forgotten
+@assign user_PAD         = 0x100     ; 256 bytes of scratch
+@assign user_SOURCE_BUF  = 0x200     ; 4 KB line buffer
+@assign source_buf_size  = 4096
+@assign user_DO_TMP0     = 0x1200    ; callable do-part1/do-part2 scratch: limit/bias base
+@assign user_DO_TMP1     = 0x1208    ; callable do-part1/do-part2 scratch: start/adjusted index
+
+; ── Dictionary header layout ─────────────────────────────────────────
+; WF64 now models WF32's real header shape rather than the earlier
+; mini-header. LATEST still points at the header base, but find-name
+; returns the name token (nt), i.e. the counted string beginning at
+; dh_nt. The executable entry point lives in dh_xtptr.
+
+; Fields carried over from WF32's head% structure. `dh_comp` is kept
+; alongside `dh_ct` / `dh_xtptr` even though the current compile-mode
+; dispatcher only needs `dh_ct`; it lets upcoming dictionary words see
+; the same shape WF32 expects.
+@assign dh_link      = 0
+@assign dh_ct        = dh_link  + cell
+@assign dh_xtptr     = dh_ct    + cell
+@assign dh_comp      = dh_xtptr + cell
+@assign dh_rec       = dh_comp  + cell
+@assign dh_vfa       = dh_rec   + cell      ; word-sized in WF32, widened later below
+@assign dh_ofa       = dh_vfa   + 2
+@assign dh_stk       = dh_ofa   + 2
+@assign dh_tfa       = dh_stk   + 2
+@assign dh_nt        = dh_tfa   + 1         ; counted string: len byte then chars
+@assign dh_name      = dh_nt    + 1         ; first character byte
+
+; Minimal WF32-compatible type tags used so far.
+@assign tfa_tcol     = 0x82                 ; colon definition
+@assign tfa_tcre     = 0x91                 ; create definition
+@assign create_stub_size = 24               ; 19-byte stub + 5 pad bytes
+
+; ── stk ──────────────────────────────────────────────────────────────
+; `stk(in, out)` emits the data-stack-pointer adjustment for a primitive
+; with stack effect ( in -- out ). Mirrors WF32's `next;` macro's use
+; of `in/out` annotations. Implemented in Rust (in JASM's
+; wfasm::asm::macros::stk) because it needs arithmetic over its args.
+;
+; Net out > in → emits `sub rbp, (out-in)*cell`
+; Net out < in → emits `add rbp, (in-out)*cell`
+; Balanced     → emits nothing.
+@rust_macro stk
+
+; ── proc / endp ──────────────────────────────────────────────────────
+; Open a Forth primitive. No prologue is emitted — primitives don't have
+; one in STC. `endp()` closes the scope but does NOT emit `ret`; use
+; `next()` (or write `ret` yourself) where you want the return.
+@macro proc(name)
+    @scope &name
+    .quad 0
+    .globl &name
+&name:
+@endmacro
+
+@macro endp()
+    @endscope
+@endmacro
+
+; ── next ─────────────────────────────────────────────────────────────
+; STC "next": just `ret`. The caller's `call` pushed the return address;
+; `ret` pops it. Named for compatibility with WF32 idiom even though
+; in STC there is no inner-interpreter NEXT loop.
+@macro next()
+    ret
+@endmacro
+
+; ── pushd / popd ─────────────────────────────────────────────────────
+; Push a value onto the data stack. Old TOS spills to NOS, new value
+; becomes TOS.
+@macro pushd(val)
+    sub  DSP, cell          ; make room
+    mov  [DSP], TOS         ; spill old TOS to NOS
+    mov  TOS, &val          ; new TOS
+@endmacro
+
+; Drop TOS — raises NOS to TOS.
+@macro popd()
+    mov  TOS, [DSP]
+    add  DSP, cell
+@endmacro
+
+; ── win64_call ───────────────────────────────────────────────────────
+; Manual Win64 callout. Wraps the target with the shadow-space + RSP
+; alignment dance. The win32/*.masm wrappers do this internally; use
+; this directly only when calling something not in the generated set
+; (e.g., the Rust runtime functions via @extern).
+@macro win64_call(target)
+    mov     r12, rsp
+    and     rsp, -16
+    sub     rsp, 32
+    call    &target
+    mov     rsp, r12
+@endmacro
+
+; ── brk ──────────────────────────────────────────────────────────────
+; Non-fatal breakpoint. The SEH handler catches `int 3`, dumps state
+; (all GPRs + 32 qwords of stack with symbolic resolution), advances
+; RIP past the byte, returns CONTINUE_EXECUTION. The function keeps
+; running. Drop one anywhere to inspect state without rebuilding.
+@macro brk()
+    int 3
+@endmacro

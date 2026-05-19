@@ -1,0 +1,1190 @@
+//! WF64 — programmable Forth session.
+//!
+//! `Wf64Session` is the unit of test isolation and the engine that
+//! `src/main.rs` (the interactive REPL) sits on top of. One session
+//! owns:
+//!
+//!   * a JIT'd kernel (assembled from `kernel/*.masm`),
+//!   * a 128 MB near-memory region carved into data stack / return
+//!     stack / user area / dictionary heap,
+//!   * the populated dictionary,
+//!   * the current data-stack state (`current_dsp` + `current_tos`).
+//!
+//! Two modes of operation:
+//!
+//!   * `eval(input)` — feed text through the REPL (quit) and capture
+//!     stdout. Bye is cooperative: it just sets a flag, quit returns
+//!     cleanly, and the session is reusable.
+//!
+//!   * `push(v)` / `pop()` / `call(sym)` — direct primitive invocation
+//!     with a pre-staged data stack. No parsing, no dispatch. Lets
+//!     unit tests cover each primitive in isolation.
+//!
+//! Both modes share the same `forth_main` entry point — see
+//! `kernel/main.masm`.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+
+pub mod runtime;
+pub mod wf32_port;
+
+use std::ffi::c_void;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::ptr;
+
+use anyhow::{Context, Result};
+use wfasm::{Assembler, Jit};
+
+pub const KERNEL_ENTRY: &str = "kernel/main.masm";
+
+/// (forth_name, asm_symbol, flags). Insertion order = scan order:
+/// most-recently-inserted is matched first by `find-name`.
+///
+/// The bootstrap loops this list inside `Wf64Session::new()` calling
+/// `(create)` / `(set-xt)` / `(set-flags)` once per entry. The Rust
+/// driver does NOT know the dictionary header layout — that lives
+/// entirely in `kernel/dict.masm` and `kernel/macros.masm`.
+pub const PRIMITIVES: &[(&str, &str, u8)] = &[
+    // Dictionary primitives — must be present from the very first
+    // bootstrap step, since the bootstrap itself uses them. They get
+    // looked up by JIT address (not by name), so the dict's emptiness
+    // at that point is irrelevant; they're "self-publishing".
+    ("(create)",    "create",     0),
+    ("(set-xt)",    "set_xt",     0),
+    ("(set-comp)",  "set_comp",   0),
+    ("(set-flags)", "set_flags",  0),
+    // Stack ops (WF32 gkernel32.fs:124-195)
+    ("dup",        "dup_",       0),
+    ("swap",       "swap_",      0),
+    ("drop",       "drop_",      0),
+    ("rot",        "rot_",       0),
+    ("over",       "over_",      0),
+    ("-rot",       "neg_rot",    0),
+    ("?dup",       "qdup",       0),
+    ("nip",        "nip_",       0),
+    ("tuck",       "tuck_",      0),
+    ("pick",       "pick",       0),
+    ("depth",      "depth",      0),
+    // Return-stack ops (WF32 gkernel32.fs:197-273)
+    ("dup>r",      "dup_to_r",   0),
+    (">r",         "to_r",       0),
+    ("r>",         "r_from",     0),
+    ("r@",         "r_fetch",    0),
+    ("rdrop",      "rdrop",      0),
+    ("2>r",        "two_to_r",   0),
+    ("2r>",        "two_r_from", 0),
+    ("2r@",        "two_r_fetch",0),
+    ("i",          "i_word",     0),
+    ("j",          "j_word",     0),
+    ("do-part1",   "do_part1",   0),
+    ("do-part2",   "do_part2",   0),
+    ("mark>",      "mark_to",    1),
+    ("<resolve",   "back_resolve", 1),
+    (">resolve",   "forward_resolve", 1),
+    ("?pairs",     "qpairs",     1),
+    ("ahead",      "ahead_word", 1),
+    ("if",         "if_word",    1),
+    ("-if",        "minus_if_word", 1),
+    ("then",       "then_word",  1),
+    ("else",       "else_word",  1),
+    ("begin",      "begin_word", 1),
+    ("while",      "while_word", 1),
+    ("again",      "again_word", 1),
+    ("until",      "until_word", 1),
+    ("repeat",     "repeat_word", 1),
+    ("recurse",    "recurse_word", 1),
+    ("do",         "do_word",    1),
+    ("?do",        "qdo_control_word", 1),
+    ("loop",       "loop_control_word", 1),
+    ("+loop",      "plus_loop_control_word", 1),
+    ("-loop",      "minus_loop_control_word", 1),
+    ("unloop",     "unloop_word", 0),
+    ("leave",      "leave_word", 1),
+    ("?leave",     "qleave_word", 1),
+    ("bra",        "bra_word",   0),
+    ("?bra",       "qbra_word",  0),
+    ("-?bra",      "minus_qbra_word", 0),
+    ("bra-?do",    "bra_qdo_word", 0),
+    ("_loop",      "loop_word",  0),
+    ("_+loop",     "plus_loop_word", 0),
+    ("_-loop",     "minus_loop_word", 0),
+    ("2rdrop",     "two_rdrop",  0),
+    ("n>r",        "n_to_r",     0),
+    ("nr>",        "nr_from",    0),
+    ("sp@",        "sp_fetch",   0),
+    ("sp!",        "sp_store",   0),
+    ("rp@",        "rp_fetch",   0),
+    ("rp!",        "rp_store",   0),
+    // Memory ops
+    ("@",          "fetch",      0),
+    ("!",          "store",      0),
+    ("c@",         "c_fetch",    0),
+    ("c!",         "c_store",    0),
+    ("here",       "here_word",  0),
+    ("allot",      "allot_word", 0),
+    ("2@",         "two_fetch",  0),
+    ("2!",         "two_store",  0),
+    // Non-std memory widths (b/w/L/q from WF32). On WF64, q is a cell.
+    ("b@",         "b_fetch",    0),
+    ("sb@",        "sb_fetch",   0),
+    ("b!",         "b_store",    0),
+    ("w@",         "w_fetch",    0),
+    ("sw@",        "sw_fetch",   0),
+    ("w!",         "w_store",    0),
+    ("L@",         "l_fetch",    0),
+    ("L!",         "l_store",    0),
+    ("q@",         "q_fetch",    0),
+    ("q!",         "q_store",    0),
+    // Bit ops + cell-size helpers + strings (gkernel32.fs:537-1278)
+    ("count-bits", "count_bits", 0),
+    ("msbit",      "msbit",      0),
+    ("lsbit",      "lsbit",      0),
+    ("cells",      "cells",      0),
+    ("cells+",     "cells_plus", 0),
+    ("+cells",     "plus_cells", 0),
+    ("cells-",     "cells_minus",0),
+    ("cell+",      "cell_plus",  0),
+    ("cell-",      "cell_minus", 0),
+    ("char+",      "char_plus",  0),
+    ("chars",      "chars",      0),
+    ("aligned",    "aligned",    0),
+    ("-aligned",   "minus_aligned", 0),
+    ("naligned",   "naligned",   0),
+    ("fill",       "fill",       0),
+    ("cmove",      "cmove",      0),
+    ("cmove>",     "cmove_to",   0),
+    ("count",      "count",      0),
+    ("move",       "move",       0),
+    ("zcount",     "zcount",     0),
+    ("lastchar",   "lastchar",   0),
+    ("slastchar",  "slastchar",  0),
+    ("exchange",   "exchange",   0),
+    ("bounds",     "bounds",     0),
+    ("/string",    "slash_string", 0),
+    ("compare",    "compare",      0),
+    ("str=",       "str_equal",    0),
+    ("istr=",      "istr_equal",   0),
+    ("tr",         "tr",           0),
+    ("upc",        "upc",          0),
+    ("upper",      "upper",        0),
+    ("lower",      "lower",        0),
+    ("uppercase",  "uppercase",    0),
+    ("lowercase",  "lowercase",    0),
+    ("+place",     "plus_place",   0),
+    ("append",     "plus_place",   0),
+    ("place",      "place",        0),
+    ("c+place",    "c_plus_place", 0),
+    ("skip",       "skip",         0),
+    ("-skip",      "minus_skip",   0),
+    ("scan",       "scan",         0),
+    ("-scan",      "minus_scan",   0),
+    ("search",     "search",       0),
+    // Double-cell stack ops
+    ("2drop",      "two_drop",   0),
+    ("2dup",       "two_dup",    0),
+    ("2nip",       "two_nip",    0),
+    ("2swap",      "two_swap",   0),
+    ("2rot",       "two_rot",    0),
+    ("2over",      "two_over",   0),
+    ("3drop",      "three_drop", 0),
+    ("4drop",      "four_drop",  0),
+    ("3dup",       "three_dup",  0),
+    ("4dup",       "four_dup",   0),
+    ("s-reverse",  "s_reverse",  0),
+    // Arithmetic
+    ("+",          "plus",       0),
+    ("*",          "times",      0),
+    ("-",          "minus",            0),
+    ("negate",     "negate",           0),
+    ("abs",        "abs",              0),
+    ("1+",         "one_plus",         0),
+    ("1-",         "one_minus",        0),
+    ("2+",         "two_plus",         0),
+    ("2-",         "two_minus",        0),
+    ("2*",         "two_times",        0),
+    ("3*",         "three_times",      0),
+    ("5*",         "five_times",       0),
+    ("10*",        "ten_times",        0),
+    ("2/",         "two_slash",        0),
+    ("u2/",        "u2slash",          0),
+    ("+!",         "plus_store",       0),
+    ("@+!",        "fetch_plus_store", 0),
+    ("1+!",        "one_plus_store",   0),
+    ("1-!",        "one_minus_store",  0),
+    ("1+c!",       "one_plus_c_store", 0),
+    ("1-c!",       "one_minus_c_store",0),
+    ("c+!",        "c_plus_store",     0),
+    ("d+",         "d_plus",           0),
+    ("d+!",        "d_plus_store",     0),
+    ("d-",         "d_minus",          0),
+    ("dnegate",    "dnegate",          0),
+    ("dabs",       "dabs",             0),
+    ("d2*",        "d_two_times",      0),
+    ("d2/",        "d_two_slash",      0),
+    ("s>d",        "s_to_d",           0),
+    ("/mod",       "slash_mod",        0),
+    ("um*",        "um_times",         0),
+    ("m*",         "m_times",          0),
+    ("um/mod",     "um_slash_mod",     0),
+    ("sm/rem",     "sm_slash_rem",     0),
+    ("fm/mod",     "fm_slash_mod",     0),
+    ("*/",         "times_slash",      0),
+    ("*/mod",      "times_slash_mod",  0),
+    ("/",          "slash",            0),
+    ("mod",        "mod_",             0),
+    // Bitwise / logic
+    ("and",        "and_",             0),
+    ("or",         "or_",              0),
+    ("xor",        "xor_",             0),
+    ("invert",     "invert",           0),
+    ("lshift",     "lshift",           0),
+    ("rshift",     "rshift",           0),
+    ("arshift",    "arshift",          0),
+    ("on",         "on",               0),
+    ("off",        "off",              0),
+    // Comparison
+    ("0=",         "zero_equal",       0),
+    ("0<>",        "zero_not_equal",   0),
+    ("0<",         "zero_less",        0),
+    ("0>",         "zero_greater",     0),
+    ("=",          "equal",            0),
+    ("<>",         "not_equal",        0),
+    ("<",          "less",             0),
+    (">",          "greater",          0),
+    ("<=",         "less_equal",       0),
+    (">=",         "greater_equal",    0),
+    ("u<",         "u_less",           0),
+    ("u>",         "u_greater",        0),
+    ("u<=",        "u_less_equal",     0),
+    ("u>=",        "u_greater_equal",  0),
+    ("min",        "min_",             0),
+    ("max",        "max_",             0),
+    ("0max",       "zero_max",         0),
+    ("umin",       "umin",             0),
+    ("umax",       "umax",             0),
+    ("within",     "within",           0),
+    ("d=",         "d_equal",          0),
+    ("d0<",        "d_zero_less",      0),
+    ("d0=",        "d_zero_equal",     0),
+    ("d<",         "d_less",           0),
+    ("du<",        "du_less",          0),
+    ("du>",        "du_greater",       0),
+    ("d>",         "d_greater",        0),
+    ("d<>",        "d_not_equal",      0),
+    // ANS Forth alias: `not` ≡ `0=`
+    ("not",        "zero_equal",       0),
+    // Number output
+    (".",          "dot",        0),
+    (".s",         "dot_s",      0),
+    ("digit",      "digit",      0),
+    (">number",    "to_number",  0),
+    ("base",       "base_word",  0),
+    ("base@",      "base_fetch", 0),
+    ("base!",      "base_store", 0),
+    ("decimal",    "decimal_word", 0),
+    ("hex",        "hex_word",   0),
+    ("octal",      "octal_word", 0),
+    // I/O
+    ("emit",       "emit",       0),
+    ("type",       "type_word",  0),
+    ("cr",         "cr_word",    0),
+    ("BRK",        "brk_word",   0),
+    ("INT3",       "int3_word",  0),
+    ("cpuid",      "cpuid_word", 0),
+    ("rdtsc",      "rdtsc_word", 0),
+    ("bye",        "bye",        0),
+    // Parse & dict
+    ("parse-name", "parse_name", 0),
+    ("find-name",  "find_name",  0),
+    (">ct",        "to_ct",      0),
+    (">comp",      "to_comp",    0),
+    (">name",      "to_name",    0),
+    ("link>name",  "link_to_name", 0),
+    ("name>interpret", "name_to_interpret", 0),
+    ("name>compile", "name_to_compile", 0),
+    ("tfa@",       "tfa_fetch",  0),
+    (">body",      "to_body",    0),
+    ("latestxt",   "latestxt",   0),
+    ("forget_last", "forget_last_word", 0),
+    ("largest",    "largest",    0),
+    ("number?",    "number_q",   0),
+    ("accept",     "accept",     0),
+    // Execute & interp
+    ("execute",    "execute",    0),
+    ("perform",    "perform",    0),
+    ("throw_abort", "throw_abort_const", 0),
+    ("throw_abortq", "throw_abortq_const", 0),
+    ("throw_componly", "throw_componly_const", 0),
+    ("throw_namereqd", "throw_namereqd_const", 0),
+    ("throw_mismatch", "throw_mismatch_const", 0),
+    ("catch",      "catch_word", 0),
+    ("throw",      "throw_word", 0),
+    ("abort",      "abort_word", 0),
+    ("?throw",     "qthrow_word", 0),
+    ("(comp-only)", "comp_only_word", 0),
+    ("quit",       "quit",       0),
+    // Colon compiler (M4)
+    ("[",          "left_bracket_word", 1),
+    ("]",          "right_bracket_word", 0),
+    ("immediate",  "immediate_word", 0),
+    ("'",          "tick_word",   0),
+    ("[']",        "bracket_tick_word", 1),
+    ("literal",    "literal_word", 1),
+    ("postpone",   "postpone_word", 1),
+    ("does>",      "does_word",   1),
+    (":",          "colon",      0),
+    ("create",     "create_word", 0),
+    (";",          "semicolon",  1),   // IMMEDIATE
+];
+
+/// Kernel-internal helper symbols (JIT-resolvable, NOT in the dict).
+pub const KERNEL_HELPERS: &[&str] = &[
+    "do_lit",
+    "compile_word",
+    "compile_comma",
+    "inline_dup_comp",
+    "inline_drop_comp",
+    "inline_swap_comp",
+    "inline_over_comp",
+    "inline_to_r_comp",
+    "inline_r_from_comp",
+    "inline_r_fetch_comp",
+    "inline_two_to_r_comp",
+    "inline_two_r_from_comp",
+    "inline_two_r_fetch_comp",
+    "inline_i_comp",
+    "inline_j_comp",
+    "inline_do_part1_comp",
+    "inline_do_part2_comp",
+    "inline_bra_comp",
+    "inline_qbra_comp",
+    "inline_minus_qbra_comp",
+    "inline_bra_qdo_comp",
+    "inline_loop_comp",
+    "inline_plus_loop_comp",
+    "inline_minus_loop_comp",
+    "inline_unloop_comp",
+    "literal",
+];
+
+// ── Memory layout (matches kernel/macros.masm) ───────────────────────
+
+const REGION_SIZE:      usize = 128 * 1024 * 1024;
+const DEBUG_META_SIZE:  u64 = 64 * 1024;
+const OFFSET_DSP_TOP:   u64 = 0x40000;
+const OFFSET_RSP_TOP:   u64 = 0x80000;
+const OFFSET_USER_BASE: u64 = 0x80000;
+const OFFSET_DICT_BASE: u64 = 0xC0000;
+
+// User-area offsets — mirror kernel/macros.masm.
+const USER_BASE_VAR:     u64 = 0x00;
+const USER_STATE_VAR:    u64 = 0x08;
+const USER_LATEST_VAR:   u64 = 0x10;
+const USER_HERE_VAR:     u64 = 0x18;
+const USER_DICT_END_VAR: u64 = 0x20;
+const USER_BYE_REQ:      u64 = 0x50;
+const USER_DSP_SAVE:     u64 = 0x60;
+const USER_SP0:          u64 = 0x68;
+const USER_RSP_CURRENT:  u64 = 0x70;
+const USER_LATESTXT_VAR: u64 = 0x78;
+const USER_HANDLER_VAR:  u64 = 0x80;
+const USER_THROW_CODE:   u64 = 0x88;
+const USER_FORGET_FENCE: u64 = 0x98;
+
+// (Dictionary header layout deliberately not mirrored here — it lives
+// entirely in kernel/macros.masm and kernel/dict.masm. The bootstrap
+// builds the dictionary by calling `(create)` / `(set-xt)` /
+// `(set-flags)` on the kernel side.)
+
+/// Scratch buffer offset inside the user area for handing names to
+/// `(create)`. Maps to `user_PAD` in kernel/macros.masm.
+const USER_PAD: u64 = 0x100;
+
+// Dictionary header offsets — mirrored privately for debug metadata.
+const DH_LINK:      u64 = 0;
+const DH_CT:        u64 = DH_LINK + 8;
+const DH_XTPTR:     u64 = DH_CT + 8;
+const DH_COMP:      u64 = DH_XTPTR + 8;
+const DH_REC:       u64 = DH_COMP + 8;
+const DH_VFA:       u64 = DH_REC + 8;
+const DH_OFA:       u64 = DH_VFA + 2;
+const DH_STK:       u64 = DH_OFA + 2;
+const DH_TFA:       u64 = DH_STK + 2;
+const DH_NT:        u64 = DH_TFA + 1;
+const DH_NAME:      u64 = DH_NT + 1;
+const XT_META_OFFSET: u64 = 8;
+
+// ── Win32 FFI for VirtualAlloc2 + MEM_ADDRESS_REQUIREMENTS ───────────
+
+#[repr(C)]
+struct MEM_ADDRESS_REQUIREMENTS {
+    LowestStartingAddress: *mut c_void,
+    HighestEndingAddress:  *mut c_void,
+    Alignment:             usize,
+}
+const MemExtendedParameterAddressRequirements: u64 = 1;
+
+#[repr(C)]
+struct MEM_EXTENDED_PARAMETER {
+    type_and_reserved: u64,
+    pointer:           *mut c_void,
+}
+
+const MEM_RESERVE: u32 = 0x00002000;
+const MEM_COMMIT:  u32 = 0x00001000;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_SIZE: usize = 4096;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RuntimeFunction {
+    BeginAddress: u32,
+    EndAddress: u32,
+    UnwindData: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UnwindInfo {
+    version_and_flags: u8,
+    size_of_prolog: u8,
+    count_of_codes: u8,
+    frame_register_and_offset: u8,
+}
+
+impl UnwindInfo {
+    const fn leaf() -> Self {
+        Self {
+            version_and_flags: 1,
+            size_of_prolog: 0,
+            count_of_codes: 0,
+            frame_register_and_offset: 0,
+        }
+    }
+}
+
+type VirtualAlloc2Fn = unsafe extern "system" fn(
+    *mut c_void, *mut c_void, usize, u32, u32,
+    *mut MEM_EXTENDED_PARAMETER, u32,
+) -> *mut c_void;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const i8) -> *mut c_void;
+    fn GetLastError() -> u32;
+    fn VirtualProtect(
+        lpAddress: *mut c_void,
+        dwSize: usize,
+        flNewProtect: u32,
+        lpflOldProtect: *mut u32,
+    ) -> i32;
+    fn RtlAddFunctionTable(
+        FunctionTable: *const RuntimeFunction,
+        EntryCount: u32,
+        BaseAddress: u64,
+    ) -> u8;
+    fn RtlDeleteFunctionTable(FunctionTable: *const RuntimeFunction) -> u8;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeWord {
+    name: String,
+    header: u64,
+    start: u64,
+    end: u64,
+}
+
+struct RegisteredFunctionTable {
+    entries: Box<[RuntimeFunction]>,
+}
+
+fn align_up(addr: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    (addr + align - 1) & !(align - 1)
+}
+
+fn get_virtual_alloc2() -> Result<VirtualAlloc2Fn> {
+    let dll: Vec<u16> = "api-ms-win-core-memory-l1-1-6.dll"
+        .encode_utf16().chain(std::iter::once(0)).collect();
+    let hmod = unsafe { LoadLibraryW(dll.as_ptr()) };
+    if hmod.is_null() {
+        anyhow::bail!("LoadLibraryW(api-ms-win-core-memory-l1-1-6.dll) failed");
+    }
+    let name = b"VirtualAlloc2\0";
+    let addr = unsafe { GetProcAddress(hmod, name.as_ptr() as *const i8) };
+    if addr.is_null() {
+        anyhow::bail!("GetProcAddress(VirtualAlloc2) failed");
+    }
+    Ok(unsafe { std::mem::transmute::<*mut c_void, VirtualAlloc2Fn>(addr) })
+}
+
+fn alloc_forth_region(kernel_addr: u64) -> Result<*mut c_void> {
+    let va2 = get_virtual_alloc2().context("locate VirtualAlloc2")?;
+    const GRANULARITY: u64 = 0x10000;
+    const WINDOW:      u64 = 0x70000000;
+    let low_raw = kernel_addr.saturating_sub(WINDOW);
+    let low_aligned = ((low_raw + GRANULARITY - 1) & !(GRANULARITY - 1))
+        .max(GRANULARITY);
+    let high_raw = kernel_addr.saturating_add(WINDOW);
+    let high_inclusive = (high_raw & !(GRANULARITY - 1)).saturating_sub(1);
+
+    let mut req = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: low_aligned as *mut c_void,
+        HighestEndingAddress:  high_inclusive as *mut c_void,
+        Alignment: 0,
+    };
+    let mut param = MEM_EXTENDED_PARAMETER {
+        type_and_reserved: MemExtendedParameterAddressRequirements,
+        pointer: &mut req as *mut _ as *mut c_void,
+    };
+    let base = unsafe {
+        va2(
+            ptr::null_mut(), ptr::null_mut(), REGION_SIZE,
+            MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE,
+            &mut param, 1,
+        )
+    };
+    if base.is_null() {
+        let err = unsafe { GetLastError() };
+        anyhow::bail!(
+            "VirtualAlloc2 returned null (GetLastError = {err}); kernel \
+             at {kernel_addr:#018x}, window [{low_aligned:#018x} \
+             .. {high_inclusive:#018x}]"
+        );
+    }
+    Ok(base)
+}
+
+// ── Wf64Session ──────────────────────────────────────────────────────
+
+/// `forth_main(target_xt, logical_dsp_in, rsp_top, user_base) → 0`.
+type ForthMain = unsafe extern "system" fn(u64, u64, u64, u64) -> u64;
+
+pub struct Wf64Session {
+    jit: Jit,
+    forth_main: ForthMain,
+    #[allow(dead_code)]
+    region_base: u64,
+    pub dsp_top:   u64,
+    pub rsp_top:   u64,
+    pub user_base: u64,
+    pub dict_base: u64,
+    debug_meta_base: u64,
+
+    /// Current "logical" data stack pointer. Equal to `dsp_top` when
+    /// the stack is empty. Each cell from `current_dsp` upward (towards
+    /// `dsp_top`) is one stack entry, top-of-stack first.
+    current_dsp: u64,
+
+    /// Runtime-created colon definitions currently visible in the
+    /// dictionary, newest or oldest order unspecified.
+    runtime_words: Vec<RuntimeWord>,
+    debug_synced_here: u64,
+    debug_synced_latest: u64,
+    debug_function_table: Option<RegisteredFunctionTable>,
+    debug_tracking_enabled: bool,
+
+    /// Post-bootstrap HERE — captured once, used by [`reset`] to roll
+    /// the dict heap back to "just after the bootstrap primitives were
+    /// registered." Everything between `boot_here..` is throwaway: it
+    /// was either a colon definition compiled during a test, or stale
+    /// bytes from a prior test. Reset just moves HERE back and lets the
+    /// next test compile over the top.
+    boot_here:   u64,
+    /// Post-bootstrap LATEST — companion to `boot_here`. Paired so the
+    /// dictionary chain head also rolls back; otherwise `find-name`
+    /// would still see test-defined words pointing into freed body
+    /// memory.
+    boot_latest: u64,
+    /// Post-bootstrap latestxt companion so reset restores the same
+    /// most-recent definition metadata that the dictionary exposes.
+    boot_latestxt: u64,
+}
+
+// SAFETY: Wf64Session holds raw LLVM pointers via `Jit` that aren't
+// `Send` by default. We rely on this Send impl ONLY to park the session
+// in a `OnceLock<Mutex<…>>` for cross-test sharing — and tests run
+// single-threaded (see .cargo/config.toml RUST_TEST_THREADS=1), so the
+// session is never actually accessed from more than one thread. The
+// Mutex enforces the serial-access discipline; the Send impl makes the
+// type fit through the OnceLock's `Sync` requirement.
+unsafe impl Send for Wf64Session {}
+
+impl Wf64Session {
+    pub fn new() -> Result<Self> {
+        Self::with_kernel(KERNEL_ENTRY)
+    }
+
+    pub fn with_kernel(kernel_path: impl AsRef<Path>) -> Result<Self> {
+        let kernel_path = kernel_path.as_ref();
+        if !kernel_path.exists() {
+            anyhow::bail!(
+                "kernel entry not found at {} — run from the WF64 root, or \
+                 pass an explicit path",
+                kernel_path.display()
+            );
+        }
+
+        // SEH dumper is process-wide; install only on first call.
+        let _ = wfasm::seh::install();
+
+        // Assemble.
+        let mut asm = Assembler::new();
+        asm.register_macro("stk", wfasm::asm::macros::stk);
+        let asm_text = asm
+            .assemble_file(kernel_path)
+            .with_context(|| format!("assemble {}", kernel_path.display()))?;
+
+        if std::env::var_os("WF64_DUMP_ASM").is_some() {
+            eprintln!("=== assembled kernel ===\n{asm_text}========================");
+        }
+
+        // JIT setup + declarations.
+        let mut jit = Jit::new("wf64").context("Jit::new")?;
+        jit.add_asm(&asm_text).context("jit add_asm")?;
+        jit.declare_fn("forth_main", 1).context("declare forth_main")?;
+        for &(_, sym, _) in PRIMITIVES {
+            jit.declare_fn(sym, 0)
+                .with_context(|| format!("declare {sym}"))?;
+        }
+        for &helper in KERNEL_HELPERS {
+            jit.declare_fn(helper, 0)
+                .with_context(|| format!("declare helper {helper}"))?;
+        }
+
+        // Bind externs.
+        let _ = wfasm::win32::bind_externs(&asm, &mut jit, |name| -> Option<*mut c_void> {
+            match name {
+                "rt_print_int" => Some(runtime::rt_print_int as *mut c_void),
+                "rt_dot_s"     => Some(runtime::rt_dot_s     as *mut c_void),
+                "rt_emit"      => Some(runtime::rt_emit      as *mut c_void),
+                "rt_type"      => Some(runtime::rt_type      as *mut c_void),
+                "rt_bye"       => Some(runtime::rt_bye       as *mut c_void),
+                "rt_read_line" => Some(runtime::rt_read_line as *mut c_void),
+                _ => None,
+            }
+        }).context("bind_externs failed")?;
+
+        // Pick near memory.
+        let kernel_addr = jit.lookup_addr("forth_main")
+            .context("lookup_addr(forth_main)")?;
+        let region_base = alloc_forth_region(kernel_addr)?;
+        let region_u64 = region_base as u64;
+
+        let dsp_top   = region_u64 + OFFSET_DSP_TOP;
+        let rsp_top   = region_u64 + OFFSET_RSP_TOP;
+        let user_base = region_u64 + OFFSET_USER_BASE;
+        let dict_base = region_u64 + OFFSET_DICT_BASE;
+        let debug_meta_base = region_u64 + REGION_SIZE as u64 - DEBUG_META_SIZE;
+
+        // Initialise user area with an *empty* dictionary. The bootstrap
+        // below will populate it by calling `(create)` and friends.
+        unsafe {
+            let up = user_base as *mut c_void;
+            write_u64(up, USER_BASE_VAR,     10);
+            write_u64(up, USER_STATE_VAR,    0);
+            write_u64(up, USER_LATEST_VAR,   0);                 // empty
+            write_u64(up, USER_HERE_VAR,     dict_base);
+            write_u64(up, USER_DICT_END_VAR, debug_meta_base);
+            write_u64(up, USER_BYE_REQ,      0);
+            write_u64(up, USER_SP0,          dsp_top);
+            write_u64(up, USER_RSP_CURRENT,  rsp_top);
+            write_u64(up, USER_LATESTXT_VAR, 0);
+            write_u64(up, USER_HANDLER_VAR,  0);
+            write_u64(up, USER_THROW_CODE,   0);
+            write_u64(up, USER_FORGET_FENCE, 0);
+        }
+
+        // Register kernel procs with SEH for symbolic crash dumps.
+        let proc_names: Vec<&str> = std::iter::once("forth_main")
+            .chain(PRIMITIVES.iter().map(|&(_, sym, _)| sym))
+            .chain(KERNEL_HELPERS.iter().copied())
+            .collect();
+        wfasm::seh::register_jit_procs(&mut jit, &proc_names)
+            .context("register kernel procs with SEH")?;
+
+        let forth_main: ForthMain = unsafe { jit.lookup_fn("forth_main") }
+            .context("lookup forth_main")?;
+
+        let mut session = Wf64Session {
+            jit,
+            forth_main,
+            region_base: region_u64,
+            dsp_top,
+            rsp_top,
+            user_base,
+            dict_base,
+            debug_meta_base,
+            current_dsp: dsp_top,
+            runtime_words: Vec::new(),
+            debug_synced_here: dict_base,
+            debug_synced_latest: 0,
+            debug_function_table: None,
+            debug_tracking_enabled: false,
+            // Provisional — overwritten after bootstrap. We need the
+            // session constructed to call `bootstrap_dictionary` (which
+            // mutates `self.jit` and the user area), so the post-boot
+            // snapshot can only happen after.
+            boot_here: 0,
+            boot_latest: 0,
+            boot_latestxt: 0,
+        };
+
+        // Bootstrap the dictionary via kernel primitives. From this
+        // point on, the kernel's view of HERE/LATEST is the only one
+        // we have — Rust knows nothing about the header layout.
+        session.bootstrap_dictionary()?;
+        session.boot_here   = session.here();
+        session.boot_latest = session.latest();
+        session.boot_latestxt = session.user_u64(USER_LATESTXT_VAR);
+        session.write_user_u64(USER_FORGET_FENCE, session.boot_latest);
+        session.debug_synced_here = session.boot_here;
+        session.debug_synced_latest = session.boot_latest;
+        session.debug_tracking_enabled = true;
+
+        if std::env::var_os("WF64_BOOT_INFO").is_some() {
+            eprintln!("WF64 boot info:");
+            eprintln!("  kernel addr  = {kernel_addr:#018x}");
+            eprintln!("  region base  = {region_u64:#018x}");
+            eprintln!("  HERE         = {:#018x}", session.here());
+            eprintln!("  LATEST       = {:#018x}", session.latest());
+            eprintln!("  primitives   = {}", PRIMITIVES.len());
+        }
+
+        Ok(session)
+    }
+
+    /// Populate the initial dictionary by calling `(create)` and
+    /// `(set-xt)` / `(set-flags)` once per primitive. Runs after the
+    /// session is otherwise fully constructed.
+    fn bootstrap_dictionary(&mut self) -> Result<()> {
+        // Collect the xts first to avoid mutable-borrow conflicts on
+        // self.jit during the iteration.
+        let entries: Vec<(&'static str, &'static str, u64, u8)> = PRIMITIVES.iter()
+            .map(|&(forth_name, asm_sym, flags)| -> Result<_> {
+                let xt = self.jit.lookup_addr(asm_sym)
+                    .with_context(|| format!("lookup_addr({asm_sym}) for `{forth_name}`"))?;
+                Ok((forth_name, asm_sym, xt, flags))
+            })
+            .collect::<Result<_>>()?;
+
+        // Look up the bootstrap primitives' xts up-front.
+        let xt_create    = self.xt_of("create")?;
+        let xt_set_xt    = self.xt_of("set_xt")?;
+        let xt_set_comp  = self.xt_of("set_comp")?;
+        let xt_set_flags = self.xt_of("set_flags")?;
+
+        let pad = self.user_base + USER_PAD;
+
+        for (forth_name, asm_sym, xt, flags) in entries {
+            // Copy the name bytes into PAD.
+            let name = forth_name.as_bytes();
+            assert!(!name.is_empty() && name.len() <= 255,
+                "primitive name `{forth_name}` length out of range");
+            unsafe {
+                std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len());
+            }
+            // (create) ( c-addr u -- )
+            self.push(pad as i64);
+            self.push(name.len() as i64);
+            self.call_xt(xt_create)?;
+            let header = self.latest();
+            // (set-xt) ( xt -- )
+            self.push(xt as i64);
+            self.call_xt(xt_set_xt)?;
+            self.write_primitive_xt_backref(xt, header)?;
+            if let Some(comp_xt) = self.primitive_comp_helper(asm_sym)? {
+                self.push(comp_xt as i64);
+                self.call_xt(xt_set_comp)?;
+            }
+            // (set-flags) ( n -- ) — only when non-zero.
+            if flags != 0 {
+                self.push(flags as i64);
+                self.call_xt(xt_set_flags)?;
+            }
+        }
+        // Stack should be empty after the bootstrap.
+        debug_assert_eq!(self.depth(), 0,
+            "bootstrap left {} cells on the stack", self.depth());
+        Ok(())
+    }
+
+    fn primitive_comp_helper(&mut self, asm_sym: &str) -> Result<Option<u64>> {
+        let helper = match asm_sym {
+            "dup_" => Some("inline_dup_comp"),
+            "drop_" => Some("inline_drop_comp"),
+            "swap_" => Some("inline_swap_comp"),
+            "over_" => Some("inline_over_comp"),
+            "to_r" => Some("inline_to_r_comp"),
+            "r_from" => Some("inline_r_from_comp"),
+            "r_fetch" => Some("inline_r_fetch_comp"),
+            "two_to_r" => Some("inline_two_to_r_comp"),
+            "two_r_from" => Some("inline_two_r_from_comp"),
+            "two_r_fetch" => Some("inline_two_r_fetch_comp"),
+            "i_word" => Some("inline_i_comp"),
+            "j_word" => Some("inline_j_comp"),
+            "do_part1" => Some("inline_do_part1_comp"),
+            "do_part2" => Some("inline_do_part2_comp"),
+            "bra_word" => Some("inline_bra_comp"),
+            "qbra_word" => Some("inline_qbra_comp"),
+            "minus_qbra_word" => Some("inline_minus_qbra_comp"),
+            "bra_qdo_word" => Some("inline_bra_qdo_comp"),
+            "loop_word" => Some("inline_loop_comp"),
+            "plus_loop_word" => Some("inline_plus_loop_comp"),
+            "minus_loop_word" => Some("inline_minus_loop_comp"),
+            "unloop_word" => Some("inline_unloop_comp"),
+            _ => None,
+        };
+        helper
+            .map(|name| {
+                self.jit.lookup_addr(name)
+                    .with_context(|| format!("lookup_addr({name}) for comp helper of `{asm_sym}`"))
+            })
+            .transpose()
+    }
+
+    fn write_primitive_xt_backref(&self, xt: u64, header: u64) -> Result<()> {
+        let ct = header + DH_CT;
+        let offset = ct as i64 - xt as i64;
+        let slot = xt - XT_META_OFFSET;
+        let page_mask = (PAGE_SIZE as u64) - 1;
+        let page = slot & !page_mask;
+        let end_page = (slot + (std::mem::size_of::<i64>() as u64) - 1) & !page_mask;
+        let protect_size = if end_page == page { PAGE_SIZE } else { PAGE_SIZE * 2 };
+        let mut old_protect = 0;
+        unsafe {
+            let ok = VirtualProtect(
+                page as *mut c_void,
+                protect_size,
+                PAGE_EXECUTE_READWRITE,
+                &mut old_protect,
+            );
+            if ok == 0 {
+                anyhow::bail!(
+                    "VirtualProtect RWX failed for primitive xt metadata at {slot:#x}: {}",
+                    GetLastError()
+                );
+            }
+
+            (slot as *mut i64).write(offset);
+
+            let mut restore_unused = 0;
+            let ok = VirtualProtect(
+                page as *mut c_void,
+                protect_size,
+                old_protect,
+                &mut restore_unused,
+            );
+            if ok == 0 {
+                anyhow::bail!(
+                    "VirtualProtect restore failed for primitive xt metadata at {slot:#x}: {}",
+                    GetLastError()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Address of a primitive (or any JITed symbol).
+    pub fn xt_of(&mut self, asm_sym: &str) -> Result<u64> {
+        self.jit.lookup_addr(asm_sym)
+            .with_context(|| format!("lookup_addr({asm_sym})"))
+    }
+
+    /// User-area cell read.
+    fn user_u64(&self, off: u64) -> u64 {
+        unsafe { ((self.user_base + off) as *const u64).read_unaligned() }
+    }
+
+    fn write_user_u64(&self, off: u64, v: u64) {
+        unsafe { ((self.user_base + off) as *mut u64).write_unaligned(v); }
+    }
+
+    /// HERE — next free byte in the dictionary heap.
+    pub fn here(&self)   -> u64 { self.user_u64(USER_HERE_VAR) }
+    /// STATE — 0 interpret, 1 compile.
+    pub fn state(&self)  -> u64 { self.user_u64(USER_STATE_VAR) }
+    /// LATEST — head of dictionary chain.
+    pub fn latest(&self) -> u64 { self.user_u64(USER_LATEST_VAR) }
+
+    /// Returns the current data stack, top first. `stack()[0]` is TOS.
+    pub fn stack(&self) -> Vec<i64> {
+        let depth = ((self.dsp_top - self.current_dsp) / 8) as usize;
+        (0..depth).map(|i| {
+            let addr = self.current_dsp + (i as u64) * 8;
+            unsafe { (addr as *const i64).read_unaligned() }
+        }).collect()
+    }
+
+    pub fn depth(&self) -> usize {
+        ((self.dsp_top - self.current_dsp) / 8) as usize
+    }
+
+    /// Push a cell onto the data stack.
+    pub fn push(&mut self, v: i64) {
+        self.current_dsp -= 8;
+        unsafe { (self.current_dsp as *mut i64).write_unaligned(v); }
+    }
+
+    /// Pop a cell. Panics on underflow — tests should know what's there.
+    pub fn pop(&mut self) -> i64 {
+        assert!(self.current_dsp < self.dsp_top, "stack underflow in pop()");
+        let v = unsafe { (self.current_dsp as *const i64).read_unaligned() };
+        self.current_dsp += 8;
+        v
+    }
+
+    /// Invoke any JITed entry point. `target_xt` may be a primitive's
+    /// xt or any other code address (e.g., a colon-defined word's body).
+    /// Captures the resulting data-stack state.
+    ///
+    /// Wire-format with the kernel: pure in-memory stack. `current_dsp`
+    /// is the address of the top cell (or `dsp_top` when empty);
+    /// `forth_main` translates to/from its internal register-cached
+    /// TOS via prologue/epilogue.
+    pub fn call_xt(&mut self, target_xt: u64) -> Result<()> {
+        self.write_user_u64(USER_BYE_REQ, 0);
+        self.write_user_u64(USER_THROW_CODE, 0);
+        let fm = self.forth_main;
+        unsafe { fm(target_xt, self.current_dsp, self.rsp_top, self.user_base); }
+        self.current_dsp = self.user_u64(USER_DSP_SAVE);
+        let throw_code = self.user_u64(USER_THROW_CODE) as i64;
+        if throw_code != 0 {
+            self.write_user_u64(USER_THROW_CODE, 0);
+            anyhow::bail!("Forth THROW {throw_code}");
+        }
+        if self.debug_tracking_enabled {
+            self.refresh_runtime_debug_info()?;
+        }
+        Ok(())
+    }
+
+    /// Invoke a primitive by its asm symbol.
+    pub fn call(&mut self, asm_sym: &str) -> Result<()> {
+        let xt = self.xt_of(asm_sym)?;
+        self.call_xt(xt)
+    }
+
+    /// Feed text through the REPL (quit). Returns captured stdout.
+    pub fn eval(&mut self, input: &str) -> Result<String> {
+        let io = runtime::Io::Buffered {
+            input: input.as_bytes().to_vec(),
+            in_cursor: 0,
+            output: Vec::new(),
+        };
+        let xt_quit = self.xt_of("quit")?;
+        let mut err = Ok(());
+        let (_, io_after) = runtime::with_io(io, || {
+            err = self.call_xt(xt_quit);
+        });
+        err?;
+        match io_after {
+            runtime::Io::Buffered { output, .. } => {
+                Ok(String::from_utf8_lossy(&output).into_owned())
+            }
+            runtime::Io::Live => unreachable!("eval installed Buffered"),
+        }
+    }
+
+    /// Load a Forth source file through the normal REPL pipeline.
+    ///
+    /// This is intentionally simple for the current bootstrap stage:
+    /// the host reads the file and feeds it to `quit`, so source files
+    /// use the same parser/compiler path as interactive input.
+    pub fn load_source_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("read Forth source {}", path.display()))?;
+        self.eval(&source)
+            .with_context(|| format!("load Forth source {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Runtime-created Forth words currently visible in the dictionary.
+    /// Each tuple is `(name, start_addr, end_addr)`.
+    pub fn debug_words(&self) -> Vec<(String, u64, u64)> {
+        self.runtime_words
+            .iter()
+            .map(|word| (word.name.clone(), word.start, word.end))
+            .collect()
+    }
+
+    /// Resolve an address into the currently-visible runtime-created
+    /// Forth word that contains it.
+    pub fn resolve_word_addr(&self, addr: u64) -> Option<String> {
+        self.runtime_words
+            .iter()
+            .find(|word| word.start <= addr && addr < word.end)
+            .map(|word| {
+                let off = addr - word.start;
+                if off == 0 {
+                    word.name.clone()
+                } else {
+                    format!("{}+0x{off:x}", word.name)
+                }
+            })
+    }
+
+    /// Roll the session back to its post-bootstrap state — empty data
+    /// stack, empty return stack, dictionary trimmed to just the
+    /// primitives, STATE = interpret, BYE_REQ cleared. The JIT module
+    /// and the primitive headers themselves stay untouched, which is
+    /// what makes sharing one session across many tests cheap: the
+    /// boot cost is amortised, and per-test reset is a handful of
+    /// pointer writes.
+    ///
+    /// Test-defined colon definitions compiled into `boot_here..HERE`
+    /// are abandoned — the bytes remain in memory but become
+    /// unreachable once HERE rolls back and LATEST is unhitched from
+    /// them. Next test compiles right over the top.
+    pub fn reset(&mut self) {
+        self.clear_runtime_unwind_table();
+        self.current_dsp = self.dsp_top;
+        self.write_user_u64(USER_BASE_VAR,     10);
+        self.write_user_u64(USER_HERE_VAR,     self.boot_here);
+        self.write_user_u64(USER_LATEST_VAR,   self.boot_latest);
+        self.write_user_u64(USER_STATE_VAR,    0);
+        self.write_user_u64(USER_BYE_REQ,      0);
+        self.write_user_u64(USER_RSP_CURRENT,  self.rsp_top);
+        self.write_user_u64(USER_DSP_SAVE,     self.dsp_top);
+        self.write_user_u64(USER_LATESTXT_VAR, self.boot_latestxt);
+        self.write_user_u64(USER_HANDLER_VAR,  0);
+        self.write_user_u64(USER_THROW_CODE,   0);
+        self.runtime_words.clear();
+        self.debug_synced_here = self.boot_here;
+        self.debug_synced_latest = self.boot_latest;
+    }
+
+    /// Run the REPL with live stdin/stdout. Used by `src/main.rs`.
+    /// Returns when the user types `bye` or stdin hits EOF.
+    pub fn run_interactive(&mut self) -> Result<()> {
+        let xt_quit = self.xt_of("quit")?;
+        let mut err = Ok(());
+        let (_, _) = runtime::with_io(runtime::Io::Live, || {
+            err = self.call_xt(xt_quit);
+        });
+        err
+    }
+
+    fn refresh_runtime_debug_info(&mut self) -> Result<()> {
+        let here = self.here();
+        let latest = self.latest();
+        if here == self.debug_synced_here && latest == self.debug_synced_latest {
+            return Ok(());
+        }
+
+        let words = self.scan_runtime_words()?;
+        self.install_runtime_unwind_table(&words)?;
+        wfasm::seh::register_many(
+            words
+                .iter()
+                .map(|word| (format!("forth:{}", word.name), word.start, "forth_word")),
+        );
+        self.runtime_words = words;
+        self.debug_synced_here = here;
+        self.debug_synced_latest = latest;
+        Ok(())
+    }
+
+    fn scan_runtime_words(&self) -> Result<Vec<RuntimeWord>> {
+        let mut headers = Vec::new();
+        let mut header = self.latest();
+        while header != 0 && header != self.boot_latest {
+            headers.push(header);
+            header = self.read_u64(header + DH_LINK);
+        }
+
+        let mut words = Vec::with_capacity(headers.len());
+        let mut end = self.here();
+        for header in headers {
+            let start = self.read_u64(header + DH_XTPTR);
+            if self.dict_base <= start && start < end {
+                let name = self.read_name(header)?;
+                words.push(RuntimeWord { name, header, start, end });
+            }
+            end = header;
+        }
+        words.reverse();
+        Ok(words)
+    }
+
+    fn install_runtime_unwind_table(&mut self, words: &[RuntimeWord]) -> Result<()> {
+        self.clear_runtime_unwind_table();
+        if words.is_empty() {
+            return Ok(());
+        }
+
+        let unwind_size = std::mem::size_of::<UnwindInfo>() as u64;
+        let required = align_up(unwind_size * words.len() as u64, 4);
+        if required > DEBUG_META_SIZE {
+            anyhow::bail!(
+                "runtime debug metadata exhausted: need {required} bytes for {} words, have {DEBUG_META_SIZE}",
+                words.len()
+            );
+        }
+
+        let mut unwind_cursor = self.debug_meta_base;
+        let mut entries = Vec::with_capacity(words.len());
+        for word in words {
+            unwind_cursor = align_up(unwind_cursor, 4);
+            let unwind_rva = (unwind_cursor - self.region_base) as u32;
+            unsafe {
+                (unwind_cursor as *mut UnwindInfo).write_unaligned(UnwindInfo::leaf());
+            }
+            unwind_cursor += unwind_size;
+
+            entries.push(RuntimeFunction {
+                BeginAddress: (word.start - self.region_base) as u32,
+                EndAddress: (word.end - self.region_base) as u32,
+                UnwindData: unwind_rva,
+            });
+        }
+
+        let entries = entries.into_boxed_slice();
+        let ok = unsafe {
+            RtlAddFunctionTable(entries.as_ptr(), entries.len() as u32, self.region_base)
+        };
+        if ok == 0 {
+            anyhow::bail!("RtlAddFunctionTable failed for {} runtime words", entries.len());
+        }
+        self.debug_function_table = Some(RegisteredFunctionTable { entries });
+        Ok(())
+    }
+
+    fn clear_runtime_unwind_table(&mut self) {
+        if let Some(table) = self.debug_function_table.take() {
+            unsafe {
+                let _ = RtlDeleteFunctionTable(table.entries.as_ptr());
+            }
+        }
+    }
+
+    fn read_u64(&self, addr: u64) -> u64 {
+        unsafe { (addr as *const u64).read_unaligned() }
+    }
+
+    fn read_name(&self, header: u64) -> Result<String> {
+        let len = unsafe { ((header + DH_NT) as *const u8).read() } as usize;
+        let bytes = unsafe { std::slice::from_raw_parts((header + DH_NAME) as *const u8, len) };
+        String::from_utf8(bytes.to_vec()).context("runtime dictionary name was not valid UTF-8")
+    }
+}
+
+impl Drop for Wf64Session {
+    fn drop(&mut self) {
+        self.clear_runtime_unwind_table();
+    }
+}
+
+unsafe fn write_u64(base: *mut c_void, off: u64, v: u64) {
+    let ptr = (base as *mut u8).add(off as usize) as *mut u64;
+    ptr.write_unaligned(v);
+}
+
+/// Helper used by `main.rs` so the binary doesn't need to know the
+/// kernel path constant directly.
+pub fn default_kernel_path() -> PathBuf {
+    PathBuf::from(KERNEL_ENTRY)
+}

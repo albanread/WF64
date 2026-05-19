@@ -1,0 +1,133 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — source-text parsing.
+;
+; Reads SOURCE-ADDR/SOURCE-LEN/>IN from the user area to walk through
+; the current source buffer. `accept` is the line reader (Win32
+; ReadConsoleA via GetStdHandle); `parse_name` extracts one
+; whitespace-delimited token.
+; ─────────────────────────────────────────────────────────────────────
+
+; parse-name  ( -- c-addr u )
+;     Skip leading whitespace in source, then return (start, length)
+;     of the next whitespace-terminated token. If source is exhausted,
+;     returns (anywhere, 0).
+;
+;     Treats space (0x20), tab (0x09), LF (0x0A), CR (0x0D) as whitespace.
+proc(parse_name)
+    mov     rsi, [UP + user_SOURCE_ADDR]    ; source base
+    mov     rcx, [UP + user_SOURCE_LEN]     ; total length
+    mov     rdx, [UP + user_TO_IN]          ; current offset
+
+    ; --- skip leading whitespace ---
+.skip:
+    cmp     rdx, rcx
+    jae     .empty
+    movzx   r8, byte ptr [rsi + rdx]
+    cmp     r8b, ' '
+    je      .ws
+    cmp     r8b, 9
+    je      .ws
+    cmp     r8b, 10
+    je      .ws
+    cmp     r8b, 13
+    je      .ws
+    cmp     r8b, '\\'
+    je      .line_comment
+    cmp     r8b, '('
+    je      .paren_comment
+    jmp     .scan_start
+.ws:
+    inc     rdx
+    jmp     .skip
+
+.line_comment:
+    inc     rdx
+.line_comment_scan:
+    cmp     rdx, rcx
+    jae     .empty
+    movzx   r8, byte ptr [rsi + rdx]
+    cmp     r8b, 10
+    je      .skip
+    cmp     r8b, 13
+    je      .skip
+    inc     rdx
+    jmp     .line_comment_scan
+
+.paren_comment:
+    inc     rdx
+.paren_comment_scan:
+    cmp     rdx, rcx
+    jae     .empty
+    movzx   r8, byte ptr [rsi + rdx]
+    inc     rdx
+    cmp     r8b, ')'
+    je      .skip
+    jmp     .paren_comment_scan
+
+    ; --- scan token until whitespace or end ---
+.scan_start:
+    mov     r9, rdx                          ; r9 = token start offset
+.scan:
+    cmp     rdx, rcx
+    jae     .done
+    movzx   r8, byte ptr [rsi + rdx]
+    cmp     r8b, ' '
+    je      .done
+    cmp     r8b, 9
+    je      .done
+    cmp     r8b, 10
+    je      .done
+    cmp     r8b, 13
+    je      .done
+    inc     rdx
+    jmp     .scan
+
+.done:
+    ; Update >IN to one past the token end.
+    mov     [UP + user_TO_IN], rdx
+    ; Push ( -- c-addr length ).
+    ;
+    ; Slot layout: after `sub rbp, 16`, [new_rbp] is the new NOS and
+    ; [new_rbp + 8] is the new NNOS. So writing BEFORE the sub:
+    ;   [rbp - 16] → new NOS slot       ← c-addr
+    ;   [rbp -  8] → new NNOS slot      ← old TOS (preserve)
+    mov     [DSP - cell], TOS                ; old TOS → NNOS slot
+    lea     rcx, [rsi + r9]
+    mov     [DSP - 2*cell], rcx              ; c-addr → NOS slot
+    mov     TOS, rdx
+    sub     TOS, r9                          ; TOS ← length
+    stk(0, 2)                                ; emit `sub rbp, 16`
+    next()
+
+.empty:
+    ; Source exhausted: push ( -- 0 0 ).
+    mov     [UP + user_TO_IN], rcx
+    mov     [DSP - cell], TOS                ; old TOS → NNOS slot
+    mov     qword ptr [DSP - 2*cell], 0      ; 0 → NOS slot
+    xor     TOS, TOS                         ; TOS = 0
+    stk(0, 2)
+    next()
+endp()
+
+
+; accept  ( c-addr +n1 -- +n2 )
+;     Read one line of input into c-addr (at most n1 bytes, terminator
+;     not included). Return the byte count. EOF returns 0.
+;
+;     Delegates to the Rust runtime function `rt_read_line` which
+;     handles two backings transparently:
+;       * Buffered (tests) — reads from an in-memory input vector,
+;         line by line.
+;       * Live (interactive REPL) — reads from stdin via Rust's
+;         line-buffered BufRead, which works equally well on consoles
+;         and on redirected stdin.
+;     LF and CRLF are both stripped before the count is returned.
+proc(accept)
+    ; Win64 args: rcx = buffer addr, rdx = capacity.
+    mov     rcx, [DSP]               ; arg1 = c-addr (NOS)
+    mov     rdx, TOS                 ; arg2 = +n1
+    win64_call(rt_read_line)
+    ; rax = bytes written. ( c-addr +n1 -- +n2 ).
+    stk(2, 1)
+    next()
+endp()
