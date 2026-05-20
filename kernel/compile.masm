@@ -883,6 +883,19 @@ endp()
 ; Runtime helper for DOES>. Rewrites the most recently created word's
 ; stub tail from RET+padding to JMP does-body, preserving the body
 ; address push in the stub prefix.
+;
+; KNOWN ISSUE: this proc's `mov TOS, [DSP]; stk(1, 0)` pair pops a
+; cell from the user's data stack. Combined with the `mov rax, target`
+; in the does> stub that overwrites the cached TOS without spilling,
+; each call to a does>-defining word (constant, value, defer, etc.)
+; consumes ONE extra cell beyond what its `,` legitimately took. So
+; `42 constant ten` net-consumes 2 cells, not 1.
+;
+; A draft fix (rcx-pass target + remove the pop here) is correct in
+; isolation but breaks the search-order tests, which were calibrated
+; against the -2 cell behavior. Fixing this needs a coordinated pass
+; across does>, lib/core.f, and the test assertions. Deferred to its
+; own task — see #27.
 proc(does_runtime_patch)
     mov     r8, [UP + user_LATESTXT]            ; xt of latest created word
     lea     r9, [r8 + 23]                       ; IP after jmp rel32

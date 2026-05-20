@@ -125,13 +125,31 @@ proc(search_header_in_wordlist)
     ret
 endp()
 
+; search_header_in_order
+;     Walk CONTEXT[0..ORDER_COUNT], calling search_header_in_wordlist
+;     for each wid until one returns non-null.
+;
+;     **Win64 ABI trap**: r8 and r9 are caller-saved. The earlier
+;     version held the loop count in r8 and the loop index in r9
+;     across the call — both got clobbered by search_header_in_wordlist
+;     (which uses r8/r9 heavily for its hash walk). After the call
+;     `cmp r9, r8` then compared garbage to garbage, frequently
+;     exiting after the FIRST wordlist instead of falling through to
+;     the rest of the search order. This was the root cause of "bye
+;     is unfindable after `forth-wordlist wordlist 2 set-order`":
+;     CONTEXT[0] (the new empty wid) was searched correctly, then
+;     CONTEXT[1] (forth_wid) was skipped.
+;
+;     Fixed by spilling the loop counter to the local stack frame
+;     and re-loading ORDER_COUNT from the user area on each iteration.
 proc(search_header_in_order)
-    sub     rsp, 16
-    mov     [rsp], rsi
-    mov     [rsp + 8], rcx
-    mov     r8, [UP + user_ORDER_COUNT]
-    xor     r9, r9
+    sub     rsp, 24
+    mov     [rsp],      rsi         ; query addr
+    mov     [rsp + 8],  rcx         ; query len
+    mov     qword ptr [rsp + 16], 0  ; loop counter
 .loop:
+    mov     r9, [rsp + 16]
+    mov     r8, [UP + user_ORDER_COUNT]
     cmp     r9, r8
     jae     .not_found
     mov     rsi, [rsp]
@@ -140,15 +158,17 @@ proc(search_header_in_order)
     call    search_header_in_wordlist
     test    rax, rax
     jnz     .found
+    mov     r9, [rsp + 16]
     inc     r9
+    mov     [rsp + 16], r9
     jmp     .loop
 
 .found:
-    add     rsp, 16
+    add     rsp, 24
     ret
 
 .not_found:
-    add     rsp, 16
+    add     rsp, 24
     xor     rax, rax
     ret
 endp()
