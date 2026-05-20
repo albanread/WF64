@@ -884,23 +884,18 @@ endp()
 ; stub tail from RET+padding to JMP does-body, preserving the body
 ; address push in the stub prefix.
 ;
-; KNOWN ISSUE: this proc's `mov TOS, [DSP]; stk(1, 0)` pair pops a
-; cell from the user's data stack. Combined with the `mov rax, target`
-; in the does> stub that overwrites the cached TOS without spilling,
-; each call to a does>-defining word (constant, value, defer, etc.)
-; consumes ONE extra cell beyond what its `,` legitimately took. So
-; `42 constant ten` net-consumes 2 cells, not 1.
-;
-; A draft fix (rcx-pass target + remove the pop here) is correct in
-; isolation but breaks the search-order tests, which were calibrated
-; against the -2 cell behavior. Fixing this needs a coordinated pass
-; across does>, lib/core.f, and the test assertions. Deferred to its
-; own task — see #27.
+; KNOWN ISSUE (#27): see `kernel/compile.masm` history. The stub
+; emits `mov rax, target` then this proc reads TOS and "pops" — net
+; consuming an extra cell beyond `,`. A correct fix exists (pass
+; target in rcx, drop the pop) but reveals a separate bug somewhere
+; in core.f loading that underflows the data stack at line 73's
+; `' (comp-fconst) ' fconstant compiles`. Reverted until the
+; underlying bug is found.
 proc(does_runtime_patch)
     mov     r8, [UP + user_LATESTXT]            ; xt of latest created word
     lea     r9, [r8 + 23]                       ; IP after jmp rel32
     mov     byte ptr [r8 + 18], 0xE9           ; JMP rel32 opcode
-    mov     r10, TOS                            ; target address
+    mov     r10, TOS                            ; target address (from `mov rax,target` in stub)
     sub     r10, r9                             ; rel32 = target - next_ip
     mov     dword ptr [r8 + 19], r10d
     mov     TOS, [DSP]

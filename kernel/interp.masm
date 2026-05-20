@@ -85,17 +85,31 @@ proc(interpret_source)
     ; ── Trace hook ───────────────────────────────────────────────────
     ; If user_TRACE is set, call rt_forth_trace(nt, tos, dsp, sp0)
     ; before executing the word.  r9 still holds the header base from
-    ; .found_word; nt = r9 + dh_nt.  rdx = xt ptr (saved across the
-    ; call by pushing it on the return stack).
+    ; .found_word; nt = r9 + dh_nt.  rdx = xt ptr.
+    ;
+    ; Win64 caveat: rt_forth_trace clobbers all caller-saved regs
+    ; (rax, rcx, rdx, r8-r11). The caller's TOS lives ONLY in rax at
+    ; this point (it was raised twice in .found_word). Pass it as
+    ; arg2 (rdx) for the trace, but ALSO spill it to the future-NOS
+    ; slot BEFORE the call so the value survives — otherwise .do_exec
+    ; would spill post-call garbage-rax into NOS and corrupt the stack
+    ; under every traced word.
     cmp     qword ptr [UP + user_TRACE], 0
     jz      .do_exec
-    push    rdx                             ; save xt on the Forth rstack
-    lea     rcx, [r9 + dh_nt]              ; arg1 = nt (counted-string ptr)
+    push    rdx                             ; save xt across the call
+    mov     [DSP - cell], TOS               ; pre-spill caller's TOS into
+                                             ; what will become the new NOS
+    lea     rcx, [r9 + dh_nt]               ; arg1 = nt
     mov     rdx, TOS                        ; arg2 = current TOS
     mov     r8,  DSP                        ; arg3 = DSP
     mov     r9,  [UP + user_SP0]            ; arg4 = SP0
     win64_call(rt_forth_trace)
     pop     rdx                             ; restore xt
+    ; The spill already happened; just commit DSP and dispatch.
+    mov     TOS, rdx
+    sub     DSP, cell
+    call    execute
+    jmp     .tokens
 .do_exec:
     mov     [DSP - cell], TOS
     mov     TOS, rdx

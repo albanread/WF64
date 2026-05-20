@@ -38,16 +38,25 @@ endp()
 
 ; float?  ( c-addr u -- -1 | c-addr u 0 )  ( F: -- r )
 ;     Parse a decimal floating-point token when BASE is decimal.
+;
+;     Win64 caveat: r10 and r11 are caller-saved volatile registers, so
+;     `win64_call(rt_to_float)` clobbers them. The earlier version held
+;     the original c-addr / u in r10 / r11 across the call, and the
+;     .invalid path then spilled the garbage-r11 to NOS — corrupting the
+;     length pushed back to the interpreter for every decimal token that
+;     wasn't a valid float. Cache `u` in r15 (callee-saved, reserved by
+;     the kernel for exactly this) so it survives. c-addr is unchanged
+;     at [DSP] across the call, no save needed.
 proc(float_q)
-    mov     r10, [DSP]                      ; original c-addr
-    mov     r11, TOS                        ; original u
+    mov     r10, [DSP]                      ; original c-addr (only used pre-call)
+    mov     r15, TOS                        ; original u — r15 survives the call
     cmp     qword ptr [UP + user_BASE], 10
     jne     .invalid
-    test    r11, r11
+    test    r15, r15
     jz      .invalid
 
     mov     rcx, r10
-    mov     rdx, r11
+    mov     rdx, r15
     lea     r8, [UP + user_FP_TMP]
     win64_call(rt_to_float)
     test    rax, rax
@@ -63,7 +72,7 @@ proc(float_q)
     next()
 
 .invalid:
-    mov     [DSP - cell], r11
+    mov     [DSP - cell], r15               ; r15 still holds the original u
     xor     TOS, TOS
     stk(2, 3)
     next()
