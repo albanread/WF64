@@ -12,3 +12,4 @@
 @extern rt_type(2)              ; write u bytes from addr to current output
 @extern rt_bye(1)               ; legacy; bye is now cooperative (kept for binding)
 @extern rt_read_line(2)         ; read one line into buf (cap); returns bytes read
+@extern rt_to_float(3)          ; parse addr+len as decimal float, store bits, return flag

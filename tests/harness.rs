@@ -140,6 +140,31 @@ fn eval_brackets_and_literal_compile_interpreted_value() {
 }
 
 #[test]
+fn eval_source_and_to_in_can_skip_rest_of_line() {
+    let mut s = sess();
+    let out = s.eval(": skip-rest source >in ! drop ;\nskip-rest 123 .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n");
+}
+
+#[test]
+fn eval_state_exposes_compilation_flag_address() {
+    let mut s = sess();
+    let out = s
+        .eval("state @ .\n: compiling? state @ ; immediate\n: compiled-state compiling? literal ;\ncompiled-state 0= .\nbye\n")
+        .unwrap();
+    assert_eq!(out, "0  ok\n ok\n ok\n0  ok\n");
+}
+
+#[test]
+fn eval_parse_word_and_pad_work() {
+    let mut s = sess();
+    let out = s
+        .eval(": upto-comma 32 parse 2drop 44 parse ;\nupto-comma hello, type cr\npad dup 65 swap c! c@ .\n32 word hello count type cr\nbye\n")
+        .unwrap();
+    assert_eq!(out, " ok\nhello\n ok\n65  ok\nhello\n ok\n");
+}
+
+#[test]
 fn eval_tick_pushes_interpret_xt() {
     let mut s = sess();
     let out = s.eval("5 ' dup execute . .\nbye\n").unwrap();
@@ -218,6 +243,28 @@ fn load_source_file_provides_bl_space_and_spaces() {
 }
 
 #[test]
+fn load_source_file_provides_char_bracket_char_true_and_false() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval("true .\nfalse .\nchar Z .\n: zchar [char] Z ;\nzchar .\nbye\n")
+        .unwrap();
+    assert_eq!(out, "-1  ok\n0  ok\n90  ok\n ok\n90  ok\n");
+}
+
+#[test]
+fn load_source_file_provides_find() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval("7 bl word dup find drop execute . .\nbl word if find nip .\nbl word nosuch find nip .\nbye\n")
+        .unwrap();
+    assert_eq!(out, "7 7  ok\n1  ok\n0  ok\n");
+}
+
+#[test]
 fn load_source_file_provides_variable_defining_word() {
     let mut s = sess();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
@@ -233,6 +280,24 @@ fn load_source_file_provides_constant_defining_word() {
     s.load_source_file(&path).unwrap();
     let out = s.eval("10 constant ten\nten .\nbye\n").unwrap();
     assert_eq!(out, " ok\n10  ok\n");
+}
+
+#[test]
+fn load_source_file_provides_fvariable_defining_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("fvariable foo\n9e foo f!\nfoo f@ f>d drop .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n9  ok\n");
+}
+
+#[test]
+fn load_source_file_provides_fconstant_defining_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("7e fconstant seven\nseven f>d drop .\n: use-seven seven ;\nuse-seven f>d drop .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n7  ok\n ok\n7  ok\n");
 }
 
 #[test]

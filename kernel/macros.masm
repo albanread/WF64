@@ -55,6 +55,13 @@
 @assign source_buf_size  = 4096
 @assign user_DO_TMP0     = 0x1200    ; callable do-part1/do-part2 scratch: limit/bias base
 @assign user_DO_TMP1     = 0x1208    ; callable do-part1/do-part2 scratch: start/adjusted index
+@assign user_FP0         = 0x1210    ; empty floating-point stack pointer
+@assign user_FSP         = 0x1218    ; current floating-point stack pointer
+@assign user_FP_TMP      = 0x1220    ; float parser scratch (raw IEEE-754 bits)
+@assign user_FP_STACK    = 0x1300    ; 256-byte floating-point stack area
+@assign fp_stack_size    = 0x100
+@assign user_WORD_BUF    = 0x1400    ; 256-byte transient counted-string buffer for WORD
+@assign word_buf_size    = 0x100
 
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier

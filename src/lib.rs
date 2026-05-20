@@ -196,6 +196,27 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("+",          "plus",       0),
     ("*",          "times",      0),
     ("-",          "minus",            0),
+    ("fdepth",     "fdepth",           0),
+    ("fdrop",      "fdrop",            0),
+    ("fdup",       "fdup",             0),
+    ("fswap",      "fswap",            0),
+    ("fover",      "fover",            0),
+    ("d>f",        "d_to_f",           0),
+    ("f>d",        "f_to_d",           0),
+    ("f@",         "f_fetch",          0),
+    ("f!",         "f_store",          0),
+    ("float+",     "float_plus",       0),
+    ("floats",     "floats",           0),
+    ("falign",     "falign",           0),
+    ("faligned",   "faligned",         0),
+    ("f+",         "f_plus",           0),
+    ("f-",         "f_minus",          0),
+    ("f*",         "f_times",          0),
+    ("f/",         "f_slash",          0),
+    ("fnegate",    "f_negate",         0),
+    ("f0=",        "f_zero_equal",     0),
+    ("f0<",        "f_zero_less",      0),
+    ("f<",         "f_less",           0),
     ("negate",     "negate",           0),
     ("abs",        "abs",              0),
     ("1+",         "one_plus",         0),
@@ -296,6 +317,12 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("bye",        "bye",        0),
     // Parse & dict
     ("parse-name", "parse_name", 0),
+    ("pad",        "pad_word",    0),
+    ("parse",      "parse_word",  0),
+    ("word",       "word_word",   0),
+    ("source",     "source_word", 0),
+    ("state",      "state_word", 0),
+    (">in",        "to_in_word", 0),
     ("find-name",  "find_name",  0),
     (">ct",        "to_ct",      0),
     (">comp",      "to_comp",    0),
@@ -331,6 +358,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("'",          "tick_word",   0),
     ("[']",        "bracket_tick_word", 1),
     ("literal",    "literal_word", 1),
+    ("fliteral",   "fliteral_word", 1),
     ("postpone",   "postpone_word", 1),
     ("does>",      "does_word",   1),
     (":",          "colon",      0),
@@ -341,6 +369,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
 /// Kernel-internal helper symbols (JIT-resolvable, NOT in the dict).
 pub const KERNEL_HELPERS: &[&str] = &[
     "do_lit",
+    "do_flit",
     "compile_word",
     "compile_comma",
     "inline_dup_comp",
@@ -366,6 +395,7 @@ pub const KERNEL_HELPERS: &[&str] = &[
     "inline_minus_loop_comp",
     "inline_unloop_comp",
     "literal",
+    "fliteral",
 ];
 
 // ── Memory layout (matches kernel/macros.masm) ───────────────────────
@@ -391,6 +421,9 @@ const USER_LATESTXT_VAR: u64 = 0x78;
 const USER_HANDLER_VAR:  u64 = 0x80;
 const USER_THROW_CODE:   u64 = 0x88;
 const USER_FORGET_FENCE: u64 = 0x98;
+const USER_FP0:          u64 = 0x1210;
+const USER_FSP:          u64 = 0x1218;
+const USER_FP_STACK:     u64 = 0x1300;
 
 // (Dictionary header layout deliberately not mirrored here — it lives
 // entirely in kernel/macros.masm and kernel/dict.masm. The bootstrap
@@ -663,6 +696,7 @@ impl Wf64Session {
                 "rt_type"      => Some(runtime::rt_type      as *mut c_void),
                 "rt_bye"       => Some(runtime::rt_bye       as *mut c_void),
                 "rt_read_line" => Some(runtime::rt_read_line as *mut c_void),
+                "rt_to_float"  => Some(runtime::rt_to_float  as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;
@@ -695,6 +729,8 @@ impl Wf64Session {
             write_u64(up, USER_HANDLER_VAR,  0);
             write_u64(up, USER_THROW_CODE,   0);
             write_u64(up, USER_FORGET_FENCE, 0);
+            write_u64(up, USER_FP0,          user_base + USER_FP_STACK + 0x100);
+            write_u64(up, USER_FSP,          user_base + USER_FP_STACK + 0x100);
         }
 
         // Register kernel procs with SEH for symbolic crash dumps.
@@ -1052,6 +1088,8 @@ impl Wf64Session {
         self.write_user_u64(USER_LATESTXT_VAR, self.boot_latestxt);
         self.write_user_u64(USER_HANDLER_VAR,  0);
         self.write_user_u64(USER_THROW_CODE,   0);
+        self.write_user_u64(USER_FP0,          self.user_base + USER_FP_STACK + 0x100);
+        self.write_user_u64(USER_FSP,          self.user_base + USER_FP_STACK + 0x100);
         self.runtime_words.clear();
         self.debug_synced_here = self.boot_here;
         self.debug_synced_latest = self.boot_latest;

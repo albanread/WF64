@@ -28,6 +28,20 @@ proc(do_lit)
     next()
 endp()
 
+; do_flit  ( -- )   [runtime helper, never user-callable]
+;     Compiled by `fliteral` as: call do_flit ; .quad bits
+;     and pushes the IEEE-754 double onto the floating-point stack.
+proc(do_flit)
+    mov     r9, [rsp]
+    mov     r10, [r9]
+    add     qword ptr [rsp], 8
+    mov     rcx, [UP + user_FSP]
+    sub     rcx, cell
+    mov     [rcx], r10
+    mov     [UP + user_FSP], rcx
+    next()
+endp()
+
 ; compile  ( xt -- )
 ;     WF32-style compile token for ordinary words: duplicate xt, map the
 ;     duplicate to its comp-field address, then dispatch that helper while
@@ -733,6 +747,18 @@ proc(literal_word)
     next()
 endp()
 
+; fliteral  ( F: r -- )                                    IMMEDIATE
+;     Compile the current floating-point top as a runtime literal.
+proc(fliteral_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    fliteral
+    next()
+endp()
+
 ; postpone  ( -<name>- )                                   IMMEDIATE
 ;     Compile the compilation semantics of the next parsed word.
 proc(postpone_word)
@@ -1223,6 +1249,25 @@ proc(literal)
     ; Drop n.
     mov     TOS, [DSP]
     stk(1, 0)
+    next()
+endp()
+
+; fliteral  ( F: r -- )               [compile-time only, not in dict]
+;     Compile the sequence  call do_flit ; .quad bits   at HERE.
+proc(fliteral)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8], 0xE8
+    lea     r9, [rip + do_flit]
+    sub     r9, r8
+    sub     r9, 5
+    mov     dword ptr [r8 + 1], r9d
+    mov     rcx, [UP + user_FSP]
+    mov     r10, [rcx]
+    mov     [r8 + 5], r10
+    add     rcx, cell
+    mov     [UP + user_FSP], rcx
+    add     r8, 13
+    mov     [UP + user_HERE], r8
     next()
 endp()
 

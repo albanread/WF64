@@ -12,6 +12,33 @@
 use std::cell::RefCell;
 use std::io::Write;
 
+fn normalize_float_token(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    if !text.bytes().any(|b| b == b'.' || b == b'e' || b == b'E') {
+        return None;
+    }
+
+    let mut out = text.trim().to_string();
+    if out.is_empty() {
+        return None;
+    }
+
+    if let Some(pos) = out.find(['e', 'E']) {
+        if pos + 1 == out.len() {
+            out.push('0');
+        } else {
+            let bytes = out.as_bytes();
+            if (bytes[pos + 1] == b'+' || bytes[pos + 1] == b'-') && pos + 2 == out.len() {
+                out.push('0');
+            }
+        }
+    }
+
+    Some(out)
+}
+
 /// I/O backing for one session. Tests use the `Buffered` variant; the
 /// interactive REPL uses `Live`.
 pub enum Io {
@@ -215,6 +242,27 @@ pub extern "C" fn rt_read_line(buf: u64, cap: u64) -> u64 {
             }
         }
     })
+}
+
+#[no_mangle]
+pub extern "C" fn rt_to_float(addr: u64, len: u64, out_bits: u64) -> u64 {
+    if len == 0 || out_bits == 0 {
+        return 0;
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len as usize) };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    let Some(normalized) = normalize_float_token(text) else {
+        return 0;
+    };
+    let Ok(value) = normalized.parse::<f64>() else {
+        return 0;
+    };
+
+    unsafe { (out_bits as *mut u64).write_unaligned(value.to_bits()) };
+    u64::MAX
 }
 
 /// Write to current output. Buffered: append to vec. Live: stdout + flush.

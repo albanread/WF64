@@ -109,6 +109,161 @@ proc(parse_name)
     next()
 endp()
 
+; source  ( -- c-addr u )
+;     Return the current input buffer descriptor.
+proc(source_word)
+    mov     [DSP - cell], TOS
+    mov     rcx, [UP + user_SOURCE_ADDR]
+    mov     [DSP - 2*cell], rcx
+    mov     TOS, [UP + user_SOURCE_LEN]
+    stk(0, 2)
+    next()
+endp()
+
+; state  ( -- a-addr )
+;     Return the address of the compilation-state flag.
+proc(state_word)
+    mov     [DSP - cell], TOS
+    lea     TOS, [UP + user_STATE]
+    stk(0, 1)
+    next()
+endp()
+
+; >in  ( -- a-addr )
+;     Return the address of the parse-area offset.
+proc(to_in_word)
+    mov     [DSP - cell], TOS
+    lea     TOS, [UP + user_TO_IN]
+    stk(0, 1)
+    next()
+endp()
+
+; pad  ( -- c-addr )
+;     Return the programmer scratch area.
+proc(pad_word)
+    mov     [DSP - cell], TOS
+    lea     TOS, [UP + user_PAD]
+    stk(0, 1)
+    next()
+endp()
+
+; parse  ( char -- c-addr u )
+;     Parse up to the next delimiter char, or to end of the parse area.
+;     If char is zero, parse the remainder of the current input buffer.
+proc(parse_word)
+    movzx   r8d, al                        ; r8b = delimiter char
+    mov     rsi, [UP + user_SOURCE_ADDR]
+    mov     rcx, [UP + user_SOURCE_LEN]
+    mov     rdx, [UP + user_TO_IN]
+    mov     r9, rdx                        ; r9 = start offset
+
+    test    r8b, r8b
+    jz      .scan_to_end
+
+.scan:
+    cmp     rdx, rcx
+    jae     .at_end
+    movzx   r10d, byte ptr [rsi + rdx]
+    cmp     r10b, r8b
+    je      .found
+    inc     rdx
+    jmp     .scan
+
+.found:
+    lea     r11, [rsi + r9]
+    mov     [DSP - cell], r11
+    mov     r10, rdx
+    sub     r10, r9
+    inc     rdx                            ; consume delimiter
+    mov     [UP + user_TO_IN], rdx
+    mov     TOS, r10
+    stk(1, 2)
+    next()
+
+.scan_to_end:
+    mov     rdx, rcx
+
+.at_end:
+    lea     r11, [rsi + r9]
+    mov     [DSP - cell], r11
+    mov     r10, rdx
+    sub     r10, r9
+    mov     [UP + user_TO_IN], rdx
+    mov     TOS, r10
+    stk(1, 2)
+    next()
+endp()
+
+; word  ( char -- c-addr )
+;     Skip leading delimiters, parse a token delimited by char, and
+;     copy it into a transient counted-string buffer.
+proc(word_word)
+    movzx   r8d, al                        ; r8b = delimiter char
+    mov     rsi, [UP + user_SOURCE_ADDR]
+    mov     rcx, [UP + user_SOURCE_LEN]
+    mov     rdx, [UP + user_TO_IN]
+
+    test    r8b, r8b
+    jz      .scan_start
+
+.skip:
+    cmp     rdx, rcx
+    jae     .scan_start
+    movzx   r10d, byte ptr [rsi + rdx]
+    cmp     r10b, r8b
+    jne     .scan_start
+    inc     rdx
+    jmp     .skip
+
+.scan_start:
+    mov     r9, rdx                        ; r9 = token start
+    test    r8b, r8b
+    jz      .copy_at_end
+
+.scan:
+    cmp     rdx, rcx
+    jae     .copy_at_end
+    movzx   r10d, byte ptr [rsi + rdx]
+    cmp     r10b, r8b
+    je      .copy_found
+    inc     rdx
+    jmp     .scan
+
+.copy_found:
+    mov     [UP + user_TO_IN], rdx
+    inc     qword ptr [UP + user_TO_IN]    ; consume delimiter
+    jmp     .copy_out
+
+.copy_at_end:
+    mov     [UP + user_TO_IN], rdx
+
+.copy_out:
+    mov     r10, rdx
+    sub     r10, r9                        ; parsed length
+    cmp     r10, 255
+    jbe     .len_ok
+    mov     r10, 255
+
+.len_ok:
+    lea     r11, [UP + user_WORD_BUF]
+    mov     byte ptr [r11], r10b
+    lea     rdi, [r11 + 1]
+    lea     r13, [rsi + r9]
+    xor     r12, r12
+.copy_loop:
+    cmp     r12, r10
+    jae     .copied
+    mov     al, byte ptr [r13 + r12]
+    mov     byte ptr [rdi + r12], al
+    inc     r12
+    jmp     .copy_loop
+
+.copied:
+    mov     byte ptr [rdi + r10], 0
+    lea     TOS, [UP + user_WORD_BUF]
+    next()
+endp()
+
 
 ; accept  ( c-addr +n1 -- +n2 )
 ;     Read one line of input into c-addr (at most n1 bytes, terminator

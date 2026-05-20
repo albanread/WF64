@@ -34,6 +34,7 @@
 @include "rstack.masm"
 @include "memory.masm"
 @include "arith.masm"
+@include "float.masm"
 @include "logic.masm"
 @include "compare.masm"
 @include "strings.masm"

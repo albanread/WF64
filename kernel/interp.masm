@@ -83,6 +83,14 @@ proc(quit)
     test    TOS, TOS
     jnz     .got_number
 
+    ; Not an integer. Drop the 0 flag and try a decimal float.
+    mov     TOS, [DSP]
+    add     DSP, cell
+
+    call    float_q                          ; ( c-addr u -- -1 | c-addr u 0 ) ( F: -- r )
+    test    TOS, TOS
+    jnz     .got_float
+
     ; Not a number either. Stack: ( c-addr u 0 ), with the iteration's
     ; original TOS preserved at NNNOS (depth +3 above where we entered
     ; the iteration). Drop all 3 and restore the original TOS.
@@ -138,6 +146,16 @@ proc(quit)
     test    r8, r8
     jz      .tokens
     call    literal
+    jmp     .tokens
+
+.got_float:
+    ; Stack: ( -1 ), with the parsed float already on the FP stack.
+    mov     TOS, [DSP]
+    add     DSP, cell
+    mov     r8, [UP + user_STATE]
+    test    r8, r8
+    jz      .tokens
+    call    fliteral
     jmp     .tokens
 
 .end_line:
