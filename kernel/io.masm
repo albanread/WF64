@@ -26,6 +26,26 @@ proc(type_word)
     next()
 endp()
 
+; key  ( -- char )
+;     Read one byte from the current input source without echoing it.
+proc(key_word)
+    mov     [DSP - cell], TOS
+    win64_call(rt_read_key)
+    mov     TOS, rax
+    stk(0, 1)
+    next()
+endp()
+
+; key?  ( -- flag )
+;     True when KEY can return a character without blocking.
+proc(key_q_word)
+    mov     [DSP - cell], TOS
+    win64_call(rt_key_q)
+    mov     TOS, rax
+    stk(0, 1)
+    next()
+endp()
+
 ; cr  ( -- )
 ;     Write a newline.
 proc(cr_word)
@@ -38,15 +58,62 @@ endp()
 
 ; BRK  ( -- )
 ; INT3 ( -- )
-;     Non-fatal debugger breakpoints for Forth code. The VEH dumps
-;     state and resumes execution at the next instruction.
+;     Non-fatal debugger breakpoints for Forth code. Prints a Forth-tuned
+;     state dump (data stack, return stack, key user variables) via
+;     rt_forth_brk, then fires INT 3 so a native debugger can also catch
+;     it. The VEH handler resumes execution after INT 3.
 proc(brk_word)
-    brk()
+    mov     r15, TOS                        ; save TOS (callee-saved, survives the call)
+    ; ── Call rt_forth_brk(tos, dsp, sp0, rsp, up) ─────────────────
+    ; Win64 5-arg convention: rcx/rdx/r8/r9 for args 1-4; arg5 at
+    ; [rsp+32] after the shadow-space allocation.  We allocate
+    ; 48 bytes (32 shadow + 8 for arg5 + 8 alignment pad) so the
+    ; stack stays 16-byte aligned before the CALL.
+    mov     rcx, TOS                        ; arg1 = tos
+    mov     rdx, DSP                        ; arg2 = dsp
+    mov     r8,  [UP + user_SP0]            ; arg3 = sp0
+    mov     r9,  rsp                        ; arg4 = current Forth RSP
+    mov     r12, rsp                        ; Win64 RSP-save slot (same pattern as win64_call)
+    and     rsp, -16
+    sub     rsp, 48
+    mov     [rsp + 32], rbx                 ; arg5 = UP (user area pointer = RBX)
+    call    rt_forth_brk
+    mov     rsp, r12
+    ; ── Fire INT 3 for native debugger ──────────────────────────────
+    int 3
+    mov     TOS, r15                        ; restore TOS
     next()
 endp()
 
 proc(int3_word)
-    brk()
+    mov     r15, TOS
+    mov     rcx, TOS
+    mov     rdx, DSP
+    mov     r8,  [UP + user_SP0]
+    mov     r9,  rsp
+    mov     r12, rsp
+    and     rsp, -16
+    sub     rsp, 48
+    mov     [rsp + 32], rbx
+    call    rt_forth_brk
+    mov     rsp, r12
+    int 3
+    mov     TOS, r15
+    next()
+endp()
+
+; trace  ( -- )
+;     Enable per-word tracing: before each interpreted word is executed
+;     the interpreter prints the word name and current stack.
+proc(trace_word)
+    mov     qword ptr [UP + user_TRACE], 1
+    next()
+endp()
+
+; notrace  ( -- )
+;     Disable per-word tracing.
+proc(notrace_word)
+    mov     qword ptr [UP + user_TRACE], 0
     next()
 endp()
 

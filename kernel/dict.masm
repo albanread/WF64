@@ -9,53 +9,232 @@
 ; `(set-xt)` and optionally `(set-flags)`.
 ; ─────────────────────────────────────────────────────────────────────
 
-; find-name  ( c-addr u -- nt -1 | c-addr u 0 )
-;     Look up a name in the dictionary. On match: replace (c-addr u)
-;     with (nt -1), where nt points at the counted name token byte.
-;     On miss: leave (c-addr u) intact and push 0, preserving the name
-;     for number?.
-proc(find_name)
-    ; TOS = u (length), [DSP] = c-addr.
-    mov     rcx, TOS                         ; rcx = u (loop bound)
-    mov     rsi, [DSP]                       ; rsi = c-addr (query)
-    mov     rdi, [UP + user_LATEST]          ; rdi = current header
+proc(init_dictionary_overlay)
+    mov     r8, [UP + user_DICT_END]
+    mov     [UP + user_INDEX_HERE], r8
+    mov     qword ptr [UP + user_INDEX_LATEST], 0
+    mov     qword ptr [UP + user_ORDER_COUNT], 0
+
+    mov     r8, [UP + user_INDEX_HERE]
+    sub     r8, wl_size
+    cmp     r8, [UP + user_HERE]
+    jbe     .overflow
+    mov     [UP + user_INDEX_HERE], r8
+
+    xor     r9, r9
+.clear:
+    cmp     r9, wl_bucket_count
+    jae     .cleared
+    mov     qword ptr [r8 + r9*8], 0
+    inc     r9
+    jmp     .clear
+
+.cleared:
+    mov     [UP + user_FORTH_WID], r8
+    mov     [UP + user_CURRENT], r8
+    mov     qword ptr [UP + user_ORDER_COUNT], 1
+    mov     [UP + user_CONTEXT], r8
+    ret
+
+.overflow:
+    mov     TOS, -8
+    call    throw_word
+    ret
+endp()
+
+proc(search_header_in_wordlist)
+    mov     r10, rcx                        ; len
+    test    r10, r10
+    jz      .not_found
+    cmp     r10, 32
+    ja      .not_found
+
+    mov     eax, 2166136261
+    xor     edx, edx                        ; first folded char
+    xor     r8, r8
+.hash:
+    cmp     r8, r10
+    jae     .hashed
+    movzx   r9d, byte ptr [rsi + r8]
+    cmp     r9d, 'a'
+    jb      .folded
+    cmp     r9d, 'z'
+    ja      .folded
+    sub     r9d, 32
+.folded:
+    test    r8, r8
+    jne     .mix
+    mov     edx, r9d
+.mix:
+    xor     eax, r9d
+    imul    eax, eax, 16777619
+    inc     r8
+    jmp     .hash
+
+.hashed:
+    mov     r11d, eax                       ; full hash
+    and     eax, wl_bucket_mask
+    lea     r9, [rdi + rax*8]
+    mov     r8, [r9]
 
 .scan:
-    test    rdi, rdi
+    test    r8, r8
     jz      .not_found
-    cmp     cl, byte ptr [rdi + dh_nt]
-    jne     .skip
-    ; Lengths match — compare bytes.
-    xor     r8, r8                           ; r8 = byte index
-.cmpbyte:
-    cmp     r8, rcx
-    je      .matched
-    mov     dl, byte ptr [rsi + r8]
+    cmp     dword ptr [r8 + dn_hash], r11d
+    jne     .next
+    cmp     byte ptr [r8 + dn_len], r10b
+    jne     .next
+    cmp     byte ptr [r8 + dn_first], dl
+    jne     .next
+
+    mov     rdi, [r8 + dn_header]
     lea     r9, [rdi + dh_name]
-    cmp     dl, byte ptr [r9 + r8]
-    jne     .skip
-    inc     r8
+    xor     r11, r11
+.cmpbyte:
+    cmp     r11, r10
+    je      .matched
+    movzx   ecx, byte ptr [rsi + r11]
+    cmp     ecx, 'a'
+    jb      .qfolded
+    cmp     ecx, 'z'
+    ja      .qfolded
+    sub     ecx, 32
+.qfolded:
+    movzx   eax, byte ptr [r9 + r11]
+    cmp     eax, 'a'
+    jb      .hfolded
+    cmp     eax, 'z'
+    ja      .hfolded
+    sub     eax, 32
+.hfolded:
+    cmp     ecx, eax
+    jne     .next
+    inc     r11
     jmp     .cmpbyte
 
-.skip:
-    mov     rdi, [rdi + dh_link]
+.matched:
+    mov     rax, rdi
+    ret
+
+.next:
+    mov     r8, [r8 + dn_bucket_next]
     jmp     .scan
 
-.matched:
-    ; Replace (c-addr u) with (nt -1).
-    lea     r8, [rdi + dh_nt]
-    mov     [DSP], r8                        ; NOS slot ← nt
-    mov     TOS, -1                          ; TOS ← true flag
-    ; Stack effect: 2 in, 2 out — no stk needed.
+.not_found:
+    xor     rax, rax
+    ret
+endp()
+
+proc(search_header_in_order)
+    sub     rsp, 16
+    mov     [rsp], rsi
+    mov     [rsp + 8], rcx
+    mov     r8, [UP + user_ORDER_COUNT]
+    xor     r9, r9
+.loop:
+    cmp     r9, r8
+    jae     .not_found
+    mov     rsi, [rsp]
+    mov     rcx, [rsp + 8]
+    mov     rdi, [UP + user_CONTEXT + r9*8]
+    call    search_header_in_wordlist
+    test    rax, rax
+    jnz     .found
+    inc     r9
+    jmp     .loop
+
+.found:
+    add     rsp, 16
+    ret
+
+.not_found:
+    add     rsp, 16
+    xor     rax, rax
+    ret
+endp()
+
+proc(publish_header_overlay)
+    mov     r10, rcx                        ; len
+    mov     r8, [UP + user_CURRENT]         ; wid
+    mov     eax, 2166136261
+    xor     edx, edx                        ; first folded char
+    xor     r9, r9
+.hash:
+    cmp     r9, r10
+    jae     .hashed
+    movzx   ecx, byte ptr [rsi + r9]
+    cmp     ecx, 'a'
+    jb      .folded
+    cmp     ecx, 'z'
+    ja      .folded
+    sub     ecx, 32
+.folded:
+    test    r9, r9
+    jne     .mix
+    mov     edx, ecx
+.mix:
+    xor     eax, ecx
+    imul    eax, eax, 16777619
+    inc     r9
+    jmp     .hash
+
+.hashed:
+    mov     r11d, eax
+    mov     r9, [UP + user_INDEX_HERE]
+    sub     r9, dn_size
+    cmp     r9, [UP + user_HERE]
+    jbe     .overflow
+    mov     [UP + user_INDEX_HERE], r9
+
+    mov     [r9 + dn_header], rdi
+    mov     [r9 + dn_wid], r8
+    mov     dword ptr [r9 + dn_hash], r11d
+    mov     byte ptr [r9 + dn_len], r10b
+    mov     byte ptr [r9 + dn_first], dl
+    mov     rcx, [UP + user_INDEX_LATEST]
+    mov     [r9 + dn_global_prev], rcx
+
+    mov     eax, r11d
+    and     eax, wl_bucket_mask
+    lea     rcx, [r8 + rax*8]
+    mov     rax, [rcx]
+    mov     [r9 + dn_bucket_next], rax
+    mov     [rcx], r9
+    mov     [UP + user_INDEX_LATEST], r9
+    ret
+
+.overflow:
+    mov     TOS, -8
+    call    throw_word
+    ret
+endp()
+
+; find-name  ( c-addr u -- nt -1 | c-addr u 0 )
+;     Look up a name in the current search order. On match: replace
+;     (c-addr u) with (nt -1), where nt points at the counted name
+;     token byte. On miss: leave (c-addr u) intact and push 0,
+;     preserving the name for number?.
+proc(find_name)
+    sub     rsp, cell
+    mov     [rsp], TOS                       ; preserve original len across helper call
+    mov     rcx, TOS                         ; len
+    mov     rsi, [DSP]                       ; query addr
+    call    search_header_in_order
+    test    rax, rax
+    jz      .not_found
+
+    lea     r8, [rax + dh_nt]
+    add     rsp, cell
+    mov     [DSP], r8
+    mov     TOS, -1
     next()
 
 .not_found:
-    ; Push 0 below original (c-addr u) — they stay.
-    ; Currently: rax = u, [rbp] = c-addr.
-    ; After: rax = 0, [rbp] = u, [rbp+cell] = c-addr.
-    mov     [DSP - cell], TOS                ; spill u into the new NOS slot
-    xor     TOS, TOS                         ; TOS ← 0 flag
-    stk(2, 3)                                ; emit `sub rbp, 8` (push 1)
+    mov     rcx, [rsp]
+    add     rsp, cell
+    mov     [DSP - cell], rcx
+    xor     TOS, TOS
+    stk(2, 3)
     next()
 endp()
 
@@ -192,6 +371,43 @@ proc(forget_last_word)
     cmp     rdi, r8
     jbe     .done
 
+    mov     r8, [UP + user_INDEX_LATEST]
+    test    r8, r8
+    jz      .remove_header_only
+    mov     r9, [r8 + dn_wid]
+    mov     eax, dword ptr [r8 + dn_hash]
+    and     eax, wl_bucket_mask
+    lea     rcx, [r9 + rax*8]
+    mov     r10, [rcx]
+    cmp     r10, r8
+    jne     .scan_bucket
+    mov     r10, [r8 + dn_bucket_next]
+    mov     [rcx], r10
+    jmp     .drop_index_latest
+
+.scan_bucket:
+    test    r10, r10
+    jz      .drop_index_latest
+    mov     r11, [r10 + dn_bucket_next]
+    cmp     r11, r8
+    je      .unlink_bucket
+    mov     r10, r11
+    jmp     .scan_bucket
+
+.unlink_bucket:
+    mov     r11, [r8 + dn_bucket_next]
+    mov     [r10 + dn_bucket_next], r11
+
+.drop_index_latest:
+    mov     r10, [r8 + dn_global_prev]
+    mov     [UP + user_INDEX_LATEST], r10
+    cmp     r8, [UP + user_INDEX_HERE]
+    jne     .remove_header_only
+    lea     r10, [r8 + dn_size]
+    mov     [UP + user_INDEX_HERE], r10
+
+.remove_header_only:
+
     mov     rcx, [rdi + dh_link]
     mov     [UP + user_HERE], rdi
     mov     [UP + user_LATEST], rcx
@@ -268,6 +484,15 @@ proc(create)
     lea     r8,  [rdi + dh_ct]
     sub     r8, r11
     mov     [r11 - cell], r8
+    cmp     r11, [UP + user_INDEX_HERE]
+    jae     .overflow
+    sub     rsp, 16
+    mov     [rsp], rdi
+    mov     [rsp + cell], r11
+    call    publish_header_overlay
+    mov     rdi, [rsp]
+    mov     r11, [rsp + cell]
+    add     rsp, 16
     mov     [rdi + dh_xtptr], r11            ; xt → body start
     mov     [UP + user_HERE],   r11
     mov     [UP + user_LATEST], rdi
@@ -276,6 +501,288 @@ proc(create)
     ; Drop (c-addr u). Stack at entry: TOS=u, [DSP]=c-addr, [DSP+cell]=old TOS.
     mov     TOS, [DSP + cell]
     add     DSP, 2*cell
+    next()
+
+.overflow:
+    mov     TOS, -8
+    call    throw_word
+    next()
+endp()
+
+
+; publish-primitive  ( c-addr u xt comp-xt flags -- )
+;     Kernel-side primitive publisher used by the Rust bootstrap.
+proc(publish_primitive)
+    sub     DSP, 2*cell
+    mov     r9, [DSP + 5*cell]               ; original c-addr
+    mov     [DSP], r9
+    mov     [DSP + cell], TOS                ; keep flags live across create
+    mov     TOS, [DSP + 4*cell]              ; original u
+    call    create
+
+    mov     rdi, [UP + user_LATEST]
+    mov     r8, [DSP + cell]                 ; xt
+    mov     [rdi + dh_xtptr], r8
+    mov     [UP + user_LATESTXT], r8
+    mov     r9, [DSP]                        ; comp-xt
+    test    r9, r9
+    jz      .maybe_flags
+    mov     [rdi + dh_comp], r9
+
+.maybe_flags:
+    test    TOS, TOS                         ; flags restored by create
+    jz      .drop_inputs
+    lea     r9, [rip + execute]
+    mov     [rdi + dh_ct], r9
+
+.drop_inputs:
+    mov     r8, [DSP + 4*cell]
+    add     DSP, 5*cell
+    mov     TOS, r8
+    next()
+endp()
+
+
+; wordlist  ( -- wid )
+proc(wordlist_word)
+    mov     r8, [UP + user_INDEX_HERE]
+    sub     r8, wl_size
+    cmp     r8, [UP + user_HERE]
+    jbe     .overflow
+    mov     [UP + user_INDEX_HERE], r8
+
+    xor     r9, r9
+.clear:
+    cmp     r9, wl_bucket_count
+    jae     .done
+    mov     qword ptr [r8 + r9*8], 0
+    inc     r9
+    jmp     .clear
+
+.done:
+    mov     [DSP - cell], TOS
+    mov     TOS, r8
+    stk(0, 1)
+    next()
+
+.overflow:
+    mov     TOS, -8
+    call    throw_word
+    next()
+endp()
+
+
+; forth-wordlist  ( -- wid )
+proc(forth_wordlist_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_FORTH_WID]
+    stk(0, 1)
+    next()
+endp()
+
+
+; get-current  ( -- wid )
+proc(get_current_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_CURRENT]
+    stk(0, 1)
+    next()
+endp()
+
+
+; set-current  ( wid -- )
+proc(set_current_word)
+    mov     [UP + user_CURRENT], TOS
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+
+; definitions  ( -- )
+proc(definitions_word)
+    mov     r8, [UP + user_CONTEXT]
+    mov     [UP + user_CURRENT], r8
+    next()
+endp()
+
+
+; only  ( -- )
+proc(only_word)
+    mov     r8, [UP + user_FORTH_WID]
+    mov     [UP + user_CONTEXT], r8
+    mov     qword ptr [UP + user_ORDER_COUNT], 1
+    next()
+endp()
+
+
+; also  ( -- )
+proc(also_word)
+    mov     rcx, [UP + user_ORDER_COUNT]
+    cmp     rcx, search_order_max
+    jae     .overflow
+    test    rcx, rcx
+    jz      .minimum
+
+    mov     r8, rcx
+.shift:
+    test    r8, r8
+    jz      .shifted
+    mov     r9, [UP + user_CONTEXT + r8*8 - cell]
+    mov     [UP + user_CONTEXT + r8*8], r9
+    dec     r8
+    jmp     .shift
+
+.shifted:
+    inc     rcx
+    mov     [UP + user_ORDER_COUNT], rcx
+    next()
+
+.minimum:
+    mov     r8, [UP + user_FORTH_WID]
+    mov     [UP + user_CONTEXT], r8
+    mov     [UP + user_CONTEXT + cell], r8
+    mov     qword ptr [UP + user_ORDER_COUNT], 2
+    next()
+
+.overflow:
+    mov     TOS, -49
+    call    throw_word
+    next()
+endp()
+
+
+; previous  ( -- )
+proc(previous_word)
+    mov     rcx, [UP + user_ORDER_COUNT]
+    cmp     rcx, 1
+    jbe     .minimum
+
+    xor     r8, r8
+.shift:
+    lea     r9, [r8 + 1]
+    cmp     r9, rcx
+    jae     .shifted
+    mov     r10, [UP + user_CONTEXT + r9*8]
+    mov     [UP + user_CONTEXT + r8*8], r10
+    inc     r8
+    jmp     .shift
+
+.shifted:
+    dec     rcx
+    mov     [UP + user_ORDER_COUNT], rcx
+    next()
+
+.minimum:
+    mov     r8, [UP + user_FORTH_WID]
+    mov     [UP + user_CONTEXT], r8
+    mov     qword ptr [UP + user_ORDER_COUNT], 1
+    next()
+endp()
+
+
+; forth  ( -- )
+proc(forth_word)
+    mov     r8, [UP + user_FORTH_WID]
+    mov     [UP + user_CONTEXT], r8
+    mov     rcx, [UP + user_ORDER_COUNT]
+    test    rcx, rcx
+    jnz     .done
+    mov     qword ptr [UP + user_ORDER_COUNT], 1
+.done:
+    next()
+endp()
+
+
+; get-order  ( -- widn ... wid1 n )
+proc(get_order_word)
+    mov     r8, [UP + user_ORDER_COUNT]
+    mov     rcx, r8
+    test    rcx, rcx
+    jz      .push_count
+
+.push_wids:
+    dec     rcx
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_CONTEXT + rcx*8]
+    sub     DSP, cell
+    test    rcx, rcx
+    jnz     .push_wids
+
+.push_count:
+    mov     [DSP - cell], TOS
+    mov     TOS, r8
+    stk(0, 1)
+    next()
+endp()
+
+
+; set-order  ( widn ... wid1 n -- )
+proc(set_order_word)
+    mov     rcx, TOS                         ; n
+    cmp     rcx, 0
+    jl      .minimum
+    cmp     rcx, search_order_max
+    ja      .overflow
+    mov     [UP + user_ORDER_COUNT], rcx
+    xor     r8, r8
+.copy:
+    cmp     r8, rcx
+    jae     .drop
+    mov     r9, [DSP + r8*8]
+    mov     [UP + user_CONTEXT + r8*8], r9
+    inc     r8
+    jmp     .copy
+
+.drop:
+    lea     r8, [DSP + rcx*8]
+    mov     TOS, [r8]
+    lea     DSP, [r8 + cell]
+    next()
+
+.minimum:
+    mov     r8, [UP + user_FORTH_WID]
+    mov     [UP + user_CONTEXT], r8
+    mov     qword ptr [UP + user_ORDER_COUNT], 1
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+
+.overflow:
+    mov     TOS, -49
+    call    throw_word
+    next()
+endp()
+
+
+; search-wordlist  ( c-addr u wid -- 0 | xt 1 | xt -1 )
+proc(search_wordlist_word)
+    mov     rdi, TOS                         ; wid
+    mov     rcx, [DSP]                       ; len
+    mov     rsi, [DSP + cell]                ; c-addr
+    call    search_header_in_wordlist
+    test    rax, rax
+    jz      .not_found
+
+    mov     r8, [rax + dh_xtptr]
+    lea     r9, [rip + execute]
+    cmp     [rax + dh_ct], r9
+    jne     .ordinary
+    mov     r9, 1
+    jmp     .return_found
+
+.ordinary:
+    mov     r9, -1
+
+.return_found:
+    mov     [DSP + cell], r8
+    add     DSP, cell
+    mov     TOS, r9
+    next()
+
+.not_found:
+    add     DSP, 2*cell
+    xor     TOS, TOS
     next()
 endp()
 

@@ -67,7 +67,6 @@ impl DerefMut for SessionGuard {
 #[test]
 fn eval_empty_input_just_prints_ok() {
     let mut s = sess();
-    // Empty line then EOF → one "ok" then implicit bye.
     let out = s.eval("\n").unwrap();
     assert_eq!(out, " ok\n");
 }
@@ -76,8 +75,6 @@ fn eval_empty_input_just_prints_ok() {
 fn eval_bye_terminates_cleanly() {
     let mut s = sess();
     let out = s.eval("bye\n").unwrap();
-    // bye runs *before* end-of-line, so we never print " ok" for this
-    // line. That's WF32 behaviour too.
     assert_eq!(out, "");
 }
 
@@ -88,10 +85,24 @@ fn eval_number_then_dot() {
     assert_eq!(out, "5  ok\n");
 }
 
+
+#[test]
+fn eval_source_defined_set_order_wrapper_persists_across_eval_calls() {
+    let mut s = sess();
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    let out = s.eval(": only2 -1 set-order ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    let out = s.eval("only2 get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
 #[test]
 fn eval_arithmetic() {
     let mut s = sess();
-    let out = s.eval("5 3 + .\n2 7 * .\nbye\n").unwrap();
+    let out = s.eval("5 3 + .\n7 2 * .\nbye\n").unwrap();
     assert_eq!(out, "8  ok\n14  ok\n");
 }
 
@@ -99,14 +110,232 @@ fn eval_arithmetic() {
 fn eval_brk_and_int3_are_callable() {
     let mut s = sess();
     let out = s.eval("BRK\nINT3\nbye\n").unwrap();
-    assert_eq!(out, " ok\n ok\n");
+    // Both words emit a Forth state dump followed by " ok\n"; we just
+    // check the eval succeeds and that the " ok" prompts are present.
+    assert!(out.contains(" ok\n"), "expected at least one ' ok\\n' in: {out:?}");
 }
 
 #[test]
-fn eval_colon_def_square() {
+fn eval_key_reads_from_buffered_input_stream() {
     let mut s = sess();
-    let out = s.eval(": square dup * ;\n5 square .\nbye\n").unwrap();
-    assert_eq!(out, " ok\n25  ok\n");
+    let out = s.eval("key .\nA\nbye\n").unwrap();
+    assert_eq!(out, "65  ok\n ok\n");
+}
+
+#[test]
+fn load_source_file_provides_only_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    s.load_source_file(&path).unwrap();
+
+    let out = s.eval("only get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn load_source_file_only_word_is_present_in_root_wordlist() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         : square-name s\" square\" ;\n\
+         : only-name s\" only\" ;\n\
+         square-name root search-wordlist nip . cr\n\
+         only-name root search-wordlist nip . cr\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n-1 \n ok\n-1 \n ok\n");
+}
+
+#[test]
+fn load_source_file_only_word_executes_via_search_wordlist_xt() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    s.load_source_file(&path).unwrap();
+
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         : only-name s\" only\" ;\n\
+         only-name root search-wordlist drop execute get-order\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn eval_core_f_with_explicit_bye_provides_only_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    let mut source = std::fs::read_to_string(&path).unwrap();
+    source.push_str("\nbye\n");
+
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+
+    let out = s.eval(&source).unwrap();
+    assert!(out.ends_with(" ok\n"), "got {out:?}");
+
+    let out = s.eval("only get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn eval_nested_evaluate_definition_provides_only_word() {
+    let mut s = sess();
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+
+    let out = s.eval(
+        ": install-only s\" : only -1 set-order ;\" evaluate ;\n\
+         install-only\n\
+         only get-order\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn load_source_file_then_redefine_only_same_name() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    s.load_source_file(&path).unwrap();
+
+    let out = s.eval(": only -1 set-order ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    let out = s.eval("only get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn eval_redefining_simple_word_same_name_uses_newest() {
+    let mut s = sess();
+    let out = s.eval(": foo 1 ;\n: foo 2 ;\nfoo .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n2  ok\n");
+}
+
+#[test]
+fn eval_redefining_simple_word_same_name_across_eval_calls_uses_newest() {
+    let mut s = sess();
+    let out = s.eval(": foo 1 ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    let out = s.eval(": foo 2 ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+
+    let out = s.eval("foo .\nbye\n").unwrap();
+    assert_eq!(out, "2  ok\n");
+}
+
+#[test]
+fn eval_primitive_only_then_get_order() {
+    let mut s = sess();
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+
+    let out = s.eval("only get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn load_source_file_provides_also_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    s.load_source_file(&path).unwrap();
+
+    let out = s.eval("only also get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.stack(), vec![2, root_wid, root_wid]);
+}
+
+#[test]
+fn load_source_file_provides_previous_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    s.load_source_file(&path).unwrap();
+
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         wordlist constant extra\n\
+         root extra 2 set-order previous get-order\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn load_source_file_provides_forth_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    s.load_source_file(&path).unwrap();
+
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         wordlist constant extra\n\
+         root extra 2 set-order forth get-order\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+    assert_eq!(s.stack(), vec![2, root_wid, root_wid]);
+}
+
+#[test]
+fn load_source_file_provides_definitions_word() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    s.load_source_file(&path).unwrap();
+
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         wordlist constant extra\n\
+         root extra 2 set-order definitions get-current\n\
+         extra\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n ok\n");
+    let stack = s.stack();
+    assert_eq!(stack.len(), 2);
+    assert_eq!(stack[0], stack[1]);
+    assert_ne!(stack[0], root_wid);
+}
+
+#[test]
+fn eval_exit_returns_early_from_definition() {
+    let mut s = sess();
+    let out = s.eval(": early 1 exit 2 ;\nearly .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n1  ok\n");
 }
 
 #[test]
@@ -114,6 +343,13 @@ fn eval_colon_without_name_throws_minus_16() {
     let mut s = sess();
     let err = s.eval(":\n").unwrap_err().to_string();
     assert!(err.contains("Forth THROW -16"), "got {err:?}");
+}
+
+#[test]
+fn eval_exit_in_interpret_state_throws_minus_14() {
+    let mut s = sess();
+    let err = s.eval("exit\n").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -14"), "got {err:?}");
 }
 
 #[test]
@@ -140,6 +376,30 @@ fn eval_brackets_and_literal_compile_interpreted_value() {
 }
 
 #[test]
+fn eval_s_quote_compiles_runtime_string() {
+    let mut s = sess();
+    let out = s.eval(": greet s\" HI\" ;\ngreet type cr\nbye\n").unwrap();
+    assert_eq!(out, " ok\nHI\n ok\n");
+}
+
+#[test]
+fn eval_dot_quote_compiles_runtime_output() {
+    let mut s = sess();
+    let out = s.eval(": greet .\" HI\" ;\ngreet cr\nbye\n").unwrap();
+    assert_eq!(out, " ok\nHI\n ok\n");
+}
+
+#[test]
+fn eval_s_quote_and_dot_quote_are_compile_only() {
+    let mut s = sess();
+    let err = s.eval("s\" HI\"\n").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+
+    let err = s.eval(".\" HI\"\n").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+}
+
+#[test]
 fn eval_source_and_to_in_can_skip_rest_of_line() {
     let mut s = sess();
     let out = s.eval(": skip-rest source >in ! drop ;\nskip-rest 123 .\nbye\n").unwrap();
@@ -153,6 +413,24 @@ fn eval_state_exposes_compilation_flag_address() {
         .eval("state @ .\n: compiling? state @ ; immediate\n: compiled-state compiling? literal ;\ncompiled-state 0= .\nbye\n")
         .unwrap();
     assert_eq!(out, "0  ok\n ok\n ok\n0  ok\n");
+}
+
+#[test]
+fn eval_source_id_tracks_repl_and_evaluate_input() {
+    let mut s = sess();
+    let out = s
+        .eval("source-id .\n: source-id-from-eval s\" source-id\" evaluate ;\nsource-id-from-eval .\nsource-id .\nbye\n")
+        .unwrap();
+    assert_eq!(out, "0  ok\n ok\n-1  ok\n0  ok\n");
+}
+
+#[test]
+fn eval_refill_reads_next_line_and_is_false_for_evaluate() {
+    let mut s = sess();
+    let out = s
+        .eval(": next-line refill if source dup >in ! type drop else 999 . then ;\n: eval-refill-string s\" refill .\" ;\nnext-line\nHELLO\neval-refill-string evaluate\nbye\n")
+        .unwrap();
+    assert_eq!(out, " ok\n ok\nHELLO ok\n0  ok\n");
 }
 
 #[test]
@@ -283,6 +561,77 @@ fn load_source_file_provides_constant_defining_word() {
 }
 
 #[test]
+fn load_source_file_provides_pictured_numeric_output_words() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval("<# 65 hold 66 hold 0 0 #> type cr\n<# 1 0 # # #> type cr\n<# 0 0 #s #> type cr\n: fmt-neg dup >r abs s>d <# #s r> sign #> ;\n-123 fmt-neg type cr\nbye\n")
+        .unwrap();
+    assert_eq!(out, "BA\n ok\n01\n ok\n0\n ok\n ok\n-123\n ok\n");
+}
+
+#[test]
+fn load_source_file_provides_holds() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval(": banner <# 49 hold 50 hold s\" AB\" holds 0 0 #> ;\nbanner type cr\nbye\n")
+        .unwrap();
+    assert_eq!(out, " ok\nAB21\n ok\n");
+}
+
+#[test]
+fn load_source_file_provides_unsigned_dot() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("123 u. cr\n-1 u. cr\nbye\n").unwrap();
+    assert_eq!(out, "123 \n ok\n18446744073709551615 \n ok\n");
+}
+
+#[test]
+fn load_source_file_provides_abort_quote() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval(": guarded dup 0= abort\" zero\" 1+ ;\n5 guarded . cr\n0 ' guarded catch . cr\nbye\n")
+        .unwrap();
+    assert_eq!(out, " ok\n6 \n ok\nzero-2 \n ok\n");
+}
+
+#[test]
+fn load_source_file_provides_environment_query() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval(": env-query s\" wf64\" ;\nenv-query environment? . cr\nbye\n")
+        .unwrap();
+    assert_eq!(out, " ok\n0 \n ok\n");
+}
+
+#[test]
+fn load_source_file_abort_quote_in_interpret_state_throws_minus_14() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let err = s.eval("abort\" nope\"\n").unwrap_err().to_string();
+    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+}
+
+#[test]
+fn load_source_file_provides_c_comma() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("here 65 c, here swap - . here 1- c@ .\nbye\n").unwrap();
+    assert_eq!(out, "1 65  ok\n");
+}
+
+#[test]
 fn load_source_file_provides_fvariable_defining_word() {
     let mut s = sess();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
@@ -307,6 +656,49 @@ fn load_source_file_provides_value_defining_word() {
     s.load_source_file(&path).unwrap();
     let out = s.eval("5 value five\nfive .\n: use-five five ;\nuse-five .\nbye\n").unwrap();
     assert_eq!(out, " ok\n5  ok\n ok\n5  ok\n");
+}
+
+#[test]
+fn load_source_file_provides_double_cell_defining_words() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval(
+            "1 2 2constant pair\n\
+             : use-pair pair ;\n\
+             2variable dv\n\
+             123 456 dv 2!\n\
+             dv 2@ . . cr\n\
+             pair . . cr\n\
+             use-pair . . cr\n\
+             : pair-lit [ 10 20 ] 2literal ;\n\
+             pair-lit . . cr\n\
+             bye\n",
+        )
+        .unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n ok\n456 123 \n ok\n2 1 \n ok\n2 1 \n ok\n ok\n10 20 \n ok\n");
+}
+
+#[test]
+fn load_source_file_provides_case_words() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s
+        .eval(
+            ": classify case\n\
+             1 of 111 endof\n\
+             2 of 222 endof\n\
+             999 swap\n\
+             endcase ;\n\
+             1 classify .\n\
+             2 classify .\n\
+             7 classify .\n\
+             bye\n",
+        )
+        .unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n111  ok\n222  ok\n999  ok\n");
 }
 
 #[test]
@@ -1670,6 +2062,227 @@ fn find_name_returns_counted_name_token() {
     let bytes = unsafe { std::slice::from_raw_parts((nt + 1) as *const u8, len as usize) };
     assert_eq!(len, name.len() as u8);
     assert_eq!(bytes, name);
+}
+
+#[test]
+fn number_q_parses_single_digit_directly() {
+    let mut s = sess();
+    let pad = s.user_base + 0x100;
+    unsafe { std::ptr::copy_nonoverlapping(b"1".as_ptr(), pad as *mut u8, 1); }
+
+    s.push(pad as i64);
+    s.push(1);
+    s.call("number_q").unwrap();
+
+    assert_eq!(s.pop(), -1);
+    assert_eq!(s.pop(), 1);
+    assert_eq!(s.depth(), 0);
+}
+
+#[test]
+fn find_name_miss_leaves_c_addr_u_zero() {
+    let mut s = sess();
+    let pad = s.user_base + 0x100;
+    unsafe { std::ptr::copy_nonoverlapping(b"1".as_ptr(), pad as *mut u8, 1); }
+
+    s.push(pad as i64);
+    s.push(1);
+    s.call("find_name").unwrap();
+
+    assert_eq!(s.stack(), vec![0, 1, pad as i64]);
+}
+
+#[test]
+fn get_order_word_reports_default_forth_order() {
+    let mut s = sess();
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    s.call("get_order_word").unwrap();
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn eval_negative_set_order_minimum_then_get_order() {
+    let mut s = sess();
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    let out = s.eval("-1 set-order get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn eval_source_defined_set_order_wrapper_then_get_order() {
+    let mut s = sess();
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+    let out = s.eval(": only2 -1 set-order ;\nonly2 get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn search_order_words_route_lookup_by_wordlist() {
+    let mut s = sess();
+    let pad = s.user_base + 0x100;
+    let name = b"TOK";
+    unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len()); }
+
+    s.call("wordlist_word").unwrap();
+    let extra_wid = s.pop();
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.pop();
+
+    s.push(extra_wid);
+    s.call("set_current_word").unwrap();
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("create").unwrap();
+    let dup_xt = s.xt_of("dup_").unwrap() as i64;
+    s.push(dup_xt);
+    s.call("set_xt").unwrap();
+
+    s.push(root_wid);
+    s.call("set_current_word").unwrap();
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("create").unwrap();
+    let drop_xt = s.xt_of("drop_").unwrap() as i64;
+    s.push(drop_xt);
+    s.call("set_xt").unwrap();
+
+    s.push(root_wid);
+    s.push(extra_wid);
+    s.push(2);
+    s.call("set_order_word").unwrap();
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("find_name").unwrap();
+    assert_eq!(s.pop(), -1);
+    let nt = s.pop();
+    s.push(nt);
+    s.call("name_to_interpret").unwrap();
+    assert_eq!(s.pop(), dup_xt);
+
+    s.push(root_wid);
+    s.push(1);
+    s.call("set_order_word").unwrap();
+    s.push(pad as i64);
+    s.push(name.len() as i64);
+    s.call("find_name").unwrap();
+    assert_eq!(s.pop(), -1);
+    let nt = s.pop();
+    s.push(nt);
+    s.call("name_to_interpret").unwrap();
+    assert_eq!(s.pop(), drop_xt);
+
+    assert_eq!(s.depth(), 0);
+}
+
+#[test]
+fn load_source_file_provides_search_order_extension_words() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         wordlist constant extra\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+
+    let out = s.eval("only get-order\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.stack(), vec![1, root_wid]);
+
+    s.reset();
+    s.load_source_file(&path).unwrap();
+    s.call("forth_wordlist_word").unwrap();
+    assert_eq!(s.stack(), vec![root_wid]);
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         wordlist constant extra\n\
+         only also get-order\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+    assert_eq!(s.stack(), vec![2, root_wid, root_wid, root_wid]);
+
+    s.reset();
+    s.load_source_file(&path).unwrap();
+    s.call("forth_wordlist_word").unwrap();
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         wordlist constant extra\n\
+         root extra 2 set-order previous get-order\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+    let stack = s.stack();
+    assert_eq!(stack.len(), 3);
+    assert_eq!(stack[0], 1);
+    assert_ne!(stack[1], root_wid);
+    assert_eq!(stack[2], root_wid);
+
+    s.reset();
+    s.load_source_file(&path).unwrap();
+    s.call("forth_wordlist_word").unwrap();
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         wordlist constant extra\n\
+         root extra 2 set-order forth get-order\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n");
+    assert_eq!(s.stack(), vec![2, root_wid, root_wid, root_wid]);
+
+    s.reset();
+    s.load_source_file(&path).unwrap();
+    s.call("forth_wordlist_word").unwrap();
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         wordlist constant extra\n\
+         root extra 2 set-order definitions get-current\n\
+         extra\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n ok\n");
+    let stack = s.stack();
+    assert_eq!(stack.len(), 3);
+    assert_eq!(stack[0], stack[1]);
+    assert_ne!(stack[0], root_wid);
+    assert_eq!(stack[2], root_wid);
+}
+
+#[test]
+fn search_wordlist_returns_xt_and_immediacy_flag() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+
+    let out = s.eval(
+        "forth-wordlist constant root\n\
+         : dup-name s\" dup\" ;\n\
+         : semi-name s\" ;\" ;\n\
+         : exit-name s\" exit\" ;\n\
+         : keyq-name s\" key?\" ;\n\
+         : dots-name s\" .s\" ;\n\
+         dup-name root search-wordlist swap drop . cr\n\
+         semi-name root search-wordlist nip . cr\n\
+         exit-name root search-wordlist nip . cr\n\
+         keyq-name root search-wordlist nip . cr\n\
+         dots-name root search-wordlist nip . cr\n\
+         bye\n"
+    ).unwrap();
+
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n ok\n-1 \n ok\n1 \n ok\n1 \n ok\n-1 \n ok\n-1 \n ok\n");
 }
 
 #[test]

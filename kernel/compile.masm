@@ -42,6 +42,22 @@ proc(do_flit)
     next()
 endp()
 
+; do_slit  ( -- c-addr u )   [runtime helper, never user-callable]
+;     Compiled by `sliteral` as: call do_slit ; .quad len ; <len bytes>
+;     and pushes the inline string address and length.
+proc(do_slit)
+    mov     r9, [rsp]                       ; r9 = addr of inline len
+    mov     r10, [r9]                       ; r10 = len
+    lea     r11, [r9 + 8]                   ; r11 = string addr
+    lea     rcx, [r11 + r10]                ; rcx = resume ip
+    mov     [rsp], rcx
+    mov     [DSP - cell], TOS               ; old TOS -> NNOS
+    mov     [DSP - 2*cell], r11             ; c-addr -> NOS
+    mov     TOS, r10                        ; len -> TOS
+    stk(0, 2)
+    next()
+endp()
+
 ; compile  ( xt -- )
 ;     WF32-style compile token for ordinary words: duplicate xt, map the
 ;     duplicate to its comp-field address, then dispatch that helper while
@@ -759,6 +775,74 @@ proc(fliteral_word)
     next()
 endp()
 
+; s"  ( "ccc<quote>" -- )                                 IMMEDIATE
+;     Compile a runtime string literal.
+proc(s_quote_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    skip_optional_source_blank
+    mov     [DSP - cell], TOS
+    mov     TOS, 34
+    stk(0, 1)
+    call    parse_word
+    call    sliteral
+    next()
+endp()
+
+; ."  ( "ccc<quote>" -- )                                  IMMEDIATE
+;     Compile a runtime string literal followed by TYPE.
+proc(dot_quote_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    skip_optional_source_blank
+    mov     [DSP - cell], TOS
+    mov     TOS, 34
+    stk(0, 1)
+    call    parse_word
+    call    sliteral
+    lea     rcx, [rip + type_word]
+    call    compile_xt_from_rcx
+    next()
+endp()
+
+; abort"  ( "ccc<quote>" -- )                            IMMEDIATE
+;     Compile: IF <inline-string> TYPE throw_abortq THROW THEN
+;     The IF/THEN control-flow mark lives on the data stack during
+;     compilation, so preserve it in registers while the string literal
+;     helper uses the stack as scratch.
+proc(abort_quote_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    call    if_word
+    mov     r13, DSP
+    mov     r14, TOS
+    call    skip_optional_source_blank
+    mov     [DSP - cell], TOS
+    mov     TOS, 34
+    stk(0, 1)
+    call    parse_word
+    call    sliteral
+    lea     rcx, [rip + type_word]
+    call    compile_xt_from_rcx
+    lea     rcx, [rip + throw_abortq_const]
+    call    compile_xt_from_rcx
+    lea     rcx, [rip + throw_word]
+    call    compile_xt_from_rcx
+    mov     DSP, r13
+    mov     TOS, r14
+    call    then_word
+    next()
+endp()
+
 ; postpone  ( -<name>- )                                   IMMEDIATE
 ;     Compile the compilation semantics of the next parsed word.
 proc(postpone_word)
@@ -851,6 +935,20 @@ proc(compile_xt_from_rcx)
     mov     TOS, rcx
     stk(0, 1)
     call    compile_word
+    ret
+endp()
+
+proc(skip_optional_source_blank)
+    mov     r8, [UP + user_TO_IN]
+    mov     r9, [UP + user_SOURCE_LEN]
+    cmp     r8, r9
+    jae     .done
+    mov     r10, [UP + user_SOURCE_ADDR]
+    movzx   ecx, byte ptr [r10 + r8]
+    cmp     ecx, 32
+    jne     .done
+    inc     qword ptr [UP + user_TO_IN]
+.done:
     ret
 endp()
 
@@ -1271,6 +1369,36 @@ proc(fliteral)
     next()
 endp()
 
+; sliteral  ( c-addr u -- )            [compile-time only, not in dict]
+;     Compile call do_slit ; .quad len ; <len bytes> at HERE.
+proc(sliteral)
+    mov     rsi, [DSP]                       ; source addr
+    mov     rcx, TOS                         ; len
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8], 0xE8
+    lea     r9, [rip + do_slit]
+    sub     r9, r8
+    sub     r9, 5
+    mov     dword ptr [r8 + 1], r9d
+    mov     [r8 + 5], rcx
+    lea     rdi, [r8 + 13]
+    xor     r10, r10
+.copy_loop:
+    cmp     r10, rcx
+    jae     .copied
+    mov     al, byte ptr [rsi + r10]
+    mov     byte ptr [rdi + r10], al
+    inc     r10
+    jmp     .copy_loop
+
+.copied:
+    add     rdi, rcx
+    mov     [UP + user_HERE], rdi
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    next()
+endp()
+
 ; :  ( -- )
 ;     Parse the next whitespace-delimited token, allocate a dict header
 ;     at HERE with that name (via `(create)`), then set STATE=1. The
@@ -1318,6 +1446,23 @@ proc(semicolon)
     inc     r8
     mov     [UP + user_HERE], r8
     mov     qword ptr [UP + user_STATE], 0
+    next()
+endp()
+
+; exit  ( -- )                                        IMMEDIATE
+;     Compile an early return from the current definition.
+proc(exit_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+
+    call    comp_only_word
+    next()
+
+.in_compile:
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8], 0xC3              ; RET
+    inc     r8
+    mov     [UP + user_HERE], r8
     next()
 endp()
 

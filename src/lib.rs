@@ -309,21 +309,40 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     // I/O
     ("emit",       "emit",       0),
     ("type",       "type_word",  0),
+    ("key",        "key_word",   0),
+    ("key?",       "key_q_word", 0),
     ("cr",         "cr_word",    0),
     ("BRK",        "brk_word",   0),
     ("INT3",       "int3_word",  0),
+    ("trace",      "trace_word", 0),
+    ("notrace",    "notrace_word", 0),
     ("cpuid",      "cpuid_word", 0),
     ("rdtsc",      "rdtsc_word", 0),
     ("bye",        "bye",        0),
     // Parse & dict
+    ("evaluate",   "evaluate_word", 0),
     ("parse-name", "parse_name", 0),
     ("pad",        "pad_word",    0),
     ("parse",      "parse_word",  0),
     ("word",       "word_word",   0),
     ("source",     "source_word", 0),
+    ("source-id",  "source_id_word", 0),
+    ("refill",     "refill_word", 0),
     ("state",      "state_word", 0),
     (">in",        "to_in_word", 0),
     ("find-name",  "find_name",  0),
+    ("forth-wordlist", "forth_wordlist_word", 0),
+    ("wordlist",   "wordlist_word", 0),
+    ("get-current", "get_current_word", 0),
+    ("set-current", "set_current_word", 0),
+    ("definitions", "definitions_word", 0),
+    ("only",        "only_word", 0),
+    ("also",        "also_word", 0),
+    ("previous",    "previous_word", 0),
+    ("forth",       "forth_word", 0),
+    ("get-order",  "get_order_word", 0),
+    ("set-order",  "set_order_word", 0),
+    ("search-wordlist", "search_wordlist_word", 0),
     (">ct",        "to_ct",      0),
     (">comp",      "to_comp",    0),
     (">name",      "to_name",    0),
@@ -359,17 +378,23 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("[']",        "bracket_tick_word", 1),
     ("literal",    "literal_word", 1),
     ("fliteral",   "fliteral_word", 1),
+    ("s\"",       "s_quote_word", 1),
+    (".\"",       "dot_quote_word", 1),
+    ("abort\"",   "abort_quote_word", 1),
     ("postpone",   "postpone_word", 1),
     ("does>",      "does_word",   1),
     (":",          "colon",      0),
     ("create",     "create_word", 0),
+    ("exit",       "exit_word",   1),
     (";",          "semicolon",  1),   // IMMEDIATE
 ];
 
 /// Kernel-internal helper symbols (JIT-resolvable, NOT in the dict).
 pub const KERNEL_HELPERS: &[&str] = &[
+    "interpret_source",
     "do_lit",
     "do_flit",
+    "do_slit",
     "compile_word",
     "compile_comma",
     "inline_dup_comp",
@@ -396,7 +421,11 @@ pub const KERNEL_HELPERS: &[&str] = &[
     "inline_unloop_comp",
     "literal",
     "fliteral",
+    "sliteral",
+    "init_dictionary_overlay",
+    "publish_primitive",
 ];
+
 
 // ── Memory layout (matches kernel/macros.masm) ───────────────────────
 
@@ -424,6 +453,13 @@ const USER_FORGET_FENCE: u64 = 0x98;
 const USER_FP0:          u64 = 0x1210;
 const USER_FSP:          u64 = 0x1218;
 const USER_FP_STACK:     u64 = 0x1300;
+const USER_CURRENT:      u64 = 0x1500;
+const USER_FORTH_WID:    u64 = 0x1508;
+const USER_ORDER_COUNT:  u64 = 0x1510;
+const USER_INDEX_HERE:   u64 = 0x1518;
+const USER_INDEX_LATEST: u64 = 0x1520;
+const USER_CONTEXT:      u64 = 0x1528;
+const USER_TRACE:        u64 = 0x15A8;  // trace flag; mirrors user_TRACE in macros.masm
 
 // (Dictionary header layout deliberately not mirrored here — it lives
 // entirely in kernel/macros.masm and kernel/dict.masm. The bootstrap
@@ -634,6 +670,14 @@ pub struct Wf64Session {
     /// Post-bootstrap latestxt companion so reset restores the same
     /// most-recent definition metadata that the dictionary exposes.
     boot_latestxt: u64,
+    boot_index_here: u64,
+    boot_index_latest: u64,
+    /// Snapshot of the FORTH-WORDLIST bucket array (512 × 8 bytes)
+    /// taken right after bootstrap. `reset()` writes this back so that
+    /// overlay nodes allocated by one test cannot leave stale bucket
+    /// pointers that create circular chains when the next test reuses
+    /// the same overlay addresses.
+    boot_wl_buckets: Vec<u64>,
 }
 
 // SAFETY: Wf64Session holds raw LLVM pointers via `Jit` that aren't
@@ -696,7 +740,11 @@ impl Wf64Session {
                 "rt_type"      => Some(runtime::rt_type      as *mut c_void),
                 "rt_bye"       => Some(runtime::rt_bye       as *mut c_void),
                 "rt_read_line" => Some(runtime::rt_read_line as *mut c_void),
-                "rt_to_float"  => Some(runtime::rt_to_float  as *mut c_void),
+                "rt_read_key"  => Some(runtime::rt_read_key  as *mut c_void),
+                "rt_key_q"     => Some(runtime::rt_key_q     as *mut c_void),
+                "rt_to_float"    => Some(runtime::rt_to_float    as *mut c_void),
+                "rt_forth_brk"   => Some(runtime::rt_forth_brk   as *mut c_void),
+                "rt_forth_trace" => Some(runtime::rt_forth_trace  as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;
@@ -731,6 +779,11 @@ impl Wf64Session {
             write_u64(up, USER_FORGET_FENCE, 0);
             write_u64(up, USER_FP0,          user_base + USER_FP_STACK + 0x100);
             write_u64(up, USER_FSP,          user_base + USER_FP_STACK + 0x100);
+            write_u64(up, USER_CURRENT,      0);
+            write_u64(up, USER_FORTH_WID,    0);
+            write_u64(up, USER_ORDER_COUNT,  0);
+            write_u64(up, USER_INDEX_HERE,   debug_meta_base);
+            write_u64(up, USER_INDEX_LATEST, 0);
         }
 
         // Register kernel procs with SEH for symbolic crash dumps.
@@ -766,7 +819,13 @@ impl Wf64Session {
             boot_here: 0,
             boot_latest: 0,
             boot_latestxt: 0,
+            boot_index_here: 0,
+            boot_index_latest: 0,
+            boot_wl_buckets: Vec::new(),
         };
+
+        let xt_init_dictionary_overlay = session.xt_of("init_dictionary_overlay")?;
+        session.call_xt(xt_init_dictionary_overlay)?;
 
         // Bootstrap the dictionary via kernel primitives. From this
         // point on, the kernel's view of HERE/LATEST is the only one
@@ -775,6 +834,17 @@ impl Wf64Session {
         session.boot_here   = session.here();
         session.boot_latest = session.latest();
         session.boot_latestxt = session.user_u64(USER_LATESTXT_VAR);
+        session.boot_index_here = session.user_u64(USER_INDEX_HERE);
+        session.boot_index_latest = session.user_u64(USER_INDEX_LATEST);
+        // Snapshot the FORTH-WORDLIST bucket array so reset() can
+        // restore it. Without this, overlay nodes allocated by a test
+        // leave stale bucket heads that create circular chains when the
+        // next test reuses the same overlay addresses.
+        let forth_wid = session.user_u64(USER_FORTH_WID);
+        session.boot_wl_buckets = unsafe {
+            std::slice::from_raw_parts(forth_wid as *const u64, 512)
+                .to_vec()
+        };
         session.write_user_u64(USER_FORGET_FENCE, session.boot_latest);
         session.debug_synced_here = session.boot_here;
         session.debug_synced_latest = session.boot_latest;
@@ -792,9 +862,9 @@ impl Wf64Session {
         Ok(session)
     }
 
-    /// Populate the initial dictionary by calling `(create)` and
-    /// `(set-xt)` / `(set-flags)` once per primitive. Runs after the
-    /// session is otherwise fully constructed.
+    /// Populate the initial dictionary by calling the kernel-side
+    /// primitive publisher once per primitive. Runs after the session
+    /// is otherwise fully constructed.
     fn bootstrap_dictionary(&mut self) -> Result<()> {
         // Collect the xts first to avoid mutable-borrow conflicts on
         // self.jit during the iteration.
@@ -806,11 +876,7 @@ impl Wf64Session {
             })
             .collect::<Result<_>>()?;
 
-        // Look up the bootstrap primitives' xts up-front.
-        let xt_create    = self.xt_of("create")?;
-        let xt_set_xt    = self.xt_of("set_xt")?;
-        let xt_set_comp  = self.xt_of("set_comp")?;
-        let xt_set_flags = self.xt_of("set_flags")?;
+        let xt_publish_primitive = self.xt_of("publish_primitive")?;
 
         let pad = self.user_base + USER_PAD;
 
@@ -822,24 +888,15 @@ impl Wf64Session {
             unsafe {
                 std::ptr::copy_nonoverlapping(name.as_ptr(), pad as *mut u8, name.len());
             }
-            // (create) ( c-addr u -- )
+            let comp_xt = self.primitive_comp_helper(asm_sym)?.unwrap_or(0);
             self.push(pad as i64);
             self.push(name.len() as i64);
-            self.call_xt(xt_create)?;
-            let header = self.latest();
-            // (set-xt) ( xt -- )
             self.push(xt as i64);
-            self.call_xt(xt_set_xt)?;
+            self.push(comp_xt as i64);
+            self.push(flags as i64);
+            self.call_xt(xt_publish_primitive)?;
+            let header = self.latest();
             self.write_primitive_xt_backref(xt, header)?;
-            if let Some(comp_xt) = self.primitive_comp_helper(asm_sym)? {
-                self.push(comp_xt as i64);
-                self.call_xt(xt_set_comp)?;
-            }
-            // (set-flags) ( n -- ) — only when non-zero.
-            if flags != 0 {
-                self.push(flags as i64);
-                self.call_xt(xt_set_flags)?;
-            }
         }
         // Stack should be empty after the bootstrap.
         debug_assert_eq!(self.depth(), 0,
@@ -1008,6 +1065,7 @@ impl Wf64Session {
         let io = runtime::Io::Buffered {
             input: input.as_bytes().to_vec(),
             in_cursor: 0,
+            pending_key: None,
             output: Vec::new(),
         };
         let xt_quit = self.xt_of("quit")?;
@@ -1020,7 +1078,7 @@ impl Wf64Session {
             runtime::Io::Buffered { output, .. } => {
                 Ok(String::from_utf8_lossy(&output).into_owned())
             }
-            runtime::Io::Live => unreachable!("eval installed Buffered"),
+            runtime::Io::Live { .. } => unreachable!("eval installed Buffered"),
         }
     }
 
@@ -1088,8 +1146,27 @@ impl Wf64Session {
         self.write_user_u64(USER_LATESTXT_VAR, self.boot_latestxt);
         self.write_user_u64(USER_HANDLER_VAR,  0);
         self.write_user_u64(USER_THROW_CODE,   0);
+        self.write_user_u64(USER_TRACE,        0);
         self.write_user_u64(USER_FP0,          self.user_base + USER_FP_STACK + 0x100);
         self.write_user_u64(USER_FSP,          self.user_base + USER_FP_STACK + 0x100);
+        self.write_user_u64(USER_INDEX_HERE,   self.boot_index_here);
+        self.write_user_u64(USER_INDEX_LATEST, self.boot_index_latest);
+        let forth_wid = self.user_u64(USER_FORTH_WID);
+        // Restore the FORTH-WORDLIST bucket chains to their
+        // post-bootstrap state. Any overlays allocated since boot used
+        // addresses that will be reused by the next test; without this
+        // restore the stale bucket heads produce circular chains and
+        // hang find-name.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.boot_wl_buckets.as_ptr(),
+                forth_wid as *mut u64,
+                512,
+            );
+        }
+        self.write_user_u64(USER_CURRENT,      forth_wid);
+        self.write_user_u64(USER_ORDER_COUNT,  1);
+        self.write_user_u64(USER_CONTEXT,      forth_wid);
         self.runtime_words.clear();
         self.debug_synced_here = self.boot_here;
         self.debug_synced_latest = self.boot_latest;
@@ -1100,7 +1177,7 @@ impl Wf64Session {
     pub fn run_interactive(&mut self) -> Result<()> {
         let xt_quit = self.xt_of("quit")?;
         let mut err = Ok(());
-        let (_, _) = runtime::with_io(runtime::Io::Live, || {
+        let (_, _) = runtime::with_io(runtime::Io::Live { pending_key: None }, || {
             err = self.call_xt(xt_quit);
         });
         err

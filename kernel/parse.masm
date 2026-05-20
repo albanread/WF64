@@ -138,6 +138,54 @@ proc(to_in_word)
     next()
 endp()
 
+; source-id  ( -- 0 | -1 )
+;     Identify the current input source.
+proc(source_id_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_SOURCE_ID]
+    stk(0, 1)
+    next()
+endp()
+
+; refill  ( -- flag )
+;     Refill the current input buffer. For EVALUATE strings this is a
+;     defined false result with no state change.
+proc(refill_word)
+    cmp     qword ptr [UP + user_SOURCE_ID], -1
+    je      .false
+
+    mov     [DSP - cell], TOS                ; old TOS -> NNNOS slot
+    lea     rcx, [UP + user_SOURCE_BUF]
+    mov     [DSP - 2*cell], rcx              ; c-addr -> NNOS slot
+    mov     TOS, source_buf_size             ; +n1
+    sub     DSP, 2*cell
+    call    accept
+
+    cmp     TOS, -1
+    je      .eof
+
+    mov     [UP + user_SOURCE_LEN], TOS
+    lea     rcx, [UP + user_SOURCE_BUF]
+    mov     [UP + user_SOURCE_ADDR], rcx
+    mov     qword ptr [UP + user_TO_IN], 0
+    mov     TOS, [DSP + cell]                ; restore old TOS
+    add     DSP, 2*cell                      ; drop count + addr temp
+    mov     [DSP - cell], TOS
+    mov     TOS, -1
+    stk(0, 1)
+    next()
+
+.eof:
+    mov     TOS, [DSP + cell]                ; restore old TOS
+    add     DSP, 2*cell                      ; drop count + addr temp
+
+.false:
+    mov     [DSP - cell], TOS
+    xor     TOS, TOS
+    stk(0, 1)
+    next()
+endp()
+
 ; pad  ( -- c-addr )
 ;     Return the programmer scratch area.
 proc(pad_word)

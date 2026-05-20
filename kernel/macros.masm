@@ -62,6 +62,14 @@
 @assign fp_stack_size    = 0x100
 @assign user_WORD_BUF    = 0x1400    ; 256-byte transient counted-string buffer for WORD
 @assign word_buf_size    = 0x100
+@assign user_CURRENT     = 0x1500    ; wid receiving new definitions
+@assign user_FORTH_WID   = 0x1508    ; built-in FORTH word list identifier
+@assign user_ORDER_COUNT = 0x1510    ; number of active search-order entries
+@assign user_INDEX_HERE  = 0x1518    ; downward-growing index arena pointer
+@assign user_INDEX_LATEST= 0x1520    ; newest overlay node by creation order
+@assign user_CONTEXT     = 0x1528    ; search order array, wid1 at slot 0
+@assign search_order_max = 16
+@assign user_TRACE       = 0x15A8    ; trace flag: 0 = off, 1 = on
 
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier
@@ -89,6 +97,20 @@
 @assign tfa_tcol     = 0x82                 ; colon definition
 @assign tfa_tcre     = 0x91                 ; create definition
 @assign create_stub_size = 24               ; 19-byte stub + 5 pad bytes
+
+; ── Dictionary overlay layout ───────────────────────────────────────
+@assign wl_bucket_count = 512
+@assign wl_bucket_mask  = wl_bucket_count - 1
+@assign wl_size         = wl_bucket_count * cell
+
+@assign dn_bucket_next  = 0
+@assign dn_global_prev  = dn_bucket_next + cell
+@assign dn_header       = dn_global_prev + cell
+@assign dn_wid          = dn_header + cell
+@assign dn_hash         = dn_wid + cell      ; dword
+@assign dn_len          = dn_hash + 4        ; byte
+@assign dn_first        = dn_len + 1         ; byte
+@assign dn_size         = 40
 
 ; ── stk ──────────────────────────────────────────────────────────────
 ; `stk(in, out)` emits the data-stack-pointer adjustment for a primitive

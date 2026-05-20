@@ -47,16 +47,25 @@ pub enum Io {
     Buffered {
         input: Vec<u8>,
         in_cursor: usize,
+        pending_key: Option<u8>,
         output: Vec<u8>,
     },
     /// Real stdin/stdout — for the interactive REPL.
-    Live,
+    Live {
+        pending_key: Option<u8>,
+    },
 }
 
 impl Io {
     pub fn new_buffered() -> Self {
-        Io::Buffered { input: Vec::new(), in_cursor: 0, output: Vec::new() }
+        Io::Buffered { input: Vec::new(), in_cursor: 0, pending_key: None, output: Vec::new() }
     }
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _kbhit() -> i32;
+    fn _getwch() -> u16;
 }
 
 thread_local! {
@@ -128,6 +137,123 @@ pub extern "C" fn rt_dot_s(tos: u64, dsp: u64, sp0: u64, rsp: u64) -> u64 {
         let value = unsafe { (addr as *const i64).read_unaligned() };
         write_bytes(format!("{value} ").as_bytes());
     }
+    0
+}
+
+/// Forth-tuned breakpoint dump.
+///
+/// Called by `brk` / `int3` before the INT 3 instruction so the human
+/// sees a readable Forth state before the raw VEH register dump.
+///
+/// Arguments (Win64, 5-arg):
+///   tos   — cached TOS register
+///   dsp   — data stack pointer (points at NOS)
+///   sp0   — initial DSP (base of data stack)
+///   rsp   — Forth return stack pointer at the point of the breakpoint
+///   up    — user area pointer (= rsp_top since region layout makes them equal)
+///
+/// # Safety
+/// All pointers come from the live JIT session arena.
+#[no_mangle]
+pub extern "C" fn rt_forth_brk(tos: u64, dsp: u64, sp0: u64, rsp: u64, up: u64) -> u64 {
+    let mut out = String::with_capacity(512);
+
+    out.push_str("\n=== Forth Breakpoint ==================================================\n");
+
+    // ── Data stack ──────────────────────────────────────────────────
+    let depth = if dsp > sp0 {
+        0usize
+    } else {
+        ((sp0 - dsp) / 8 + 1) as usize
+    };
+    out.push_str(&format!("Data stack [{depth}]:\n"));
+    if depth == 0 {
+        out.push_str("  (empty)\n");
+    } else {
+        out.push_str(&format!("  TOS: {:>20}  {:#018x}\n", tos as i64, tos));
+        for i in 1..depth {
+            let addr = dsp + (i as u64 - 1) * 8;
+            let v = unsafe { (addr as *const u64).read_unaligned() };
+            out.push_str(&format!("  {:>3}: {:>20}  {:#018x}\n", i, v as i64, v));
+        }
+    }
+
+    // ── Return stack ────────────────────────────────────────────────
+    // rsp_top == up (region layout: return stack grows from up downward).
+    let rstack_depth = if rsp >= up { 0usize } else { ((up - rsp) / 8) as usize };
+    let rstack_show  = rstack_depth.min(16);
+    out.push_str(&format!("Return stack [{rstack_depth} cells, showing {rstack_show}]:\n"));
+    for i in 0..rstack_show {
+        let addr = rsp + i as u64 * 8;
+        let v = unsafe { (addr as *const u64).read_unaligned() };
+        out.push_str(&format!("  [{i}]: {v:#018x}\n"));
+    }
+
+    // ── Key user variables ───────────────────────────────────────────
+    // Safety: up points into the live session user area.
+    let uread = |off: u64| unsafe { *((up + off) as *const u64) };
+    let base         = uread(0x00);
+    let state        = uread(0x08);
+    let latest       = uread(0x10);
+    let here         = uread(0x18);
+    let latestxt     = uread(0x78);
+    let handler      = uread(0x80);
+    let throw_code   = uread(0x88);
+    let current      = uread(0x1500);
+    let forth_wid    = uread(0x1508);
+    let order_count  = uread(0x1510);
+    out.push_str("User variables:\n");
+    out.push_str(&format!("  BASE={base:<5}  STATE={state:<3}  HERE={here:#x}  LATEST={latest:#x}\n"));
+    out.push_str(&format!("  LATESTXT={latestxt:#x}  HANDLER={handler:#x}  THROW={throw_code}\n"));
+    out.push_str(&format!("  CURRENT={current:#x}  FORTH-WID={forth_wid:#x}  ORDER={order_count}\n"));
+    let show_ctx = (order_count as usize).min(16);
+    for i in 0..show_ctx {
+        let wid = uread(0x1528 + i as u64 * 8);
+        out.push_str(&format!("  CONTEXT[{i}]={wid:#x}\n"));
+    }
+
+    out.push_str("=======================================================================\n");
+    write_bytes(out.as_bytes());
+    0
+}
+
+/// Per-word trace hook, called from the interpreter before each word executes.
+///
+/// Arguments (Win64, 4-arg):
+///   nt    — name token (pointer to counted string: length byte then chars)
+///   tos   — current TOS
+///   dsp   — current DSP (points at NOS)
+///   sp0   — initial DSP (base of data stack)
+///
+/// # Safety
+/// `nt` points into the live JIT dictionary arena.
+#[no_mangle]
+pub extern "C" fn rt_forth_trace(nt: u64, tos: u64, dsp: u64, sp0: u64) -> u64 {
+    let name = unsafe {
+        let len = *(nt as *const u8) as usize;
+        let bytes = std::slice::from_raw_parts((nt + 1) as *const u8, len);
+        std::str::from_utf8(bytes).unwrap_or("<?>")
+    };
+
+    let depth = if dsp > sp0 {
+        0usize
+    } else {
+        ((sp0 - dsp) / 8 + 1) as usize
+    };
+
+    let mut out = format!("» {name:<16}  (");
+    if depth == 0 {
+        out.push_str(" empty");
+    } else {
+        out.push_str(&format!(" {}", tos as i64));
+        for i in 1..depth {
+            let addr = dsp + (i as u64 - 1) * 8;
+            let v = unsafe { (addr as *const i64).read_unaligned() };
+            out.push_str(&format!(" {v}"));
+        }
+    }
+    out.push_str(" )\n");
+    write_bytes(out.as_bytes());
     0
 }
 
@@ -218,7 +344,7 @@ pub extern "C" fn rt_read_line(buf: u64, cap: u64) -> u64 {
             }
             count
         }
-        Io::Live => {
+        Io::Live { .. } => {
             use std::io::{self, BufRead};
             let stdin = io::stdin();
             let mut handle = stdin.lock();
@@ -240,6 +366,73 @@ pub extern "C" fn rt_read_line(buf: u64, cap: u64) -> u64 {
                 }
                 Err(_) => EOF,
             }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn rt_read_key() -> u64 {
+    with_current_io(|io| match io {
+        Io::Buffered { input, in_cursor, pending_key, .. } => {
+            if let Some(byte) = pending_key.take() {
+                return byte as u64;
+            }
+            if *in_cursor >= input.len() {
+                return 0;
+            }
+            let byte = input[*in_cursor];
+            *in_cursor += 1;
+            byte as u64
+        }
+        Io::Live { pending_key } => {
+            if let Some(byte) = pending_key.take() {
+                return byte as u64;
+            }
+            use std::io::Read;
+
+            let stdin = std::io::stdin();
+            let mut handle = stdin.lock();
+            let mut buf = [0u8; 1];
+            match handle.read_exact(&mut buf) {
+                Ok(()) => buf[0] as u64,
+                Err(_) => 0,
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn rt_key_q() -> u64 {
+    with_current_io(|io| match io {
+        Io::Buffered { input, in_cursor, pending_key, .. } => {
+            if pending_key.is_some() {
+                return u64::MAX;
+            }
+            if *in_cursor >= input.len() {
+                return 0;
+            }
+            *pending_key = Some(input[*in_cursor]);
+            *in_cursor += 1;
+            u64::MAX
+        }
+        Io::Live { pending_key } => {
+            if pending_key.is_some() {
+                return u64::MAX;
+            }
+
+            #[cfg(windows)]
+            unsafe {
+                if _kbhit() == 0 {
+                    return 0;
+                }
+                let wide = _getwch();
+                if wide <= 0xFF {
+                    *pending_key = Some(wide as u8);
+                    return u64::MAX;
+                }
+            }
+
+            0
         }
     })
 }
@@ -269,7 +462,7 @@ pub extern "C" fn rt_to_float(addr: u64, len: u64, out_bits: u64) -> u64 {
 fn write_bytes(bytes: &[u8]) {
     with_current_io(|io| match io {
         Io::Buffered { output, .. } => output.extend_from_slice(bytes),
-        Io::Live => {
+        Io::Live { .. } => {
             let mut out = std::io::stdout();
             let _ = out.write_all(bytes);
             let _ = out.flush();

@@ -19,6 +19,119 @@
 ; the call-clobbered RAX.
 ; ─────────────────────────────────────────────────────────────────────
 
+proc(interpret_source)
+.tokens:
+    ; Cooperative bye check (also covers the case where bye was called
+    ; mid-source by a primitive or compiled word).
+    cmp     qword ptr [UP + user_BYE_REQ], 0
+    jne     .done
+
+    call    parse_name                       ; ( -- c-addr u )
+    test    TOS, TOS                         ; u == 0?
+    jz      .end_source
+
+    call    find_name                        ; ( c-addr u -- nt -1 | c-addr u 0 )
+    test    TOS, TOS
+    jnz     .found_word
+
+    ; Not in the dictionary. Drop the 0 flag; (c-addr u) is still on stack.
+    mov     TOS, [DSP]
+    add     DSP, cell
+
+    call    number_q                         ; ( c-addr u -- n -1 | c-addr u 0 )
+    test    TOS, TOS
+    jnz     .got_number
+
+    ; Not an integer. Drop the 0 flag and try a decimal float.
+    mov     TOS, [DSP]
+    add     DSP, cell
+
+    call    float_q                          ; ( c-addr u -- -1 | c-addr u 0 ) ( F: -- r )
+    test    TOS, TOS
+    jnz     .got_float
+
+    ; Not a number either. Stack: ( c-addr u 0 ), with the caller's
+    ; original TOS preserved at NNNOS. Drop all 3 and restore it.
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+
+    ; Print "? " via type ( addr len -- )
+    mov     [DSP - cell], TOS
+    lea     rcx, [rip + .qmark_str]
+    mov     [DSP - 2*cell], rcx
+    mov     TOS, 2
+    sub     DSP, 2*cell
+    call    type_word
+    jmp     .tokens
+
+.found_word:
+    mov     TOS, [DSP]
+    add     DSP, cell
+    lea     r9, [TOS - dh_nt]
+    mov     rcx, [r9 + dh_ct]
+    mov     rdx, [r9 + dh_xtptr]
+    mov     r8,  [UP + user_STATE]
+    mov     TOS, [DSP]
+    add     DSP, cell
+    test    r8, r8
+    jz      .exec_xt
+    mov     [DSP - cell], TOS
+    mov     TOS, rdx
+    sub     DSP, cell
+    call    rcx
+    jmp     .tokens
+
+.exec_xt:
+    ; ── Trace hook ───────────────────────────────────────────────────
+    ; If user_TRACE is set, call rt_forth_trace(nt, tos, dsp, sp0)
+    ; before executing the word.  r9 still holds the header base from
+    ; .found_word; nt = r9 + dh_nt.  rdx = xt ptr (saved across the
+    ; call by pushing it on the return stack).
+    cmp     qword ptr [UP + user_TRACE], 0
+    jz      .do_exec
+    push    rdx                             ; save xt on the Forth rstack
+    lea     rcx, [r9 + dh_nt]              ; arg1 = nt (counted-string ptr)
+    mov     rdx, TOS                        ; arg2 = current TOS
+    mov     r8,  DSP                        ; arg3 = DSP
+    mov     r9,  [UP + user_SP0]            ; arg4 = SP0
+    win64_call(rt_forth_trace)
+    pop     rdx                             ; restore xt
+.do_exec:
+    mov     [DSP - cell], TOS
+    mov     TOS, rdx
+    sub     DSP, cell
+    call    execute
+    jmp     .tokens
+
+.got_number:
+    mov     TOS, [DSP]
+    add     DSP, cell
+    mov     r8, [UP + user_STATE]
+    test    r8, r8
+    jz      .tokens
+    call    literal
+    jmp     .tokens
+
+.got_float:
+    mov     TOS, [DSP]
+    add     DSP, cell
+    mov     r8, [UP + user_STATE]
+    test    r8, r8
+    jz      .tokens
+    call    fliteral
+    jmp     .tokens
+
+.end_source:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+
+.done:
+    ret
+
+.qmark_str:
+    .ascii "? "
+endp()
+
 ; quit  ( -- )
 ;     The REPL loop. Doesn't return under normal operation; `bye`
 ;     calls ExitProcess to leave.
@@ -60,109 +173,10 @@ proc(quit)
     mov     TOS, [DSP]
     add     DSP, cell
 
-    ; ── Token dispatch loop ─────────────────────────────────────────
-.tokens:
-    ; Cooperative bye check (also covers the case where bye was called
-    ; mid-line by a primitive or compiled word).
+    call    interpret_source
+
     cmp     qword ptr [UP + user_BYE_REQ], 0
     jne     .bye_return
-
-    call    parse_name                       ; ( -- c-addr u )
-    test    TOS, TOS                         ; u == 0?
-    jz      .end_line
-
-    call    find_name                        ; ( c-addr u -- nt -1 | c-addr u 0 )
-    test    TOS, TOS
-    jnz     .found_word
-
-    ; Not in the dictionary. Drop the 0 flag; (c-addr u) is still on stack.
-    mov     TOS, [DSP]
-    add     DSP, cell
-
-    call    number_q                         ; ( c-addr u -- n -1 | c-addr u 0 )
-    test    TOS, TOS
-    jnz     .got_number
-
-    ; Not an integer. Drop the 0 flag and try a decimal float.
-    mov     TOS, [DSP]
-    add     DSP, cell
-
-    call    float_q                          ; ( c-addr u -- -1 | c-addr u 0 ) ( F: -- r )
-    test    TOS, TOS
-    jnz     .got_float
-
-    ; Not a number either. Stack: ( c-addr u 0 ), with the iteration's
-    ; original TOS preserved at NNNOS (depth +3 above where we entered
-    ; the iteration). Drop all 3 and restore the original TOS.
-    mov     TOS, [DSP + 2*cell]              ; raise OLD_TOS into TOS
-    add     DSP, 3*cell                      ; drop u, c-addr, 0-flag slots
-
-    ; Print "? " via type ( addr len -- )
-    mov     [DSP - cell], TOS                ; spill TOS
-    lea     rcx, [rip + .qmark_str]
-    mov     [DSP - 2*cell], rcx              ; NOS = addr
-    mov     TOS, 2                           ; TOS = length
-    sub     DSP, 2*cell
-    call    type_word
-    jmp     .tokens
-
-.found_word:
-    ; Stack: ( nt -1 ). Drop -1, raise nt.
-    mov     TOS, [DSP]                       ; TOS ← nt
-    add     DSP, cell
-    ; Extract xt + ct + state before touching the stack any more.
-    ; find-name returns nt, so step back to the header base.
-    lea     r9, [TOS - dh_nt]                ; r9  = header base
-    mov     rcx, [r9 + dh_ct]                ; rcx = ct
-    mov     rdx, [r9 + dh_xtptr]             ; rdx = xt
-    mov     r8,  [UP + user_STATE]           ; r8  = STATE
-    ; Drop nt — restore the iteration's TOS underneath it.
-    mov     TOS, [DSP]
-    add     DSP, cell
-    ; STATE == 0 → execute. Else execute the compilation token held in
-    ; HEAD.CT on the xt.
-    test    r8, r8
-    jz      .exec_xt
-    ; Compile mode: push xt, then tail through ct.
-    mov     [DSP - cell], TOS                ; spill TOS
-    mov     TOS, rdx                         ; new TOS = xt
-    sub     DSP, cell
-    call    rcx
-    jmp     .tokens
-.exec_xt:
-    ; Interpret OR immediate: push xt, call execute
-    mov     [DSP - cell], TOS                ; spill TOS
-    mov     TOS, rdx                         ; new TOS = xt
-    sub     DSP, cell
-    call    execute                          ; ( xt -- ... )
-    jmp     .tokens
-
-.got_number:
-    ; Stack: ( n -1 ). Drop -1, n stays as new TOS.
-    mov     TOS, [DSP]                       ; raise n
-    add     DSP, cell
-    ; In compile mode, fold the literal into the current definition.
-    mov     r8, [UP + user_STATE]
-    test    r8, r8
-    jz      .tokens
-    call    literal
-    jmp     .tokens
-
-.got_float:
-    ; Stack: ( -1 ), with the parsed float already on the FP stack.
-    mov     TOS, [DSP]
-    add     DSP, cell
-    mov     r8, [UP + user_STATE]
-    test    r8, r8
-    jz      .tokens
-    call    fliteral
-    jmp     .tokens
-
-.end_line:
-    ; parse_name returned ( ??? 0 ). Drop both cells AND restore the
-    ; iteration's original TOS from the NNOS slot.
-    mov     TOS, [DSP + cell]                ; raise OLD_TOS
-    add     DSP, 2*cell
 
     ; Print " ok\n" via type
     mov     [DSP - cell], TOS                ; spill
@@ -181,9 +195,55 @@ proc(quit)
 
     ; ── Inline string literals (after the loop's unconditional jmp,
     ;    so execution never falls through them) ──────────────────────
-.qmark_str:
-    .ascii "? "
 .ok_str:
     .ascii " ok"
     .byte 10
+endp()
+
+proc(evaluate_word)
+    pop     rcx                              ; save our return address
+    mov     r8,  [UP + user_SOURCE_ID]
+    mov     r9,  [UP + user_SOURCE_ADDR]
+    mov     r10, [UP + user_SOURCE_LEN]
+    mov     r11, [UP + user_TO_IN]
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+    push    rcx                              ; restore return address to top
+
+    mov     rcx, [DSP]                       ; c-addr
+    mov     [UP + user_SOURCE_ADDR], rcx
+    mov     [UP + user_SOURCE_LEN], TOS      ; u
+    mov     qword ptr [UP + user_SOURCE_ID], -1
+    mov     qword ptr [UP + user_TO_IN], 0
+
+    mov     TOS, [DSP + cell]                ; drop c-addr u
+    add     DSP, 2*cell
+
+    mov     [DSP - cell], TOS
+    lea     TOS, [rip + interpret_source]
+    sub     DSP, cell
+    call    catch_word
+
+    pop     rcx                              ; saved return address
+    pop     r11                              ; old >IN
+    pop     r10                              ; old SOURCE-LEN
+    pop     r9                               ; old SOURCE-ADDR
+    pop     r8                               ; old SOURCE-ID
+    push    rcx
+    mov     [UP + user_SOURCE_ID], r8
+    mov     [UP + user_SOURCE_ADDR], r9
+    mov     [UP + user_SOURCE_LEN], r10
+    mov     [UP + user_TO_IN], r11
+
+    test    TOS, TOS
+    jnz     .rethrow
+    mov     TOS, [DSP]
+    add     DSP, cell
+    next()
+
+.rethrow:
+    call    throw_word
+    next()
 endp()
