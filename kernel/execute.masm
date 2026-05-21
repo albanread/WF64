@@ -10,31 +10,48 @@
 ;
 ;     Stack effect is variadic (the called word may push/pop anything).
 ;     We manually adjust rbp for the xt drop.
+;
+;     Internal-state contract at entry:
+;       DSP < SP0  -> there is a real NOS below xt; raise [DSP]
+;       DSP = SP0  -> xt is the only real item; dropping xt makes depth 0
+;       DSP > SP0  -> caller already normalized to internal depth 0
+;
+;     The `jae` (≥) check is what distinguishes the first two cases
+;     correctly. With the old `ja` test, the depth-1 case fell through,
+;     read garbage from [SP0], and turned "xt only" into a fake NOS.
 proc(execute)
     mov     rcx, TOS                         ; rcx = xt
     cmp     DSP, [UP + user_SP0]
-    ja      .empty_below
+    jae     .empty_below                     ; DSP == SP0: xt was the only item
     mov     TOS, [DSP]                       ; raise NOS to TOS
     add     DSP, cell                        ; drop the xt slot
     jmp     rcx                              ; tail-jump
  .empty_below:
-    xor     TOS, TOS                         ; xt was the only item; leave stack logically empty
+    cmp     DSP, [UP + user_SP0]
+    ja      .already_empty
+    add     DSP, cell                        ; consume the final real stack item
+.already_empty:
+    xor     TOS, TOS                         ; leave stack logically empty
     jmp     rcx
     ; (no next() — we don't ret here, the target's ret returns past us)
 endp()
 
 ; perform  ( i*x a-xt -- j*x )
 ;     Fetch xt from a-xt, then execute it with the same tail-jump
-;     behavior as `execute`.
+;     behavior and internal-state contract as `execute`.
 proc(perform)
     mov     rcx, [TOS]                       ; rcx = *a-xt = xt
     cmp     DSP, [UP + user_SP0]
-    ja      .empty_below
+    jae     .empty_below                     ; DSP == SP0: a-xt was the only item
     mov     TOS, [DSP]                       ; raise NOS to TOS
     add     DSP, cell                        ; drop the a-xt slot
     jmp     rcx                              ; tail-jump
  .empty_below:
-    xor     TOS, TOS                         ; a-xt was the only item; leave stack logically empty
+    cmp     DSP, [UP + user_SP0]
+    ja      .already_empty
+    add     DSP, cell                        ; consume the final real stack item
+.already_empty:
+    xor     TOS, TOS                         ; leave stack logically empty
     jmp     rcx
 endp()
 

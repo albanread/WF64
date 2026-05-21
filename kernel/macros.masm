@@ -8,6 +8,19 @@
 ;   RSP = rstack (return stack — also CPU call/ret stack since we STC)
 ;   R12 = callee-saved scratch for Win64 callouts (RSP-save slot)
 ;
+; Internal data-stack representation:
+;   - At kernel entry/exit, Rust sees a pure in-memory stack.
+;   - Inside the kernel, TOS is cached in RAX and DSP points at NOS.
+;   - Therefore depth is encoded by DSP relative to SP0:
+;       depth 0: DSP = SP0 + cell, TOS is stale/don't-care
+;       depth 1: DSP = SP0,        TOS is the only real item
+;       depth 2: DSP = SP0 - cell, TOS is top and [DSP] is NOS
+;   Any code that manufactures or consumes a call boundary, an
+;   interpreter dispatch, or an `execute` path must preserve this
+;   encoding exactly. Ordinary words should only reason in terms of the
+;   internal form above; only forth_main translates to/from Rust's
+;   memory-only wire format.
+;
 ; Subroutine-threaded: every primitive ends with `ret` and every Forth
 ; word called from a colon definition is invoked via `call`. There is
 ; no inner interpreter dispatch loop — the CPU's call/ret IS the dispatch.
@@ -166,6 +179,12 @@
 ; alignment dance. The win32/*.masm wrappers do this internally; use
 ; this directly only when calling something not in the generated set
 ; (e.g., the Rust runtime functions via @extern).
+;
+; IMPORTANT: this macro only makes the Win64 ABI call itself correct.
+; It does NOT preserve the Forth machine state for you. In particular,
+; every Rust call must be treated as clobbering TOS because TOS lives in
+; RAX and RAX is the Win64 integer return register. If the pre-call TOS
+; still matters after the call, the caller must spill or recompute it.
 @macro win64_call(target)
     mov     r12, rsp
     and     rsp, -16

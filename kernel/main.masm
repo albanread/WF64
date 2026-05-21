@@ -60,6 +60,11 @@
 ;   prologue:  mov TOS, [DSP]; add DSP, cell    ; cache top in rax
 ;   epilogue:  sub DSP, cell; mov [DSP], TOS    ; spill top back
 ;
+; This is the only general stack-representation translation layer.
+; Inside the kernel, everybody else must speak the internal cached-TOS
+; form only. Rust and the host runtime never see the live internal form;
+; they only see the pure memory stack saved through user_DSP_SAVE.
+;
 ; With those bookends, `[UP + user_DSP_SAVE]` after return *is* the
 ; logical_dsp the caller should adopt. The Rust harness counts depth
 ; as (dsp_top - logical_dsp)/cell — no separate counter needed.
@@ -93,7 +98,11 @@ proc(forth_main)
     ; from then on.
     mov     rsp, [UP + user_RSP_CURRENT]
 
-    ; Prologue: cache top-of-memory-stack into TOS, bump DSP.
+    ; Prologue: translate Rust's memory-only stack into the internal
+    ; cached-TOS form. After this:
+    ;   input depth 0 -> internal depth 0 (DSP = SP0 + cell)
+    ;   input depth 1 -> internal depth 1 (DSP = SP0, TOS = item)
+    ;   input depth N -> internal depth N with DSP pointing at NOS
     mov     TOS, [DSP]
     add     DSP, cell
 
@@ -124,7 +133,8 @@ proc(forth_main)
     mov     rsp, [UP + user_RSP_CURRENT]
 
 .spill_and_return:
-    ; Epilogue: spill TOS back to memory, leave DSP pointing at top.
+    ; Epilogue: translate the internal cached-TOS form back into the
+    ; memory-only wire format Rust expects, then publish logical_dsp.
     sub     DSP, cell
     mov     [DSP], TOS
     mov     [UP + user_DSP_SAVE], DSP

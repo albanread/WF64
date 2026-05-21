@@ -64,24 +64,25 @@ variable hld
  
 : constant create , does> @ ;
  
-' (comp-cons) compiles-me
+' (comp-cons) ' constant compiles
 
 : (comp-2cons) ( xt -- ) >body postpone literal postpone 2@ ;
 
 : 2constant create 2, does> 2@ ;
-' (comp-2cons) compiles-me
+
+' (comp-2cons) ' 2constant compiles
 
 : (comp-fconst) ( xt -- ) >body postpone literal postpone f@ ;
 
 : fconstant create f, does> f@ ;
 
-' (comp-fconst) compiles-me
+' (comp-fconst) ' fconstant compiles
  
 : (comp-val) ( xt -- ) >body postpone literal postpone @ ;
  
 : value create , does> @ ;
  
-' (comp-val) compiles-me
+' (comp-val) ' value compiles
  
 : defer@ ( xt -- xt' ) dup >name tfa@ 145 = if 24 + @ else drop -31 throw then ;
  

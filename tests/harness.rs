@@ -137,6 +137,146 @@ fn load_source_file_provides_only_word() {
 }
 
 #[test]
+fn load_source_file_leaves_empty_data_stack() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let stack = s.stack();
+    let resolved: Vec<String> = stack
+        .iter()
+        .map(|value| {
+            s.resolve_word_addr(*value as u64)
+                .unwrap_or_else(|| format!("{value:#x}"))
+        })
+        .collect();
+    assert_eq!(stack, Vec::<i64>::new(), "resolved stack = {resolved:?}");
+}
+
+#[test]
+fn direct_only_word_then_get_order_leaves_clean_stack() {
+    let mut s = sess();
+    s.call("forth_wordlist_word").unwrap();
+    let root_wid = s.stack()[0];
+    s.reset();
+
+    s.call("only_word").unwrap();
+    s.call("get_order_word").unwrap();
+
+    assert_eq!(s.stack(), vec![1, root_wid]);
+}
+
+#[test]
+fn eval_tick_then_compiles_me_leaves_empty_stack() {
+    let mut s = sess();
+    let out = s.eval(
+        ": compiles ( xt1 xt2 -- ) >comp ! ;\n\
+         : compiles-me ( xt -- ) latestxt compiles ;\n\
+         : helper 123 ;\n\
+         : target 456 ;\n\
+         ' helper compiles-me\n\
+         bye\n"
+    ).unwrap();
+
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n");
+    assert_eq!(s.stack(), Vec::<i64>::new());
+}
+
+#[test]
+fn eval_defining_word_with_does_leaves_empty_stack() {
+    let mut s = sess();
+    let out = s.eval(": , here ! 1 cells allot ;\n: constant create , does> @ ;\nbye\n").unwrap();
+
+    assert_eq!(out, " ok\n ok\n");
+    assert_eq!(s.stack(), Vec::<i64>::new());
+}
+
+#[test]
+fn eval_compiles_me_on_defining_word_leaves_empty_stack() {
+    let mut s = sess();
+    let out = s.eval(
+        ": , here ! 1 cells allot ;\n\
+         : compiles ( xt1 xt2 -- ) >comp ! ;\n\
+         : compiles-me ( xt -- ) latestxt compiles ;\n\
+             : (comp-cons) ( xt -- ) >body postpone literal ;\n\
+         : constant create , does> @ ;\n\
+             ' (comp-cons) compiles-me\n\
+         bye\n"
+    ).unwrap();
+
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n ok\n");
+    let stack = s.stack();
+    let resolved: Vec<String> = stack
+        .iter()
+        .map(|value| {
+            s.resolve_word_addr(*value as u64)
+                .unwrap_or_else(|| format!("{value:#x}"))
+        })
+        .collect();
+    assert_eq!(stack, Vec::<i64>::new(), "resolved stack = {resolved:?}");
+}
+
+#[test]
+fn eval_defining_word_setup_leaves_empty_stack() {
+    let mut s = sess();
+    let out = s.eval(
+        ": , here ! 1 cells allot ;\n\
+         : compiles ( xt1 xt2 -- ) >comp ! ;\n\
+         : compiles-me ( xt -- ) latestxt compiles ;\n\
+             : (comp-cons) ( xt -- ) >body postpone literal ;\n\
+         : constant create , does> @ ;\n\
+         bye\n"
+    ).unwrap();
+
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n");
+    assert_eq!(s.stack(), Vec::<i64>::new());
+}
+
+#[test]
+fn direct_compiles_me_on_defining_word_leaves_empty_stack() {
+    let mut s = sess();
+    s.eval(
+        ": , here ! 1 cells allot ;\n\
+         : compiles ( xt1 xt2 -- ) >comp ! ;\n\
+         : compiles-me ( xt -- ) latestxt compiles ;\n\
+             : (comp-cons) ( xt -- ) >body postpone literal ;\n\
+         : constant create , does> @ ;\n\
+         bye\n"
+    ).unwrap();
+
+        s.eval("' compiles-me ' (comp-cons) bye\n").unwrap();
+        let comp_cons_xt = s.pop() as u64;
+    let compiles_me_xt = s.pop() as u64;
+
+    s.push(comp_cons_xt as i64);
+    s.call_xt(compiles_me_xt).unwrap();
+
+    assert_eq!(s.stack(), Vec::<i64>::new());
+}
+
+#[test]
+fn execute_primitive_compiles_me_on_defining_word_leaves_empty_stack() {
+    let mut s = sess();
+    s.eval(
+        ": , here ! 1 cells allot ;\n\
+         : compiles ( xt1 xt2 -- ) >comp ! ;\n\
+         : compiles-me ( xt -- ) latestxt compiles ;\n\
+             : (comp-cons) ( xt -- ) >body postpone literal ;\n\
+         : constant create , does> @ ;\n\
+         bye\n"
+    ).unwrap();
+
+        s.eval("' compiles-me ' (comp-cons) bye\n").unwrap();
+    let comp_cons_xt = s.pop() as u64;
+    let compiles_me_xt = s.pop() as u64;
+
+    s.push(comp_cons_xt as i64);
+    s.push(compiles_me_xt as i64);
+    s.call("execute").unwrap();
+
+    assert_eq!(s.stack(), Vec::<i64>::new());
+}
+
+#[test]
 fn load_source_file_only_word_is_present_in_root_wordlist() {
     let mut s = sess();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
@@ -450,6 +590,14 @@ fn eval_tick_pushes_interpret_xt() {
 }
 
 #[test]
+fn eval_tick_from_empty_then_drop_leaves_stack_empty() {
+    let mut s = sess();
+    let out = s.eval("' dup drop\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    assert_eq!(s.depth(), 0);
+}
+
+#[test]
 fn eval_bracket_tick_compiles_xt_literal() {
     let mut s = sess();
     let out = s.eval(": run-dup ['] dup execute ;\n7 run-dup . .\nbye\n").unwrap();
@@ -461,6 +609,58 @@ fn eval_immediate_and_postpone_enable_forth_defined_compiler_words() {
     let mut s = sess();
     let out = s.eval(": twice postpone dup postpone dup ; immediate\n: demo twice ;\n4 demo . . .\nbye\n").unwrap();
     assert_eq!(out, " ok\n ok\n4 4 4  ok\n");
+}
+
+#[test]
+fn eval_compiles_me_bindings_leave_stack_empty() {
+    let mut s = sess();
+    s.eval(
+        ": compiles ( xt1 xt2 -- ) >comp ! ;\n\
+         : compiles-me ( xt -- ) latestxt compiles ;\n\
+         : f, here f! 1 floats allot ;\n\
+         : (comp-cons) ( xt -- ) >body postpone literal ;\n\
+         : constant create , does> @ ;\n\
+         : (comp-2cons) ( xt -- ) >body postpone literal postpone 2@ ;\n\
+         : 2constant create 2, does> 2@ ;\n\
+         : (comp-fconst) ( xt -- ) >body postpone literal postpone f@ ;\n\
+         : fconstant create f, does> f@ ;\n\
+         : (comp-val) ( xt -- ) >body postpone literal postpone @ ;\n\
+         : value create , does> @ ;\n\
+         bye\n",
+    )
+    .unwrap();
+    assert_eq!(s.depth(), 0);
+
+    s.eval("' (comp-cons) compiles-me\nbye\n").unwrap();
+    assert_eq!(s.stack(), Vec::<i64>::new());
+
+    s.eval("' (comp-2cons) compiles-me\nbye\n").unwrap();
+    assert_eq!(s.depth(), 0);
+
+    s.eval("' (comp-fconst) compiles-me\nbye\n").unwrap();
+    assert_eq!(s.depth(), 0);
+
+    s.eval("' (comp-val) compiles-me\nbye\n").unwrap();
+    assert_eq!(s.depth(), 0);
+}
+
+#[test]
+fn eval_compiles_me_consumes_tick_result_across_eval_boundary() {
+    let mut s = sess();
+    s.eval(
+        ": compiles ( xt1 xt2 -- ) >comp ! ;\n\
+         : compiles-me ( xt -- ) latestxt compiles ;\n\
+         : (comp-cons) ( xt -- ) >body postpone literal ;\n\
+         : constant create , does> @ ;\n\
+         bye\n",
+    )
+    .unwrap();
+
+    s.eval("' (comp-cons)\nbye\n").unwrap();
+    assert_eq!(s.depth(), 1);
+
+    s.eval("compiles-me\nbye\n").unwrap();
+    assert_eq!(s.depth(), 0);
 }
 
 #[test]
@@ -1676,6 +1876,20 @@ fn eval_i_and_j_through_nested_rstack_frames() {
 }
 
 #[test]
+fn eval_two_r_roundtrip_with_literals_in_definition() {
+    let mut s = sess();
+    let out = s.eval(": rr2 1 2 2>r 2r> ;\nrr2 . .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n2 1  ok\n");
+}
+
+#[test]
+fn eval_two_r_roundtrip_with_literals_can_end_empty() {
+    let mut s = sess();
+    let out = s.eval(": rr1 1 2 2>r 2r> 2drop ;\nrr1\nbye\n").unwrap();
+    assert_eq!(out, " ok\n ok\n");
+}
+
+#[test]
 fn eval_do_part_helpers_feed_i_and_j() {
     let mut s = sess();
     let out = s.eval(": dijtest 20 3 do-part1 do-part2 50 10 do-part1 do-part2 i . j . 2rdrop 2rdrop ;\ndijtest\nbye\n").unwrap();
@@ -2186,17 +2400,17 @@ fn search_order_words_route_lookup_by_wordlist() {
 fn load_source_file_provides_search_order_extension_words() {
     let mut s = sess();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
-    s.load_source_file(&path).unwrap();
-
     s.call("forth_wordlist_word").unwrap();
     let root_wid = s.stack()[0];
+    s.reset();
+    s.load_source_file(&path).unwrap();
 
     let out = s.eval(
         "forth-wordlist constant root\n\
          wordlist constant extra\n\
          bye\n"
     ).unwrap();
-    assert_eq!(out, " ok\n ok\n ok\n");
+    assert_eq!(out, " ok\n ok\n");
 
     let out = s.eval("only get-order\nbye\n").unwrap();
     assert_eq!(out, " ok\n");
@@ -2206,6 +2420,7 @@ fn load_source_file_provides_search_order_extension_words() {
     s.load_source_file(&path).unwrap();
     s.call("forth_wordlist_word").unwrap();
     assert_eq!(s.stack(), vec![root_wid]);
+    s.pop();
     let out = s.eval(
         "forth-wordlist constant root\n\
          wordlist constant extra\n\
@@ -2213,11 +2428,10 @@ fn load_source_file_provides_search_order_extension_words() {
          bye\n"
     ).unwrap();
     assert_eq!(out, " ok\n ok\n ok\n");
-    assert_eq!(s.stack(), vec![2, root_wid, root_wid, root_wid]);
+    assert_eq!(s.stack(), vec![2, root_wid, root_wid]);
 
     s.reset();
     s.load_source_file(&path).unwrap();
-    s.call("forth_wordlist_word").unwrap();
     let out = s.eval(
         "forth-wordlist constant root\n\
          wordlist constant extra\n\
@@ -2226,14 +2440,12 @@ fn load_source_file_provides_search_order_extension_words() {
     ).unwrap();
     assert_eq!(out, " ok\n ok\n ok\n");
     let stack = s.stack();
-    assert_eq!(stack.len(), 3);
+    assert_eq!(stack.len(), 2);
     assert_eq!(stack[0], 1);
-    assert_ne!(stack[1], root_wid);
-    assert_eq!(stack[2], root_wid);
+    assert_eq!(stack[1], root_wid);
 
     s.reset();
     s.load_source_file(&path).unwrap();
-    s.call("forth_wordlist_word").unwrap();
     let out = s.eval(
         "forth-wordlist constant root\n\
          wordlist constant extra\n\
@@ -2241,11 +2453,10 @@ fn load_source_file_provides_search_order_extension_words() {
          bye\n"
     ).unwrap();
     assert_eq!(out, " ok\n ok\n ok\n");
-    assert_eq!(s.stack(), vec![2, root_wid, root_wid, root_wid]);
+    assert_eq!(s.stack(), vec![2, root_wid, root_wid]);
 
     s.reset();
     s.load_source_file(&path).unwrap();
-    s.call("forth_wordlist_word").unwrap();
     let out = s.eval(
         "forth-wordlist constant root\n\
          wordlist constant extra\n\
@@ -2255,10 +2466,9 @@ fn load_source_file_provides_search_order_extension_words() {
     ).unwrap();
     assert_eq!(out, " ok\n ok\n ok\n ok\n");
     let stack = s.stack();
-    assert_eq!(stack.len(), 3);
+    assert_eq!(stack.len(), 2);
     assert_eq!(stack[0], stack[1]);
     assert_ne!(stack[0], root_wid);
-    assert_eq!(stack[2], root_wid);
 }
 
 #[test]

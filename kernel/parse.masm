@@ -13,6 +13,9 @@
 ;     returns (anywhere, 0).
 ;
 ;     Treats space (0x20), tab (0x09), LF (0x0A), CR (0x0D) as whitespace.
+;     `(` starts a parenthesized comment only when it is the standalone
+;     Forth word `(`, i.e. when the next character is a delimiter or EOF.
+;     Names like `(comp-cons)` are ordinary tokens, not comments.
 proc(parse_name)
     mov     rsi, [UP + user_SOURCE_ADDR]    ; source base
     mov     rcx, [UP + user_SOURCE_LEN]     ; total length
@@ -34,7 +37,7 @@ proc(parse_name)
     cmp     r8b, '\\'
     je      .line_comment
     cmp     r8b, '('
-    je      .paren_comment
+    je      .maybe_paren_comment
     jmp     .scan_start
 .ws:
     inc     rdx
@@ -52,6 +55,21 @@ proc(parse_name)
     je      .skip
     inc     rdx
     jmp     .line_comment_scan
+
+.maybe_paren_comment:
+    lea     r9, [rdx + 1]
+    cmp     r9, rcx
+    jae     .paren_comment
+    movzx   r8, byte ptr [rsi + r9]
+    cmp     r8b, ' '
+    je      .paren_comment
+    cmp     r8b, 9
+    je      .paren_comment
+    cmp     r8b, 10
+    je      .paren_comment
+    cmp     r8b, 13
+    je      .paren_comment
+    jmp     .scan_start
 
 .paren_comment:
     inc     rdx
@@ -168,16 +186,12 @@ proc(refill_word)
     lea     rcx, [UP + user_SOURCE_BUF]
     mov     [UP + user_SOURCE_ADDR], rcx
     mov     qword ptr [UP + user_TO_IN], 0
-    mov     TOS, [DSP + cell]                ; restore old TOS
-    add     DSP, 2*cell                      ; drop count + addr temp
-    mov     [DSP - cell], TOS
     mov     TOS, -1
-    stk(0, 1)
     next()
 
 .eof:
-    mov     TOS, [DSP + cell]                ; restore old TOS
-    add     DSP, 2*cell                      ; drop count + addr temp
+    xor     TOS, TOS
+    next()
 
 .false:
     mov     [DSP - cell], TOS

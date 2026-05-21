@@ -256,7 +256,7 @@ proc(inline_two_to_r_comp)
     add     r8, 12
     mov     [UP + user_HERE], r8
     mov     TOS, [DSP]
-    add     DSP, 2*cell
+    stk(1, 0)
     next()
 endp()
 
@@ -273,12 +273,10 @@ proc(inline_two_r_from_comp)
     mov     byte ptr [r8 + 6], 0x45
     mov     byte ptr [r8 + 7], 0x08
     mov     byte ptr [r8 + 8], 0x58          ; pop rax
-    mov     byte ptr [r8 + 9], 0x59          ; pop rcx
-    mov     byte ptr [r8 + 10], 0x48         ; mov [rbp], rcx
-    mov     byte ptr [r8 + 11], 0x89
-    mov     byte ptr [r8 + 12], 0x4D
-    mov     byte ptr [r8 + 13], 0x00
-    add     r8, 14
+    mov     byte ptr [r8 + 9], 0x8F          ; pop qword ptr [rbp]
+    mov     byte ptr [r8 + 10], 0x45
+    mov     byte ptr [r8 + 11], 0x00
+    add     r8, 12
     mov     [UP + user_HERE], r8
     mov     TOS, [DSP]
     stk(1, 0)
@@ -884,23 +882,18 @@ endp()
 ; stub tail from RET+padding to JMP does-body, preserving the body
 ; address push in the stub prefix.
 ;
-; KNOWN ISSUE (#27): see `kernel/compile.masm` history. The stub
-; emits `mov rax, target` then this proc reads TOS and "pops" — net
-; consuming an extra cell beyond `,`. A correct fix exists (pass
-; target in rcx, drop the pop) but reveals a separate bug somewhere
-; in core.f loading that underflows the data stack at line 73's
-; `' (comp-fconst) ' fconstant compiles`. Reverted until the
-; underlying bug is found.
+; The DOES> stub puts the target address in RCX (Win64 arg-1,
+; caller-saved) via `mov rcx, imm64(target)`, then `call`s here.
+; RCX is NOT the cached TOS, so the user's data stack is untouched
+; and we just do the patch and `ret` (no `next()` — we're in a
+; sub-call from the stub, returning to the stub's own RET).
 proc(does_runtime_patch)
     mov     r8, [UP + user_LATESTXT]            ; xt of latest created word
     lea     r9, [r8 + 23]                       ; IP after jmp rel32
-    mov     byte ptr [r8 + 18], 0xE9           ; JMP rel32 opcode
-    mov     r10, TOS                            ; target address (from `mov rax,target` in stub)
-    sub     r10, r9                             ; rel32 = target - next_ip
-    mov     dword ptr [r8 + 19], r10d
-    mov     TOS, [DSP]
-    stk(1, 0)
-    next()
+    mov     byte ptr [r8 + 18], 0xE9            ; JMP rel32 opcode
+    sub     rcx, r9                             ; rel32 = target - next_ip
+    mov     dword ptr [r8 + 19], ecx
+    ret
 endp()
 
 ; does>  ( -- )                                        IMMEDIATE
@@ -917,9 +910,11 @@ proc(does_word)
     mov     r8, [UP + user_HERE]                ; patch-call sequence start
     lea     r9, [r8 + 16]                       ; target = code after ret
 
-    ; mov rax, imm64(target)
+    ; mov rcx, imm64(target)  -- rcx is Win64 arg-1, caller-saved, and
+    ; is NOT the cached TOS register, so this does not clobber the user's
+    ; data stack the way `mov rax, ...` would.
     mov     byte ptr [r8 + 0], 0x48
-    mov     byte ptr [r8 + 1], 0xB8
+    mov     byte ptr [r8 + 1], 0xB9
     mov     qword ptr [r8 + 2], r9
 
     ; call does_runtime_patch

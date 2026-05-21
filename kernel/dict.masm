@@ -272,8 +272,31 @@ endp()
 ; >comp  ( xt -- comp )
 ;     Convert xt to the header's compile helper slot.
 proc(to_comp)
-    mov     rcx, [TOS - cell]
-    lea     TOS, [TOS + rcx + dh_comp - dh_ct]
+    mov     rcx, [TOS - cell]                ; candidate ct offset
+    lea     r8, [TOS + rcx]                  ; candidate ct addr
+    mov     r9, [r8 + dh_xtptr - dh_ct]      ; header.xtptr via ct addr
+    cmp     r9, TOS
+    jne     .scan_fallback
+    lea     TOS, [r8 + dh_comp - dh_ct]
+    next()
+
+.scan_fallback:
+    mov     rdi, [UP + user_LATEST]
+
+.scan:
+    test    rdi, rdi
+    jz      .not_found
+    cmp     TOS, [rdi + dh_xtptr]
+    je      .matched
+    mov     rdi, [rdi + dh_link]
+    jmp     .scan
+
+.matched:
+    lea     TOS, [rdi + dh_comp]
+    next()
+
+.not_found:
+    xor     TOS, TOS
     next()
 endp()
 
