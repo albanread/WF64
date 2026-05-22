@@ -49,6 +49,27 @@ proc(interpret_source)
     test    TOS, TOS                         ; u == 0?
     jz      .end_source
 
+    ; In compile state with locals active, try the locals table first.
+    ; On a match it emits a 15-byte inline fetch into the current colon
+    ; def and returns true; we just drop the flag and grab the next
+    ; token. On a miss it leaves (c-addr u) intact for find_name below.
+    cmp     qword ptr [UP + user_STATE], 0
+    jz      .skip_locals_check
+    cmp     qword ptr [UP + user_LOCALS_COUNT], 0
+    jz      .skip_locals_check
+    call    check_local_emit_word
+    test    TOS, TOS
+    jz      .locals_miss
+    ; Matched -- drop the true flag and resume the token loop.
+    mov     TOS, [DSP]
+    add     DSP, cell
+    jmp     .tokens
+.locals_miss:
+    ; Not a local. Drop the false flag, leaving (c-addr u).
+    mov     TOS, [DSP]
+    add     DSP, cell
+.skip_locals_check:
+
     call    find_name                        ; ( c-addr u -- nt -1 | c-addr u 0 )
     test    TOS, TOS
     jnz     .found_word

@@ -87,6 +87,11 @@
 @assign user_LP0         = 0x15B0    ; initial locals-stack pointer (high end of LP region)
 @assign user_LP_LIMIT    = 0x15B8    ; low limit of locals stack (overflow check)
 @assign user_LOCALS_COUNT= 0x15C0    ; #locals declared in the current colon def (0 outside)
+@assign user_LOCALS_TABLE= 0x15C8    ; 16 slots * 32 bytes; per-slot layout:
+                                      ;   [+0]    : name length (u8, max 15)
+                                      ;   [+1..15]: name bytes
+                                      ;   [+16..23]: byte offset within frame (u64)
+                                      ;   [+24..31]: padding
 
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier

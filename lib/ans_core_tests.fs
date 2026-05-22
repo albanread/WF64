@@ -428,6 +428,19 @@ T{  5 maybe-exit  -> 10 }T
 \ After all the locals tests, LP must still be balanced.
 T{  lp@ lp0@ =  -> -1 }T
 
+\ Locals are compile-time-only -- they do NOT become dictionary entries.
+\ Use names unlikely to clash with any other test or core.f word.
+T{  : zz1  {: locals-priv-abc locals-priv-xyz :}
+       locals-priv-abc locals-priv-xyz + ;
+    3 4 zz1                              -> 7 }T
+T{  [defined] locals-priv-abc            ->  0 }T
+T{  [defined] locals-priv-xyz            ->  0 }T
+
+\ Same name re-used in another word -- no shadow conflict because the
+\ first word's "local" was never in the dictionary to begin with.
+T{  : zz2  {: locals-priv-abc :}  locals-priv-abc 10 * ;
+    7 zz2                                -> 70 }T
+
 \ ── Memory-Allocation: ALLOCATE / FREE / RESIZE ──────────────────────────
 
 s" Memory-Allocation" testing

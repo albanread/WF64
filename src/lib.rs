@@ -365,6 +365,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("(local!)",       "local_store_word",        0),
     ("locals#",        "locals_count_word",       0),
     ("locals#!",       "locals_count_store_word", 0),
+    ("check-local-emit","check_local_emit_word", 0),
     // Parse & dict
     ("evaluate",   "evaluate_word", 0),
     ("parse-name", "parse_name", 0),
@@ -1262,6 +1263,7 @@ impl Wf64Session {
         self.write_user_u64(USER_HANDLER_VAR,  0);
         self.write_user_u64(USER_THROW_CODE,   0);
         self.write_user_u64(USER_TRACE,        0);
+        self.write_user_u64(USER_LOCALS_COUNT, 0);
         self.write_user_u64(USER_FP0,          self.user_base + USER_FP_STACK + 0x100);
         self.write_user_u64(USER_FSP,          self.user_base + USER_FP_STACK + 0x100);
         self.write_user_u64(USER_INDEX_HERE,   self.boot_index_here);

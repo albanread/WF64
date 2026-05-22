@@ -1503,8 +1503,10 @@ proc(colon)
     call    create
     mov     r8, [UP + user_LATEST]
     mov     byte ptr [r8 + dh_tfa], tfa_tcol
-    ; Enter compile mode.
+    ; Enter compile mode. Clear any stale locals state in case a prior
+    ; compile aborted mid-definition.
     mov     qword ptr [UP + user_STATE], 1
+    mov     qword ptr [UP + user_LOCALS_COUNT], 0
     next()
 endp()
 

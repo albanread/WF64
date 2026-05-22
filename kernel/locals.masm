@@ -107,3 +107,84 @@ proc(locals_count_store_word)
     stk(1, 0)
     next()
 endp()
+
+; check-local-emit  ( c-addr u -- true | c-addr u false )
+;     Scans the user_LOCALS_TABLE for a name matching (c-addr,u).
+;     On match: emits a 15-byte inline fetch sequence at HERE and
+;     returns true (consuming c-addr u).
+;       48 89 45 F8        mov [rbp-8], rax    ; spill TOS to NOS
+;       49 8B 87 <disp32>  mov rax, [r15+d32]  ; load local
+;       48 83 ED 08        sub rbp, 8          ; pop into TOS
+;     On no match: returns false leaving c-addr u intact.
+;     Used by interpret_source between parse_name and find_name when
+;     state==compile and user_LOCALS_COUNT > 0.
+;
+;     R13 is preserved (interp_source's tie-breaker lives there across
+;     primitive calls).
+proc(check_local_emit_word)
+    mov     rcx, TOS                            ; u = name length
+    mov     rsi, [DSP]                           ; c-addr
+
+    mov     r10, [UP + user_LOCALS_COUNT]
+    test    r10, r10
+    jz      .not_found
+
+    lea     r11, [UP + user_LOCALS_TABLE]
+    xor     r9, r9                                ; slot index
+.slot_loop:
+    mov     rax, r9
+    shl     rax, 5                                ; *32
+    add     rax, r11                              ; slot ptr
+
+    movzx   rdx, byte ptr [rax]                  ; slot's name length
+    cmp     rdx, rcx
+    jne     .next_slot
+
+    ; Lengths match -- compare bytes.
+    xor     r8, r8
+.cmp_loop:
+    cmp     r8, rcx
+    je      .matched
+    mov     dl, byte ptr [rsi + r8]
+    cmp     dl, byte ptr [rax + 1 + r8]
+    jne     .next_slot
+    inc     r8
+    jmp     .cmp_loop
+
+.matched:
+    ; Read the byte-offset and emit the inline fetch at HERE.
+    mov     rdx, [rax + 16]
+    mov     rdi, [UP + user_HERE]
+
+    mov     byte ptr [rdi + 0], 0x48
+    mov     byte ptr [rdi + 1], 0x89
+    mov     byte ptr [rdi + 2], 0x45
+    mov     byte ptr [rdi + 3], 0xF8
+    mov     byte ptr [rdi + 4], 0x49
+    mov     byte ptr [rdi + 5], 0x8B
+    mov     byte ptr [rdi + 6], 0x87
+    mov     dword ptr [rdi + 7], edx
+    mov     byte ptr [rdi + 11], 0x48
+    mov     byte ptr [rdi + 12], 0x83
+    mov     byte ptr [rdi + 13], 0xED
+    mov     byte ptr [rdi + 14], 0x08
+    add     rdi, 15
+    mov     [UP + user_HERE], rdi
+
+    ; ( c-addr u -- -1 )
+    mov     TOS, -1
+    stk(2, 1)
+    next()
+
+.next_slot:
+    inc     r9
+    cmp     r9, r10
+    jb      .slot_loop
+
+.not_found:
+    ; ( c-addr u -- c-addr u 0 ); spill u to a new slot, set TOS = 0.
+    mov     [DSP - cell], TOS
+    xor     TOS, TOS
+    stk(2, 3)
+    next()
+endp()
