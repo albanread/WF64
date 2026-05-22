@@ -20,6 +20,8 @@
 ;   -2058  generic GC error (HEAPPTR region overflow, etc.)
 ;   -2059  GC out of memory (allocation failed)
 ;   -2060  type mismatch  (vec-f@ on a non-FloatVec, etc.)
+;   -2061  nil dereference (vec-f@/vec-f!/vec-len on a HEAPPTR slot
+;          that still holds nil — never bound to a heap object)
 ; ─────────────────────────────────────────────────────────────────────
 
 ; HEAPPTR  ( "name" -- )
@@ -194,6 +196,8 @@ proc(vec_f_fetch)
     ; TOS = index, [DSP] = handle.
     mov     r9, [DSP]                               ; r9 = handle (slot addr)
     mov     r9, [r9]                                ; r9 = tagged pointer
+    test    r9, r9
+    jz      .nil_deref
     ; Check tag is FloatVec (= 2).
     mov     r10, r9
     and     r10, 7
@@ -225,6 +229,15 @@ proc(vec_f_fetch)
     stk(0, 1)
     call    throw_word
     next()
+
+.nil_deref:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
 endp()
 
 
@@ -234,6 +247,8 @@ endp()
 proc(vec_f_store)
     mov     r9, [DSP]                               ; handle
     mov     r9, [r9]                                ; tagged pointer
+    test    r9, r9
+    jz      .nil_deref
     mov     r10, r9
     and     r10, 7
     cmp     r10, 2
@@ -262,6 +277,15 @@ proc(vec_f_store)
     stk(0, 1)
     call    throw_word
     next()
+
+.nil_deref:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
 endp()
 
 
@@ -272,6 +296,8 @@ endp()
 proc(vec_len)
     mov     r9, TOS                                 ; handle
     mov     r9, [r9]                                ; tagged pointer
+    test    r9, r9
+    jz      .nil_deref
     and     r9, -8                                  ; strip tag
 
     mov     r10, [r9]                               ; header word
@@ -280,5 +306,11 @@ proc(vec_len)
     and     r10, r11                                ; mask 24-bit length
 
     mov     TOS, r10
+    next()
+
+.nil_deref:
+    ; Replace TOS (handle) with throw code -2061.
+    mov     TOS, -2061
+    call    throw_word
     next()
 endp()

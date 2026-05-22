@@ -2563,18 +2563,12 @@ fn gc_unrooted_object_gets_reclaimed() {
     assert!(out.contains("0.000000"), "got {out:?}");
 }
 
-#[test]
-fn gc_vec_f_fetch_wrong_type_throws() {
-    let mut s = sess_with_core();
-    // Default a HEAPPTR holds 0 (nil).  vec-f@ on it should throw
-    // -2060 (wrong type) because nil's tag is 0, not 2 (FloatVec).
-    let err = s.eval(
-        "HEAPPTR empty\nempty 0 vec-f@ f.\nbye\n"
-    ).unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(msg.contains("-2060") || msg.contains("THROW"),
-        "expected -2060 throw on nil access, got: {msg}");
-}
+// `gc_vec_f_fetch_wrong_type_throws` was the V1b umbrella test that
+// covered both nil-deref and wrong-type cases under -2060.  V1c
+// splits those: nil now throws -2061 (see
+// `gc_vec_f_fetch_on_nil_throws_dedicated_code`), and the wrong-type
+// path still throws -2060 (see
+// `gc_vec_f_fetch_wrong_type_still_throws_minus_2060`).
 
 #[test]
 fn gc_heapptr_no_name_throws() {
@@ -2599,6 +2593,133 @@ fn gc_minor_collection_keeps_rooted_object() {
          bye\n"
     ).unwrap();
     assert!(out.contains("42.000000"), "got {out:?}");
+}
+
+#[test]
+fn gc_forget_last_reuses_heapptr_slot() {
+    // V1c: after `forget_last` on a HEAPPTR-defined word, HEAPPTR_NEXT
+    // rolls back past its slot.  A subsequently declared HEAPPTR
+    // re-uses the same slot address.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR a\n\
+         a .\n\
+         forget_last\n\
+         HEAPPTR b\n\
+         b .\n\
+         bye\n"
+    ).unwrap();
+    let parsed: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(parsed.len(), 2,
+        "expected 2 slot addresses, got {parsed:?} from {out:?}");
+    assert_eq!(parsed[0], parsed[1],
+        "slot addr should be reused after forget; got {out:?}");
+}
+
+#[test]
+fn gc_forget_last_zeroes_abandoned_slot() {
+    // After allocating into HEAPPTR a, forget_last should zero the
+    // abandoned slot.  Verified by stashing the slot's raw address in
+    // a VARIABLE *before* defining the HEAPPTR (so VARIABLE survives
+    // the forget), then dereferencing it again after the forget.  Pre-
+    // forget the slot holds a tagged FloatVec pointer (non-zero, low
+    // bits = 010); post-forget it must be 0.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "VARIABLE saved\n\
+         HEAPPTR a\n\
+         a saved !\n\
+         10 a vec-alloc-floats!\n\
+         saved @ @ .\n\
+         forget_last\n\
+         saved @ @ .\n\
+         bye\n"
+    ).unwrap();
+    let parsed: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(parsed.len(), 2,
+        "expected 2 cell values, got {parsed:?} from {out:?}");
+    assert_ne!(parsed[0], 0,
+        "pre-forget slot should hold a tagged ptr; got {out:?}");
+    assert_eq!(parsed[0] & 7, 2,
+        "pre-forget slot should be a FloatVec (tag 010); got {out:?}");
+    assert_eq!(parsed[1], 0,
+        "post-forget slot should be zeroed; got {out:?}");
+}
+
+#[test]
+fn gc_forget_last_on_non_heapptr_leaves_region_alone() {
+    // A regular colon definition forget should NOT touch HEAPPTR_NEXT.
+    // Define HEAPPTR a, then : foo ;, then forget_last (removes foo).
+    // After: HEAPPTR b should land in slot 1, not slot 0.  So `a` and
+    // `b` print different addresses.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR a\n\
+         : foo 42 ;\n\
+         forget_last\n\
+         HEAPPTR b\n\
+         a .\n\
+         b .\n\
+         bye\n"
+    ).unwrap();
+    let parsed: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(parsed.len(), 2, "got {parsed:?} from {out:?}");
+    assert_eq!(parsed[1] - parsed[0], 8,
+        "b should be one cell past a; got a={} b={}", parsed[0], parsed[1]);
+}
+
+#[test]
+fn gc_vec_f_fetch_on_nil_throws_dedicated_code() {
+    // V1c: nil-deref produces -2061, distinct from -2060 (wrong type).
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR empty\nempty 0 vec-f@ f.\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2061"),
+        "expected -2061 (nil-deref) on vec-f@ over nil slot, got: {msg}");
+}
+
+#[test]
+fn gc_vec_f_store_on_nil_throws_dedicated_code() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR empty\n42.0e empty 0 vec-f!\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2061"),
+        "expected -2061 (nil-deref) on vec-f! over nil slot, got: {msg}");
+}
+
+#[test]
+fn gc_vec_len_on_nil_throws_dedicated_code() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR empty\nempty vec-len .\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2061"),
+        "expected -2061 (nil-deref) on vec-len over nil slot, got: {msg}");
+}
+
+#[test]
+fn gc_vec_f_fetch_wrong_type_still_throws_minus_2060() {
+    // Make sure -2060 still fires when the slot holds something with
+    // a non-zero, non-FloatVec tag (e.g., a RefVec).  Distinct from
+    // the nil case above.
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR refs\n4 refs vec-alloc-refs!\nrefs 0 vec-f@ f.\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2060"),
+        "expected -2060 (wrong type) on vec-f@ over RefVec, got: {msg}");
 }
 
 #[test]

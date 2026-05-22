@@ -414,6 +414,35 @@ proc(forget_last_word)
     cmp     rdi, r8
     jbe     .done
 
+    ; ── V1c: HEAPPTR rewind ────────────────────────────────────────
+    ; If the word about to be forgotten was defined by HEAPPTR, we
+    ; need to zero its slot and roll HEAPPTR_NEXT back by one cell —
+    ; otherwise the slot stays in the GC root region holding a stale
+    ; tagged pointer, leaking whatever vector it bound.
+    ;
+    ; Detection: tfa == tfa_tcre AND the stub's imm64 (at xt+6) is
+    ; in [user_HEAPPTR_BASE_abs, user_HEAPPTR_NEXT).  CREATE-flavoured
+    ; words with bodies outside that range are ordinary CREATE words
+    ; and we leave them alone.  Uses r12 and r13 which are callee-
+    ; saved (preserved by forth_main's prologue) and not touched by
+    ; the rest of this proc.
+    cmp     byte ptr [rdi + dh_tfa], tfa_tcre
+    jne     .not_heapptr
+    mov     r12, [rdi + dh_xtptr]                   ; xt
+    mov     r12, [r12 + 6]                          ; imm64 from stub = slot addr
+    lea     r13, [UP + user_HEAPPTR_BASE]
+    cmp     r12, r13
+    jb      .not_heapptr
+    mov     r13, [UP + user_HEAPPTR_NEXT]
+    cmp     r12, r13
+    jae     .not_heapptr
+    ; This is a HEAPPTR word.  Zero its slot, decrement NEXT by cell.
+    ; LIFO invariant: the slot we're about to drop is exactly
+    ; (NEXT - cell); we don't have to find it, just trust that.
+    mov     qword ptr [r12], 0
+    sub     qword ptr [UP + user_HEAPPTR_NEXT], cell
+
+.not_heapptr:
     mov     r8, [UP + user_INDEX_LATEST]
     test    r8, r8
     jz      .remove_header_only
