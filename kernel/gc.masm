@@ -143,10 +143,27 @@ endp()
 ;     Allocate an n-cell FloatVec and store the tagged pointer in the
 ;     HEAPPTR slot at [handle].  Atomic: the raw GC pointer never
 ;     appears on the data stack.
+;
+;     V2: before allocating, ask paged_gc whether its allocation
+;     budget has been exhausted (`rt_gc_should_collect`).  If so,
+;     run a minor GC first.  This is the "auto-GC" promise from
+;     docs/gc_design.md V2: callers no longer have to remember to
+;     call `(gc)` periodically; the cost shows up in `gc-cycle`
+;     instead.
 proc(vec_alloc_floats_store)
     ; Stack: handle in TOS, n at [DSP].
+    ; Stash handle in r14 (callee-saved across Win64 callouts) so it
+    ; survives across rt_gc_should_collect / rt_gc_collect_minor;
+    ; n stays in memory at [DSP] (also stable).
+    mov     r14, TOS
+    win64_call(rt_gc_should_collect)
+    test    rax, rax
+    jz      .alloc
+    mov     rcx, UP
+    win64_call(rt_gc_collect_minor)
+.alloc:
     mov     rcx, [DSP]                              ; arg1: n
-    mov     rdx, TOS                                ; arg2: handle (slot addr)
+    mov     rdx, r14                                ; arg2: handle (slot addr)
     win64_call(rt_vec_alloc_floats)
     test    rax, rax
     jnz     .err
@@ -168,9 +185,17 @@ endp()
 ; vec-alloc-refs!  ( n handle -- )
 ;     Allocate an n-cell RefVec (all slots initialised to nil) and
 ;     store the tagged pointer in the HEAPPTR slot at [handle].
+;     V2 auto-GC trigger, same shape as vec-alloc-floats!.
 proc(vec_alloc_refs_store)
+    mov     r14, TOS
+    win64_call(rt_gc_should_collect)
+    test    rax, rax
+    jz      .alloc
+    mov     rcx, UP
+    win64_call(rt_gc_collect_minor)
+.alloc:
     mov     rcx, [DSP]
-    mov     rdx, TOS
+    mov     rdx, r14
     win64_call(rt_vec_alloc_refs)
     test    rax, rax
     jnz     .err
@@ -184,6 +209,25 @@ proc(vec_alloc_refs_store)
     mov     TOS, -2059
     stk(0, 1)
     call    throw_word
+    next()
+endp()
+
+
+; gc-cycle  ( -- n )
+;     Push the current GC cycle counter (monotonic, incremented on
+;     each major or minor collection).  See V2 in docs/gc_design.md:
+;     once auto-GC is in play, any raw heap pointer a long-running
+;     word holds may silently become stale across an allocation that
+;     used to be safe pre-V2.  Snapshot this counter, compare after
+;     each allocation, refresh from @heapptr if it changed.
+proc(gc_cycle_word)
+    ; Save caller's TOS into the next-down memory slot BEFORE the
+    ; Win64 call (rt_gc_cycle_count returns its result in rax, which
+    ; IS TOS — so we have to spill first).
+    mov     [DSP - cell], TOS
+    win64_call(rt_gc_cycle_count)
+    mov     TOS, rax
+    stk(0, 1)
     next()
 endp()
 

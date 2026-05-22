@@ -584,6 +584,26 @@ pub extern "C" fn rt_gc_collect_minor(up: u64) -> u64 {
     0
 }
 
+/// True (returns 1) when paged_gc's allocation budget has been
+/// exhausted and the next allocation should be preceded by a
+/// minor GC.  The kernel's `vec-alloc-*!` words call this to
+/// decide whether to insert an auto-trigger.
+///
+/// Returns 0 when no collection is needed.  Never errors.
+#[no_mangle]
+pub extern "C" fn rt_gc_should_collect() -> u64 {
+    if gc::should_collect() { 1 } else { 0 }
+}
+
+/// Current value of the GC cycle counter — monotonically incremented
+/// by one on every successful collection (major or minor).  Exposed
+/// as the Forth word `gc-cycle ( -- n )`.  Reset to 0 by session
+/// reset between harness tests.
+#[no_mangle]
+pub extern "C" fn rt_gc_cycle_count() -> u64 {
+    gc::gc_cycle_count()
+}
+
 // ── LET DSL compilation ──────────────────────────────────────────────
 //
 // `rt_let_compile(up)` is called by the kernel's immediate `LET` word.

@@ -2709,6 +2709,122 @@ fn gc_vec_len_on_nil_throws_dedicated_code() {
 }
 
 #[test]
+fn gc_cycle_starts_at_zero() {
+    let mut s = sess_with_core();
+    let out = s.eval("gc-cycle .\nbye\n").unwrap();
+    assert!(out.contains("0  ok"),
+        "gc-cycle should start at 0; got {out:?}");
+}
+
+#[test]
+fn gc_cycle_increments_on_explicit_major_collection() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "gc-cycle .\n\
+         (gc)\n\
+         gc-cycle .\n\
+         (gc)\n\
+         gc-cycle .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![0, 1, 2],
+        "gc-cycle should monotonically increase on (gc); got {nums:?} from {out:?}");
+}
+
+#[test]
+fn gc_cycle_increments_on_minor_collection() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "gc-minor\n\
+         gc-cycle .\n\
+         gc-minor\n\
+         gc-cycle .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![1, 2],
+        "gc-cycle should bump on gc-minor too; got {nums:?} from {out:?}");
+}
+
+#[test]
+fn gc_auto_collects_when_budget_exhausted() {
+    // V2: vec-alloc-* checks should_collect() and runs a minor GC
+    // first if the budget is exhausted.  paged_gc's default trigger
+    // is 8 MB; each 200_000-cell FloatVec is ~1.6 MB (200k * 8B +
+    // header).  Allocating 8 of them (with the previous one
+    // dropped each cycle) should force at least one auto-trigger.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR slot\n\
+         gc-cycle .                \\ should be 0\n\
+         200000 slot vec-alloc-floats!\n\
+         200000 slot vec-alloc-floats!\n\
+         200000 slot vec-alloc-floats!\n\
+         200000 slot vec-alloc-floats!\n\
+         200000 slot vec-alloc-floats!\n\
+         200000 slot vec-alloc-floats!\n\
+         200000 slot vec-alloc-floats!\n\
+         200000 slot vec-alloc-floats!\n\
+         gc-cycle .                \\ should be > 0\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums.len(), 2, "got {nums:?} from {out:?}");
+    assert_eq!(nums[0], 0, "gc-cycle should start at 0; got {out:?}");
+    assert!(nums[1] >= 1,
+        "gc-cycle should bump from auto-GC; got pre={} post={} ({out:?})",
+        nums[0], nums[1]);
+}
+
+#[test]
+fn gc_auto_collects_does_not_lose_rooted_data() {
+    // After auto-GC the still-rooted vector should be intact.
+    // Allocate, write known cells, force enough allocation to
+    // trigger auto-GC at least once, then read the cells back.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR keep\n\
+         HEAPPTR scratch\n\
+         4 keep vec-alloc-floats!\n\
+         1.5e keep 0 vec-f!\n\
+         2.5e keep 1 vec-f!\n\
+         3.5e keep 2 vec-f!\n\
+         4.5e keep 3 vec-f!\n\
+         200000 scratch vec-alloc-floats!\n\
+         200000 scratch vec-alloc-floats!\n\
+         200000 scratch vec-alloc-floats!\n\
+         200000 scratch vec-alloc-floats!\n\
+         200000 scratch vec-alloc-floats!\n\
+         200000 scratch vec-alloc-floats!\n\
+         200000 scratch vec-alloc-floats!\n\
+         200000 scratch vec-alloc-floats!\n\
+         gc-cycle .\n\
+         keep 0 vec-f@ f.\n\
+         keep 1 vec-f@ f.\n\
+         keep 2 vec-f@ f.\n\
+         keep 3 vec-f@ f.\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("1.500000"), "cell 0 lost: {out:?}");
+    assert!(out.contains("2.500000"), "cell 1 lost: {out:?}");
+    assert!(out.contains("3.500000"), "cell 2 lost: {out:?}");
+    assert!(out.contains("4.500000"), "cell 3 lost: {out:?}");
+    // Should have triggered at least one auto-collection.
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert!(nums.iter().any(|&n| n >= 1),
+        "expected at least one auto-GC cycle; got {nums:?} from {out:?}");
+}
+
+#[test]
 fn gc_vec_f_fetch_wrong_type_still_throws_minus_2060() {
     // Make sure -2060 still fires when the slot holds something with
     // a non-zero, non-FloatVec tag (e.g., a RefVec).  Distinct from

@@ -104,6 +104,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("HEAPPTR",            "heapptr_word",             0),
     ("(gc)",               "gc_collect_word",          0),
     ("gc-minor",           "gc_collect_minor_word",    0),
+    ("gc-cycle",           "gc_cycle_word",            0),
     ("vec-alloc-floats!",  "vec_alloc_floats_store",   0),
     ("vec-alloc-refs!",    "vec_alloc_refs_store",     0),
     ("vec-f@",             "vec_f_fetch",              0),
@@ -942,6 +943,8 @@ impl Wf64Session {
                 "rt_vec_alloc_refs"   => Some(runtime::rt_vec_alloc_refs   as *mut c_void),
                 "rt_gc_collect"       => Some(runtime::rt_gc_collect       as *mut c_void),
                 "rt_gc_collect_minor" => Some(runtime::rt_gc_collect_minor as *mut c_void),
+                "rt_gc_should_collect" => Some(runtime::rt_gc_should_collect as *mut c_void),
+                "rt_gc_cycle_count"   => Some(runtime::rt_gc_cycle_count   as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;

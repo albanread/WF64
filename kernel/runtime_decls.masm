@@ -26,3 +26,5 @@
 @extern rt_vec_alloc_refs(2)    ; (n_cells, slot_addr) -> err — alloc + store
 @extern rt_gc_collect(1)        ; (UP) -> err — major collection
 @extern rt_gc_collect_minor(1)  ; (UP) -> err — minor collection
+@extern rt_gc_should_collect(0) ; () -> 1 if heap wants a collection, else 0
+@extern rt_gc_cycle_count(0)    ; () -> monotonically-increasing collection counter

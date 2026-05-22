@@ -44,6 +44,16 @@ thread_local! {
     /// The live GC heap.  Initialised on first use; cleared on
     /// session reset.
     static WF_HEAP: RefCell<Option<PageHeap<Wf64Layout>>> = const { RefCell::new(None) };
+
+    /// Monotonically-increasing counter, incremented by one on every
+    /// `collect_major` / `collect_minor` call.  Exposed to Forth via
+    /// the `gc-cycle` primitive (see V2 in docs/gc_design.md): a
+    /// long-running word that holds a raw heap pointer can snapshot
+    /// the counter before each potentially-allocating call and
+    /// refresh from `@heapptr` whenever it changes.  Reset to 0 by
+    /// `reset_wf_heap` so each harness test starts from a known
+    /// baseline.
+    static WF_GC_CYCLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Reset the GC heap, dropping all allocations.  Called by session
@@ -54,6 +64,25 @@ pub fn reset_wf_heap() {
     WF_HEAP.with(|cell| {
         *cell.borrow_mut() = None;
     });
+    WF_GC_CYCLES.with(|c| c.set(0));
+}
+
+/// Current value of the GC cycle counter.  Each successful
+/// `collect_major` / `collect_minor` increments it by one.
+pub fn gc_cycle_count() -> u64 {
+    WF_GC_CYCLES.with(|c| c.get())
+}
+
+/// True when paged_gc's auto-GC heuristic thinks a collection
+/// should run before the next allocation.  Returns `false` if the
+/// heap hasn't been touched yet (no point collecting an empty
+/// heap).
+pub fn should_collect() -> bool {
+    WF_HEAP.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(false, |h| h.should_collect())
+    })
 }
 
 /// Ensure the heap is initialised, then run `f` with a mutable
@@ -139,6 +168,7 @@ pub unsafe fn collect_major(region_base: u64, region_next: u64) {
             }
         });
     });
+    WF_GC_CYCLES.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// Run a minor GC over the same root set.
@@ -157,6 +187,7 @@ pub unsafe fn collect_minor(region_base: u64, region_next: u64) {
             }
         });
     });
+    WF_GC_CYCLES.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 #[cfg(test)]

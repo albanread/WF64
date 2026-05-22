@@ -18,6 +18,7 @@ pub use heap::{
     reset_wf_heap, with_wf_heap,
     alloc_floatvec, alloc_refvec, alloc_string,
     collect_major, collect_minor,
+    gc_cycle_count, should_collect,
 };
 
 pub use layout::{
