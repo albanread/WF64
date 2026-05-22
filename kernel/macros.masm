@@ -92,6 +92,8 @@
                                       ;   [+1..15]: name bytes
                                       ;   [+16..23]: byte offset within frame (u64)
                                       ;   [+24..31]: padding
+@assign user_TOOLS_WID   = 0x17C8    ; wid of the TOOLS wordlist (set at boot)
+@assign user_PRIVATE_WID = 0x17D0    ; wid of the PRIVATE wordlist (set at boot)
 
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier

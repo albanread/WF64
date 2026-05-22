@@ -2371,12 +2371,57 @@ fn find_name_miss_leaves_c_addr_u_zero() {
 
 #[test]
 fn get_order_word_reports_default_forth_order() {
+    // Default search order after reset is (PRIVATE TOOLS FORTH) with
+    // PRIVATE innermost. get-order returns wid_n ... wid_1 n with the
+    // count on top, then wids from innermost to outermost going down.
     let mut s = sess();
     s.call("forth_wordlist_word").unwrap();
-    let root_wid = s.stack()[0];
+    let forth_wid = s.stack()[0];
     s.reset();
+    let private_wid = unsafe { ((s.user_base + 0x17D0) as *const u64).read_unaligned() } as i64;
+    let tools_wid   = unsafe { ((s.user_base + 0x17C8) as *const u64).read_unaligned() } as i64;
     s.call("get_order_word").unwrap();
-    assert_eq!(s.stack(), vec![1, root_wid]);
+    // stack() is top-first: [count, innermost, ..., outermost]
+    assert_eq!(s.stack(), vec![3, private_wid, tools_wid, forth_wid]);
+}
+
+#[test]
+fn bootstrap_splits_primitives_into_three_wordlists() {
+    // After boot, `.s` should be findable in TOOLS but not in FORTH;
+    // `(create)` should be findable in PRIVATE but not in FORTH or
+    // TOOLS; and ordinary words like `dup` should be in FORTH only.
+    let mut s = sess();
+    let forth_wid   = unsafe { ((s.user_base + 0x1508) as *const u64).read_unaligned() } as i64;
+    let tools_wid   = unsafe { ((s.user_base + 0x17C8) as *const u64).read_unaligned() } as i64;
+    let private_wid = unsafe { ((s.user_base + 0x17D0) as *const u64).read_unaligned() } as i64;
+
+    // Define a probe helper inside Forth: collapses search-wordlist's
+    // two-shape return ( 0 | xt ±1 ) into a single flag.
+    s.eval(": probe-sw  ( c-addr u wid -- flag )  search-wordlist dup if nip then ;\nbye\n")
+        .unwrap();
+    fn probe(s: &mut Wf64Session, name: &str, wid: i64) -> i64 {
+        let code = format!(
+            "s\" {name}\" {wid} probe-sw .\nbye\n",
+            name = name, wid = wid
+        );
+        let out = s.eval(&code).unwrap();
+        out.split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    // `dup` is in FORTH only.
+    assert_ne!(probe(&mut s, "dup", forth_wid),  0);
+    assert_eq!(probe(&mut s, "dup", tools_wid),  0);
+    assert_eq!(probe(&mut s, "dup", private_wid), 0);
+
+    // `.s` is in TOOLS only.
+    assert_eq!(probe(&mut s, ".s", forth_wid),   0);
+    assert_ne!(probe(&mut s, ".s", tools_wid),   0);
+    assert_eq!(probe(&mut s, ".s", private_wid), 0);
+
+    // `(create)` is in PRIVATE only.
+    assert_eq!(probe(&mut s, "(create)", forth_wid),   0);
+    assert_eq!(probe(&mut s, "(create)", tools_wid),   0);
+    assert_ne!(probe(&mut s, "(create)", private_wid), 0);
 }
 
 #[test]
@@ -2540,22 +2585,23 @@ fn search_wordlist_returns_xt_and_immediacy_flag() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
     s.load_source_file(&path).unwrap();
 
+    // `.s` lives in the TOOLS wordlist now, so the original variant
+    // that searched FORTH for it no longer applies. The four other
+    // names cover the same code path.
     let out = s.eval(
         "forth-wordlist constant root\n\
          : dup-name s\" dup\" ;\n\
          : semi-name s\" ;\" ;\n\
          : exit-name s\" exit\" ;\n\
          : keyq-name s\" key?\" ;\n\
-         : dots-name s\" .s\" ;\n\
          dup-name root search-wordlist swap drop . cr\n\
          semi-name root search-wordlist nip . cr\n\
          exit-name root search-wordlist nip . cr\n\
          keyq-name root search-wordlist nip . cr\n\
-         dots-name root search-wordlist nip . cr\n\
          bye\n"
     ).unwrap();
 
-    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n ok\n-1 \n ok\n1 \n ok\n1 \n ok\n-1 \n ok\n-1 \n ok\n");
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n-1 \n ok\n1 \n ok\n1 \n ok\n-1 \n ok\n");
 }
 
 #[test]

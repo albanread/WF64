@@ -524,6 +524,45 @@ const USER_TRACE:        u64 = 0x15A8;  // trace flag; mirrors user_TRACE in mac
 const USER_LP0:          u64 = 0x15B0;  // initial LP (top of locals region)
 const USER_LP_LIMIT:     u64 = 0x15B8;  // low limit of locals stack
 const USER_LOCALS_COUNT: u64 = 0x15C0;  // #locals in current colon def (0 outside)
+const USER_LOCALS_TABLE: u64 = 0x15C8;  // 16 * 32-byte locals table
+const USER_TOOLS_WID:    u64 = 0x17C8;  // wid of TOOLS wordlist
+const USER_PRIVATE_WID:  u64 = 0x17D0;  // wid of PRIVATE wordlist
+
+/// Words that should be published to the TOOLS wordlist at bootstrap.
+/// Debug / inspection primitives the average user doesn't want in their
+/// face. Source-defined Tools-ext words (WORDS, FORGET, MARKER, etc.)
+/// are placed by core.f via `also tools definitions`.
+pub const TOOLS_WORDS: &[&str] = &[
+    ".s",
+    "BRK", "INT3",
+    "trace", "notrace",
+    "rdtsc", "cpuid",
+];
+
+/// Words that should be published to the PRIVATE wordlist at bootstrap.
+/// Compiler internals, locals scaffolding, control-flow helpers --
+/// things only the kernel and core.f reach for, never user code.
+pub const PRIVATE_WORDS: &[&str] = &[
+    // Dictionary builders
+    "(create)", "(set-xt)", "(set-comp)", "(set-flags)",
+    // Compile-action helpers
+    "(comp-cons)", "(comp-2cons)", "(comp-fconst)", "(comp-val)", "(comp-only)",
+    // Locals stack
+    "(open-locals)", "(close-locals)", "(local@)", "(local!)",
+    "check-local-emit", "locals#", "locals#!",
+    "lp@", "lp0@", "lp-limit", "lp-smoke",
+    // Control-flow assembly internals
+    "mark>", ">resolve", "<resolve", "?pairs",
+    "_loop", "_+loop", "_-loop", "bra-?do",
+    "do-part1", "do-part2",
+    // Throw-code constants
+    "throw_namereqd", "throw_componly", "throw_abortq",
+    "throw_abort", "throw_mismatch",
+    // Forget machinery
+    "forget_last", "latestxt",
+    // Raw stack-pointer access
+    "sp@", "sp!", "rp@", "rp!",
+];
 
 // (Dictionary header layout deliberately not mirrored here — it lives
 // entirely in kernel/macros.masm and kernel/dict.masm. The bootstrap
@@ -993,9 +1032,33 @@ impl Wf64Session {
 
         let xt_publish_primitive = self.xt_of("publish_primitive")?;
 
+        // Create the TOOLS and PRIVATE wordlists by carving them out of
+        // the index arena (same layout that the kernel's `wordlist`
+        // primitive uses). Each is wl_size = 512 * 8 = 4096 bytes,
+        // zeroed.
+        const WL_SIZE: u64 = 512 * 8;
+        let tools_wid = self.allocate_wordlist(WL_SIZE);
+        let private_wid = self.allocate_wordlist(WL_SIZE);
+        self.write_user_u64(USER_TOOLS_WID,   tools_wid);
+        self.write_user_u64(USER_PRIVATE_WID, private_wid);
+
+        let forth_wid = self.user_u64(USER_FORTH_WID);
+        let tools_set:   std::collections::HashSet<&str> = TOOLS_WORDS.iter().copied().collect();
+        let private_set: std::collections::HashSet<&str> = PRIVATE_WORDS.iter().copied().collect();
+
         let pad = self.user_base + USER_PAD;
 
         for (forth_name, asm_sym, xt, flags) in entries {
+            // Pick the destination wordlist for this primitive.
+            let target_wid = if private_set.contains(forth_name) {
+                private_wid
+            } else if tools_set.contains(forth_name) {
+                tools_wid
+            } else {
+                forth_wid
+            };
+            self.write_user_u64(USER_CURRENT, target_wid);
+
             // Copy the name bytes into PAD.
             let name = forth_name.as_bytes();
             assert!(!name.is_empty() && name.len() <= 255,
@@ -1013,10 +1076,43 @@ impl Wf64Session {
             let header = self.latest();
             self.write_primitive_xt_backref(xt, header)?;
         }
+
+        // Restore CURRENT = FORTH for any subsequent definitions.
+        self.write_user_u64(USER_CURRENT, forth_wid);
+
+        // While core.f is being loaded, the search order needs all
+        // three wordlists visible so that core.f source can reference
+        // PRIVATE primitives like `(open-locals)` and the {: parser
+        // helpers. The caller (or core.f itself) is responsible for
+        // narrowing the search order back to just FORTH at the end of
+        // loading.
+        self.write_user_u64(USER_ORDER_COUNT, 3);
+        // Search order: index 0 = innermost = PRIVATE, then TOOLS, then FORTH.
+        let context = self.user_base + USER_CONTEXT;
+        unsafe {
+            (context as *mut u64).offset(0).write_unaligned(private_wid);
+            (context as *mut u64).offset(1).write_unaligned(tools_wid);
+            (context as *mut u64).offset(2).write_unaligned(forth_wid);
+        }
+
         // Stack should be empty after the bootstrap.
         debug_assert_eq!(self.depth(), 0,
             "bootstrap left {} cells on the stack", self.depth());
         Ok(())
+    }
+
+    /// Carve a fresh wordlist bucket area out of the downward-growing
+    /// index arena. Mirrors what the kernel's `wordlist` primitive
+    /// does, but is callable from Rust at bootstrap before any kernel
+    /// state is settled.
+    fn allocate_wordlist(&mut self, wl_size: u64) -> u64 {
+        let index_here = self.user_u64(USER_INDEX_HERE);
+        let new_wl = index_here - wl_size;
+        self.write_user_u64(USER_INDEX_HERE, new_wl);
+        unsafe {
+            std::ptr::write_bytes(new_wl as *mut u8, 0, wl_size as usize);
+        }
+        new_wl
     }
 
     fn primitive_comp_helper(&mut self, asm_sym: &str) -> Result<Option<u64>> {
@@ -1282,8 +1378,19 @@ impl Wf64Session {
             );
         }
         self.write_user_u64(USER_CURRENT,      forth_wid);
-        self.write_user_u64(USER_ORDER_COUNT,  1);
-        self.write_user_u64(USER_CONTEXT,      forth_wid);
+        // Default search order: PRIVATE TOOLS FORTH (innermost first).
+        // The three-wordlist organisation lets callers see the
+        // categorisation via get-order while everything stays findable
+        // by default. Narrowing (e.g. `only forth`) is opt-in.
+        let tools_wid   = self.user_u64(USER_TOOLS_WID);
+        let private_wid = self.user_u64(USER_PRIVATE_WID);
+        self.write_user_u64(USER_ORDER_COUNT,  3);
+        let context = self.user_base + USER_CONTEXT;
+        unsafe {
+            (context as *mut u64).offset(0).write_unaligned(private_wid);
+            (context as *mut u64).offset(1).write_unaligned(tools_wid);
+            (context as *mut u64).offset(2).write_unaligned(forth_wid);
+        }
         self.runtime_words.clear();
         self.debug_synced_here = self.boot_here;
         self.debug_synced_latest = self.boot_latest;
