@@ -37,6 +37,7 @@ use anyhow::{Context, Result};
 use wfasm::{Assembler, Jit};
 
 pub mod let_lang;
+pub mod gc;
 
 pub const KERNEL_ENTRY: &str = "kernel/main.masm";
 

@@ -8,6 +8,7 @@ description = "A 64-bit STC Forth, JIT-compiled via the JASM assembler"
 # Path dep on JASM while both projects co-evolve. Flip to a git or
 # crates.io dep once JASM stabilises.
 wfasm = { path = "../JASM/rust" }
+newgc-core = { path = "../NewGC/crates/newgc-core" }
 anyhow = "1"
 
 [lib]
