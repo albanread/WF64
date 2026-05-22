@@ -98,6 +98,23 @@
                                       ;   (0 if not preceded by a fresh CALL).  Used by
                                       ;   ; and EXIT for tail-call optimisation.
 
+; ── HEAPPTR region (V1b GC root storage) ─────────────────────────────
+; A bump-allocated array of slots, each holding either nil (0) or a
+; tagged GC pointer (Wf64Layout's 3-bit tag scheme).  Declared via
+; `HEAPPTR name` from Forth; the slot is the sole place a GC pointer
+; lives long-term.  See docs/gc_design.md.
+;
+;   user_HEAPPTR_NEXT  : bump pointer (absolute address of next free slot)
+;                        initialised at boot to (UP + user_HEAPPTR_BASE)
+;   user_HEAPPTR_BASE  : first slot of the region
+;   heapptr_region_size: 4 KB = 512 slots, default
+;
+; The GC root scan walks [UP + user_HEAPPTR_BASE, user_HEAPPTR_NEXT)
+; one cell at a time, calling evac.visit_cell on each.
+@assign user_HEAPPTR_NEXT  = 0x17E0  ; bump pointer (abs addr; 0 == empty)
+@assign user_HEAPPTR_BASE  = 0x2000  ; first slot of the region
+@assign heapptr_region_size = 0x1000 ; 4 KB = 512 slots
+
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier
 ; mini-header. LATEST still points at the header base, but find-name

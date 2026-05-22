@@ -557,6 +557,13 @@ const USER_LOCALS_TABLE: u64 = 0x15C8;  // 16 * 32-byte locals table
 const USER_TOOLS_WID:    u64 = 0x17C8;  // wid of TOOLS wordlist
 const USER_PRIVATE_WID:  u64 = 0x17D0;  // wid of PRIVATE wordlist
 
+// HEAPPTR region — bump-allocated array of GC root slots.  See
+// docs/gc_design.md and kernel/macros.masm.  `pub(crate)` so the
+// runtime module can read them when servicing rt_gc_collect.
+pub(crate) const USER_HEAPPTR_NEXT:  u64 = 0x17E0;  // bump pointer (abs addr)
+pub(crate) const USER_HEAPPTR_BASE:  u64 = 0x2000;  // first slot of the region
+pub(crate) const HEAPPTR_REGION_SIZE: u64 = 0x1000; // 4 KB = 512 slots
+
 /// Words that should be published to the TOOLS wordlist at bootstrap.
 /// Debug / inspection primitives the average user doesn't want in their
 /// face. Source-defined Tools-ext words (WORDS, FORGET, MARKER, etc.)
@@ -922,6 +929,10 @@ impl Wf64Session {
                 "rt_slurp_pop"   => Some(runtime::rt_slurp_pop    as *mut c_void),
                 "rt_let_compile" => Some(runtime::rt_let_compile as *mut c_void),
                 "rt_code_compile_body" => Some(runtime::rt_code_compile_body as *mut c_void),
+                "rt_vec_alloc_floats" => Some(runtime::rt_vec_alloc_floats as *mut c_void),
+                "rt_vec_alloc_refs"   => Some(runtime::rt_vec_alloc_refs   as *mut c_void),
+                "rt_gc_collect"       => Some(runtime::rt_gc_collect       as *mut c_void),
+                "rt_gc_collect_minor" => Some(runtime::rt_gc_collect_minor as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;
@@ -972,6 +983,11 @@ impl Wf64Session {
             write_u64(up, USER_LP0,          locals_top);
             write_u64(up, USER_LP_LIMIT,     locals_base_u64);
             write_u64(up, USER_LOCALS_COUNT, 0);
+            // HEAPPTR region: bump pointer starts at the base (= no
+            // slots in use).  The region itself is zero-filled
+            // already because the user area was VirtualAlloc'd
+            // (pages start zero) and nothing has written to it yet.
+            write_u64(up, USER_HEAPPTR_NEXT, user_base + USER_HEAPPTR_BASE);
         }
 
         // Register kernel procs with SEH for symbolic crash dumps.
@@ -1438,6 +1454,19 @@ impl Wf64Session {
         self.write_user_u64(USER_LOCALS_COUNT, 0);
         self.write_user_u64(USER_FP0,          self.user_base + USER_FP_STACK + 0x100);
         self.write_user_u64(USER_FSP,          self.user_base + USER_FP_STACK + 0x100);
+        // HEAPPTR region reset: clear all slots, rewind bump pointer
+        // to the region base, drop the GC heap so the next test gets
+        // a fresh one.
+        let heapptr_base = self.user_base + USER_HEAPPTR_BASE;
+        unsafe {
+            std::ptr::write_bytes(
+                heapptr_base as *mut u8,
+                0,
+                HEAPPTR_REGION_SIZE as usize,
+            );
+        }
+        self.write_user_u64(USER_HEAPPTR_NEXT, heapptr_base);
+        gc::reset_wf_heap();
         self.write_user_u64(USER_INDEX_HERE,   self.boot_index_here);
         self.write_user_u64(USER_INDEX_LATEST, self.boot_index_latest);
         let forth_wid = self.user_u64(USER_FORTH_WID);

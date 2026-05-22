@@ -12,6 +12,13 @@
 //! region-walk simulation that is the V1a → V1b checkpoint.
 
 pub mod layout;
+pub mod heap;
+
+pub use heap::{
+    reset_wf_heap, with_wf_heap,
+    alloc_floatvec, alloc_refvec, alloc_string,
+    collect_major, collect_minor,
+};
 
 pub use layout::{
     HeapType, Wf64Layout,

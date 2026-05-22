@@ -508,6 +508,82 @@ pub extern "C" fn rt_slurp_pop() -> u64 {
     })
 }
 
+// ── GC runtime functions ─────────────────────────────────────────────
+//
+// V1b plumbing.  These get called from the kernel's GC primitives
+// (`vec-alloc-floats!`, `(gc)`, …) via the same @extern mechanism
+// the rest of the kernel uses for I/O and number parsing.
+//
+// All addresses are absolute (the kernel computes them from UP +
+// offset where needed).  Return value: 0 on success, u64::MAX on
+// error.
+
+use crate::gc;
+
+/// Allocate a FloatVec of `n_cells` payload cells, store the tagged
+/// pointer at `*slot_addr`.  `slot_addr` is the absolute address of
+/// a HEAPPTR slot (caller's responsibility to ensure it's inside
+/// `user_HEAPPTR_REGION`).
+///
+/// Returns 0 on success, u64::MAX on allocation failure (heap full).
+#[no_mangle]
+pub extern "C" fn rt_vec_alloc_floats(n_cells: u64, slot_addr: u64) -> u64 {
+    if n_cells > u32::MAX as u64 {
+        eprintln!("vec-alloc-floats!: requested length {n_cells} exceeds u32::MAX");
+        return u64::MAX;
+    }
+    let Some(tagged) = gc::alloc_floatvec(n_cells as u32) else {
+        eprintln!("vec-alloc-floats!: out of GC heap (requested {n_cells} cells)");
+        return u64::MAX;
+    };
+    unsafe { *(slot_addr as *mut u64) = tagged; }
+    0
+}
+
+/// Allocate a RefVec of `n_cells` (all initialised to nil), store
+/// the tagged pointer at `*slot_addr`.
+#[no_mangle]
+pub extern "C" fn rt_vec_alloc_refs(n_cells: u64, slot_addr: u64) -> u64 {
+    if n_cells > u32::MAX as u64 {
+        eprintln!("vec-alloc-refs!: requested length {n_cells} exceeds u32::MAX");
+        return u64::MAX;
+    }
+    let Some(tagged) = gc::alloc_refvec(n_cells as u32) else {
+        eprintln!("vec-alloc-refs!: out of GC heap (requested {n_cells} cells)");
+        return u64::MAX;
+    };
+    unsafe { *(slot_addr as *mut u64) = tagged; }
+    0
+}
+
+/// Run a major GC.  Walks the HEAPPTR region [base, next) as the
+/// root set.  Caller passes `up` (the UP register value); we read
+/// the region's base and bump-pointer from the user area.
+#[no_mangle]
+pub extern "C" fn rt_gc_collect(up: u64) -> u64 {
+    let next = unsafe { *((up + crate::USER_HEAPPTR_NEXT) as *const u64) };
+    let base = up + crate::USER_HEAPPTR_BASE;
+    if next < base {
+        eprintln!("(gc): HEAPPTR_NEXT (0x{next:x}) is below BASE (0x{base:x}) — \
+                   probable user-area corruption");
+        return u64::MAX;
+    }
+    unsafe { gc::collect_major(base, next); }
+    0
+}
+
+/// Run a minor GC.  Same root set as `rt_gc_collect`.
+#[no_mangle]
+pub extern "C" fn rt_gc_collect_minor(up: u64) -> u64 {
+    let next = unsafe { *((up + crate::USER_HEAPPTR_NEXT) as *const u64) };
+    let base = up + crate::USER_HEAPPTR_BASE;
+    if next < base {
+        return u64::MAX;
+    }
+    unsafe { gc::collect_minor(base, next); }
+    0
+}
+
 // ── LET DSL compilation ──────────────────────────────────────────────
 //
 // `rt_let_compile(up)` is called by the kernel's immediate `LET` word.

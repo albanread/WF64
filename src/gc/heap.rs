@@ -1,0 +1,227 @@
+//! `WfHeap` — the live GC heap, wrapping `PageHeap<Wf64Layout>`.
+//!
+//! Sits in a thread-local because the Forth runtime functions
+//! (`rt_vec_alloc_floats`, `rt_gc_collect`, …) are called from
+//! JIT'd code via the `@extern` mechanism, which has no `&mut
+//! Session` to thread through.  Same pattern the rest of WF64 uses
+//! for compile-only state (LET_JITS, CODE_JITS, …).
+//!
+//! V1b status: lazily initialised on first allocation.  64 MB
+//! reservation by default — large enough to play with multi-MB
+//! vectors without thinking about it, small enough that test runs
+//! don't reserve embarrassing amounts of address space.
+
+use std::cell::RefCell;
+
+use newgc_core::{Generation, PageHeap};
+
+use super::layout::{HeapType, Wf64Layout, make_header, tag_pointer};
+
+/// Default heap reservation: 64 MB.  paged_gc reserves address
+/// space lazily via VirtualAlloc; the physical pages don't get
+/// committed until they're actually touched.
+const DEFAULT_HEAP_BYTES: usize = 64 * 1024 * 1024;
+
+thread_local! {
+    /// The live GC heap.  Initialised on first use; cleared on
+    /// session reset.
+    static WF_HEAP: RefCell<Option<PageHeap<Wf64Layout>>> = const { RefCell::new(None) };
+}
+
+/// Reset the GC heap, dropping all allocations.  Called by session
+/// reset between harness tests so each test starts with a fresh
+/// (empty) heap.  In production this would never be called; the
+/// heap lives for the session.
+pub fn reset_wf_heap() {
+    WF_HEAP.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// Ensure the heap is initialised, then run `f` with a mutable
+/// reference to it.  Lazy initialisation lets sessions that never
+/// touch the GC avoid paying for it.
+pub fn with_wf_heap<R>(f: impl FnOnce(&mut PageHeap<Wf64Layout>) -> R) -> R {
+    WF_HEAP.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            *borrow = Some(PageHeap::<Wf64Layout>::with_reservation(DEFAULT_HEAP_BYTES));
+        }
+        f(borrow.as_mut().expect("just initialised"))
+    })
+}
+
+/// Allocate a `FloatVec` of `n_cells` payload cells in `Generation::G0`.
+///
+/// Returns the tagged pointer (with `TAG_FLOATVEC` low bits) ready
+/// to store into a HEAPPTR slot.  Returns `None` if allocation
+/// fails.  Payload cells start as zero (paged_gc fills with
+/// `Wf64Layout::FILL_WORD` on page acquisition).
+pub fn alloc_floatvec(n_cells: u32) -> Option<u64> {
+    with_wf_heap(|heap| {
+        let total = 1 + n_cells as usize;
+        let ptr = heap.try_alloc_boxed_in(Generation::G0, total)?;
+        unsafe {
+            *ptr.as_ptr() = make_header(HeapType::FloatVec, n_cells);
+            // Payload cells already zero (FILL_WORD).
+        }
+        Some(tag_pointer(ptr.as_ptr() as *const u8, HeapType::FloatVec))
+    })
+}
+
+/// Allocate a `RefVec` of `n_cells` payload cells (all initialised
+/// to nil / 0) in `Generation::G0`.
+pub fn alloc_refvec(n_cells: u32) -> Option<u64> {
+    with_wf_heap(|heap| {
+        let total = 1 + n_cells as usize;
+        let ptr = heap.try_alloc_boxed_in(Generation::G0, total)?;
+        unsafe {
+            *ptr.as_ptr() = make_header(HeapType::RefVec, n_cells);
+        }
+        Some(tag_pointer(ptr.as_ptr() as *const u8, HeapType::RefVec))
+    })
+}
+
+/// Allocate a `String` of `n_bytes` in `Generation::G0`.  Caller
+/// is responsible for writing the bytes to the payload (offset 8
+/// from the returned untagged address).
+pub fn alloc_string(n_bytes: u32) -> Option<u64> {
+    with_wf_heap(|heap| {
+        let payload_cells = ((n_bytes as usize) + 7) / 8;
+        let total = 1 + payload_cells;
+        let ptr = heap.try_alloc_boxed_in(Generation::G0, total)?;
+        unsafe {
+            *ptr.as_ptr() = make_header(HeapType::String, n_bytes);
+        }
+        Some(tag_pointer(ptr.as_ptr() as *const u8, HeapType::String))
+    })
+}
+
+/// Run a major GC, walking the HEAPPTR region [base, next) as the
+/// root set.  Each cell in the region gets `evac.visit_cell`'d
+/// precisely.
+///
+/// # Safety
+/// `region_base` and `region_next` must point at 8-byte-aligned
+/// cells in the user-area HEAPPTR region.  `region_next` must be
+/// `>= region_base`.  The cells in between must each hold either
+/// nil (0) or a tagged Wf64Layout pointer.
+pub unsafe fn collect_major(region_base: u64, region_next: u64) {
+    debug_assert!(region_next >= region_base);
+    debug_assert!(region_base & 7 == 0, "region base must be 8-byte aligned");
+    debug_assert!(region_next & 7 == 0, "region next must be 8-byte aligned");
+
+    let n_slots = ((region_next - region_base) / 8) as usize;
+    let base_ptr = region_base as *mut u64;
+
+    with_wf_heap(|heap| {
+        heap.collect_major(|evac| {
+            for i in 0..n_slots {
+                unsafe { evac.visit_cell(base_ptr.add(i)); }
+            }
+        });
+    });
+}
+
+/// Run a minor GC over the same root set.
+///
+/// # Safety
+/// Same constraints as `collect_major`.
+pub unsafe fn collect_minor(region_base: u64, region_next: u64) {
+    debug_assert!(region_next >= region_base);
+    let n_slots = ((region_next - region_base) / 8) as usize;
+    let base_ptr = region_base as *mut u64;
+
+    with_wf_heap(|heap| {
+        heap.collect_minor(|evac| {
+            for i in 0..n_slots {
+                unsafe { evac.visit_cell(base_ptr.add(i)); }
+            }
+        });
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::layout::{PAYLOAD_MASK, TAG_FLOATVEC, TAG_MASK, TAG_REFVEC, TAG_STRING};
+
+    /// Tests share the thread_local heap; each test resets first.
+    fn reset() { reset_wf_heap(); }
+
+    #[test]
+    fn alloc_floatvec_returns_tagged_pointer() {
+        reset();
+        let p = alloc_floatvec(4).expect("alloc");
+        assert_eq!(p & TAG_MASK, TAG_FLOATVEC);
+        assert!(p & PAYLOAD_MASK != 0, "address must be non-zero");
+    }
+
+    #[test]
+    fn alloc_refvec_returns_tagged_pointer() {
+        reset();
+        let p = alloc_refvec(8).expect("alloc");
+        assert_eq!(p & TAG_MASK, TAG_REFVEC);
+    }
+
+    #[test]
+    fn alloc_string_returns_tagged_pointer() {
+        reset();
+        let p = alloc_string(13).expect("alloc");
+        assert_eq!(p & TAG_MASK, TAG_STRING);
+    }
+
+    #[test]
+    fn allocated_floatvec_payload_is_zero() {
+        reset();
+        let p = alloc_floatvec(4).expect("alloc");
+        let base = (p & PAYLOAD_MASK) as *const u64;
+        unsafe {
+            for i in 1..=4 {
+                assert_eq!(*base.add(i), 0, "cell {i} not zero-initialised");
+            }
+        }
+    }
+
+    #[test]
+    fn collect_with_one_root_keeps_it_alive() {
+        reset();
+        // Build a fake HEAPPTR region as a Box<[u64; 4]> so its
+        // address is stable across the with_wf_heap call.
+        let mut region: Vec<u64> = vec![0; 4];
+        let p = alloc_floatvec(2).expect("alloc");
+        // Write a marker into the payload so we can check survival.
+        unsafe {
+            let base = (p & PAYLOAD_MASK) as *mut u64;
+            *base.add(1) = 0xDEAD_BEEF;
+            *base.add(2) = 0xCAFE_BABE;
+        }
+        region[0] = p;
+
+        let base = region.as_mut_ptr() as u64;
+        let next = base + 4 * 8; // 4 slots used
+        unsafe { collect_major(base, next); }
+
+        // Slot may have been rewritten if the object moved.
+        let p_after = region[0];
+        assert_eq!(p_after & TAG_MASK, TAG_FLOATVEC);
+        unsafe {
+            let base_ptr = (p_after & PAYLOAD_MASK) as *const u64;
+            assert_eq!(*base_ptr.add(1), 0xDEAD_BEEF);
+            assert_eq!(*base_ptr.add(2), 0xCAFE_BABE);
+        }
+    }
+
+    #[test]
+    fn reset_clears_the_heap() {
+        reset();
+        // Allocate something, then reset; subsequent allocation
+        // gets a fresh heap.
+        let _ = alloc_floatvec(1).expect("alloc");
+        reset_wf_heap();
+        // After reset, the next allocation should succeed (proving
+        // the heap was re-initialised).
+        let p2 = alloc_floatvec(1).expect("post-reset alloc");
+        assert_ne!(p2, 0);
+    }
+}
