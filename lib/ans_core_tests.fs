@@ -394,6 +394,40 @@ T{  0 ms  lp@ lp0@ =  -> -1 }T              \ kernel32 Sleep preserves R15
 \ The region is writable through R15.
 T{  lp-smoke lp-smoke +  -> 84 }T
 
+\ ── Forth 2012 locals: {: ... :} ─────────────────────────────────────────
+
+\ Basic: one local. {: x :} pops TOS into x; reading x returns it.
+T{  : loc1  {: x :} x ;
+    42 loc1  -> 42 }T
+
+\ Two locals. Last-declared takes TOS.
+T{  : loc2  {: a b :} a b ;
+    10 20 loc2  -> 10 20 }T
+
+\ Three locals + arithmetic.
+T{  : sum3  {: x y z :} x y + z + ;
+    1 2 3 sum3  -> 6 }T
+
+\ Locals frame is released on exit — LP back to LP0.
+T{  10 20 30 sum3  lp@ lp0@ =  -> 60 -1 }T
+
+\ Locals used in non-trivial computation.
+T{  : avg3  {: x y z :} x y + z + 3 / ;
+    2 4 6 avg3  -> 4 }T
+
+\ Recursion with locals: each call gets its own frame.
+T{  : fact  {: n :} n 1 <= if 1 else n n 1 - recurse * then ;
+    5 fact  -> 120 }T
+T{  6 fact  -> 720 }T
+
+\ EXIT inside a locals-defining word releases the frame too.
+T{  : maybe-exit  {: n :} n 0 = if 99 exit then n 2 * ;
+    0 maybe-exit  -> 99 }T
+T{  5 maybe-exit  -> 10 }T
+
+\ After all the locals tests, LP must still be balanced.
+T{  lp@ lp0@ =  -> -1 }T
+
 \ ── Memory-Allocation: ALLOCATE / FREE / RESIZE ──────────────────────────
 
 s" Memory-Allocation" testing

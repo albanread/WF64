@@ -398,6 +398,89 @@ variable rl-state                 \ 0=continue 1=EOF-no-data 2=clean-end 3=error
     rl-state @ 1 = if 0 else -1 then
     rl-ior @ ;
 
+\ ── Locals: {: x y z :} ─────────────────────────────────────────────────
+\ Forth 2012 locals.  Usage:
+\     : foo ( a b c -- result )
+\         {: x y z :}
+\         x y z + + ;
+\
+\ At run time `c` goes into z (highest offset), `b` into y, `a` into x.
+\ Locals are read-only in this version: each name compiles to a fetch
+\ from [r15 + offset].
+\
+\ Implementation outline.  When `: foo` runs, (create) places foo's
+\ header at HERE and sets foo's xt to the next byte (= the current
+\ HERE).  The body is normally compiled directly into those bytes.
+\ With locals, we instead:
+\   1. Reserve 5 bytes at foo's xt for a JMP rel32.
+\   2. Define each local (x, y, z) -- (create) places their headers
+\      contiguously starting at xt+5.
+\   3. Backpatch the JMP at foo's xt so it jumps PAST the locals to
+\      where the real body starts.
+\   4. Compile the frame-allocation and arg-pop code, then the body.
+\   5. ; (kernel) emits `add r15, N*cell` before RET based on
+\      user_LOCALS_COUNT, then zeros that counter for the next def.
+
+\ Emit machine code at HERE that fetches [r15 + disp32] onto the data
+\ stack.  This becomes the runtime body of each local name.
+\
+\   48 89 45 F8                 mov [rbp-8], rax       ; spill TOS
+\   49 8B 87 <disp32>           mov rax, [r15 + d32]   ; load local
+\   48 83 ED 08                 sub rbp, 8             ; pop into TOS
+\   C3                          ret
+: emit-local-fetch  ( byte-offset -- )
+    $48 c, $89 c, $45 c, $F8 c,
+    $49 c, $8B c, $87 c,
+    here L!  4 allot
+    $48 c, $83 c, $ED c, $08 c,
+    $C3 c, ;
+
+\ Define one local at the given byte offset from R15.
+: local-defining-word  ( byte-offset c-addr u -- )
+    (create) emit-local-fetch ;
+
+: locals-closer?  ( c-addr u -- flag )  s" :}" str= ;
+
+: {:
+    here                                     ( jmp-loc )    \ foo's xt
+    5 allot                                  \ reserve JMP rel32 slot
+    0                                        ( jmp-loc cell-offset )
+    begin
+        parse-name dup 0= if
+            2drop refill drop false
+        else
+            2dup locals-closer?
+            if
+                2drop true
+            else
+                ( jmp-loc cell-offset c-addr u )
+                2 pick cells -rot            ( jmp-loc cell-offset byte-offset c-addr u )
+                local-defining-word          ( jmp-loc cell-offset )
+                1+ false
+            then
+        then
+    until
+    ( jmp-loc N )
+
+    \ Backpatch JMP at jmp-loc:
+    \   E9 disp32, disp32 = HERE - (jmp-loc + 5).
+    swap                                     ( N jmp-loc )
+    $E9 over c!                              ( N jmp-loc )
+    here over 5 + -                          ( N jmp-loc rel32 )
+    swap 1+ L!                               ( N )
+
+    \ Record locals count for ; / EXIT cleanup.
+    dup locals#!
+
+    \ Compile `N (open-locals)` to allocate the frame.
+    dup postpone literal postpone (open-locals)
+
+    \ Compile pop sequence: TOS → highest offset first.
+    dup 0 ?do
+        dup 1- i - cells postpone literal postpone (local!)
+    loop
+    drop ; immediate
+
 \ ── Console / terminal (Facility) ─────────────────────────────────────────
 \ Implemented via ANSI escape sequences. Modern Windows terminals
 \ (Windows Terminal, conhost on Windows 10+) handle these by default.

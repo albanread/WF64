@@ -47,3 +47,63 @@ proc(lp_smoke_word)
     stk(0, 1)
     next()
 endp()
+
+; ── Locals-frame runtime primitives ──────────────────────────────────
+; These are the four operations a colon definition with locals needs:
+; allocate the frame on entry, store args into local slots, fetch local
+; values at use sites, and free the frame on exit. The kernel's `;`
+; auto-emits the free call based on user_LOCALS_COUNT, so user code
+; only needs the alloc + fetch + store ops.
+
+; (open-locals)  ( n -- )    Allocate n cells on the locals stack.
+proc(open_locals_word)
+    mov     rcx, TOS
+    shl     rcx, 3                              ; n * cell
+    sub     r15, rcx
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; (close-locals)  ( n -- )    Release n cells from the locals stack.
+proc(close_locals_word)
+    mov     rcx, TOS
+    shl     rcx, 3
+    add     r15, rcx
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; (local@)  ( offset -- val )    Fetch [r15 + offset]; offset in bytes.
+proc(local_fetch_word)
+    mov     rcx, TOS
+    mov     TOS, [r15 + rcx]
+    next()
+endp()
+
+; (local!)  ( val offset -- )    Store val at [r15 + offset]; offset in bytes.
+proc(local_store_word)
+    mov     rcx, TOS                            ; offset
+    mov     rdx, [DSP]                           ; val
+    mov     [r15 + rcx], rdx
+    mov     TOS, [DSP + cell]                    ; raise NNOS to TOS
+    stk(2, 0)
+    next()
+endp()
+
+; locals#  ( -- u )    Number of locals declared in the current colon def.
+proc(locals_count_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_LOCALS_COUNT]
+    stk(0, 1)
+    next()
+endp()
+
+; locals#!  ( u -- )    Set the locals count (used by `{:`).
+proc(locals_count_store_word)
+    mov     [UP + user_LOCALS_COUNT], TOS
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()

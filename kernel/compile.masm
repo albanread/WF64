@@ -1512,6 +1512,27 @@ endp()
 ;     Finish the current definition: emit a single RET into the body
 ;     and leave compile mode. The header was already linked into the
 ;     chain by `(create)` when `:` ran, so no commit step is needed.
+; Emit `add r15, count*8` machine code at HERE if user_LOCALS_COUNT > 0.
+; Encoding:   49 81 C7  imm32_le   = add r15, imm32  (7 bytes)
+; Used by both ; and EXIT so colon defs with locals release the frame
+; on every exit path. Idempotent across multiple EXIT sites — the count
+; isn't zeroed here (only ; clears it after the final RET).
+proc(emit_locals_release)
+    mov     rcx, [UP + user_LOCALS_COUNT]
+    test    rcx, rcx
+    jz      .none
+    shl     rcx, 3                              ; bytes = count*8
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x49
+    mov     byte ptr [r8 + 1], 0x81
+    mov     byte ptr [r8 + 2], 0xC7
+    mov     dword ptr [r8 + 3], ecx             ; imm32 little-endian
+    add     r8, 7
+    mov     [UP + user_HERE], r8
+.none:
+    ret
+endp()
+
 proc(semicolon)
     cmp     qword ptr [UP + user_STATE], 0
     jne     .in_compile
@@ -1520,16 +1541,19 @@ proc(semicolon)
     next()
 
 .in_compile:
+    call    emit_locals_release
     mov     r8, [UP + user_HERE]
     mov     byte ptr [r8], 0xC3              ; RET
     inc     r8
     mov     [UP + user_HERE], r8
     mov     qword ptr [UP + user_STATE], 0
+    mov     qword ptr [UP + user_LOCALS_COUNT], 0   ; reset for next definition
     next()
 endp()
 
 ; exit  ( -- )                                        IMMEDIATE
-;     Compile an early return from the current definition.
+;     Compile an early return from the current definition. If the
+;     definition has a locals frame, release it first.
 proc(exit_word)
     cmp     qword ptr [UP + user_STATE], 0
     jne     .in_compile
@@ -1538,6 +1562,7 @@ proc(exit_word)
     next()
 
 .in_compile:
+    call    emit_locals_release
     mov     r8, [UP + user_HERE]
     mov     byte ptr [r8], 0xC3              ; RET
     inc     r8

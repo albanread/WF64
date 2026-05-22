@@ -86,6 +86,7 @@
 @assign user_TRACE       = 0x15A8    ; trace flag: 0 = off, 1 = on
 @assign user_LP0         = 0x15B0    ; initial locals-stack pointer (high end of LP region)
 @assign user_LP_LIMIT    = 0x15B8    ; low limit of locals stack (overflow check)
+@assign user_LOCALS_COUNT= 0x15C0    ; #locals declared in the current colon def (0 outside)
 
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier

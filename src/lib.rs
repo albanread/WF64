@@ -359,6 +359,12 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("lp0@",       "lp0_fetch_word",   0),
     ("lp-limit",   "lp_limit_word",    0),
     ("lp-smoke",   "lp_smoke_word",    0),
+    ("(open-locals)",  "open_locals_word",        0),
+    ("(close-locals)", "close_locals_word",       0),
+    ("(local@)",       "local_fetch_word",        0),
+    ("(local!)",       "local_store_word",        0),
+    ("locals#",        "locals_count_word",       0),
+    ("locals#!",       "locals_count_store_word", 0),
     // Parse & dict
     ("evaluate",   "evaluate_word", 0),
     ("parse-name", "parse_name", 0),
@@ -516,6 +522,7 @@ const USER_CONTEXT:      u64 = 0x1528;
 const USER_TRACE:        u64 = 0x15A8;  // trace flag; mirrors user_TRACE in macros.masm
 const USER_LP0:          u64 = 0x15B0;  // initial LP (top of locals region)
 const USER_LP_LIMIT:     u64 = 0x15B8;  // low limit of locals stack
+const USER_LOCALS_COUNT: u64 = 0x15C0;  // #locals in current colon def (0 outside)
 
 // (Dictionary header layout deliberately not mirrored here — it lives
 // entirely in kernel/macros.masm and kernel/dict.masm. The bootstrap
@@ -889,6 +896,7 @@ impl Wf64Session {
             write_u64(up, USER_INDEX_LATEST, 0);
             write_u64(up, USER_LP0,          locals_top);
             write_u64(up, USER_LP_LIMIT,     locals_base_u64);
+            write_u64(up, USER_LOCALS_COUNT, 0);
         }
 
         // Register kernel procs with SEH for symbolic crash dumps.
