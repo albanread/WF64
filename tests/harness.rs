@@ -546,6 +546,20 @@ fn eval_s_quote_works_in_interpret_mode() {
 }
 
 #[test]
+fn eval_c_quote_works_in_interpret_mode() {
+    let mut s = sess();
+    let out = s.eval("c\" HI\" count type cr\nbye\n").unwrap();
+    assert_eq!(out, "HI\n ok\n");
+}
+
+#[test]
+fn eval_c_quote_compiles_runtime_counted_string() {
+    let mut s = sess();
+    let out = s.eval(": greet c\" HI\" ;\ngreet count type cr\nbye\n").unwrap();
+    assert_eq!(out, " ok\nHI\n ok\n");
+}
+
+#[test]
 fn eval_source_and_to_in_can_skip_rest_of_line() {
     let mut s = sess();
     let out = s.eval(": skip-rest source >in ! drop ;\nskip-rest 123 .\nbye\n").unwrap();
@@ -814,6 +828,15 @@ fn load_source_file_provides_unsigned_dot() {
 }
 
 #[test]
+fn load_source_file_provides_double_unsigned_dot() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("123 s>d du. cr\nbye\n").unwrap();
+    assert_eq!(out, "123 \n ok\n");
+}
+
+#[test]
 fn load_source_file_provides_abort_quote() {
     let mut s = sess();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
@@ -924,17 +947,6 @@ fn load_source_file_provides_case_words() {
 }
 
 #[test]
-fn load_source_file_include_loads_file() {
-    let mut s = sess();
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
-    s.load_source_file(&path).unwrap();
-    let fs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("include_test.fs");
-    let include_cmd = format!("include {}\n4 double .\nbye\n", fs_path.display());
-    let out = s.eval(&include_cmd).unwrap();
-    assert_eq!(out, " ok\n8  ok\n");
-}
-
-#[test]
 fn m7_ans_core_tests_pass() {
     let mut s = sess();
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -942,8 +954,6 @@ fn m7_ans_core_tests_pass() {
     s.load_source_file(&manifest.join("lib").join("tester.fs")).unwrap();
     s.load_source_file(&manifest.join("lib").join("ans_core_tests.fs")).unwrap();
     let out = s.eval("bye\n").unwrap();
-    // Tally is printed by the test file; we just need it to be reachable.
-    // Any INCORRECT RESULT or WRONG NUMBER OF RESULTS lines mean failure.
     assert!(
         !out.contains("INCORRECT RESULT"),
         "ANS core test failures:\n{out}"

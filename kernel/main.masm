@@ -40,6 +40,8 @@
 @include "strings.masm"
 @include "number.masm"
 @include "io.masm"
+@include "facility.masm"
+@include "fmath.masm"
 @include "parse.masm"
 @include "dict.masm"
 @include "execute.masm"

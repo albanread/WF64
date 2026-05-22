@@ -283,6 +283,212 @@ s" Environment" testing
 
 T{  s" MAX-N" environment? -> false }T   \ stub: always false
 
+\ ── File-Access: OPEN / CREATE / READ / WRITE / CLOSE / DELETE ───────────
+
+s" File-Access" testing
+
+variable fa-fid
+variable fa-ior
+variable fa-n
+create   fa-buf  256 allot
+
+\ Temp filename, kept around as a 2constant so the path bytes stay valid
+\ across READ-FILE and the subsequent DELETE-FILE.
+s" tmp_file_access_test.dat" 2constant tmpf
+
+\ CREATE-FILE
+T{  tmpf r/w create-file fa-ior ! fa-fid !  fa-ior @ -> 0 }T
+
+\ WRITE-FILE
+T{  s" Hello, World!" fa-fid @ write-file -> 0 }T
+
+\ CLOSE-FILE
+T{  fa-fid @ close-file -> 0 }T
+
+\ OPEN-FILE for reading
+T{  tmpf r/o open-file fa-ior ! fa-fid !  fa-ior @ -> 0 }T
+
+\ READ-FILE: read 13 bytes back into fa-buf
+T{  fa-buf 256 fa-fid @ read-file fa-ior ! fa-n !  fa-ior @ -> 0 }T
+T{  fa-n @ -> 13 }T
+T{  fa-buf c@ -> 72 }T              \ 'H'
+T{  fa-buf 7 + c@ -> 87 }T          \ 'W'
+
+\ CLOSE again
+T{  fa-fid @ close-file -> 0 }T
+
+\ DELETE-FILE
+T{  tmpf delete-file -> 0 }T
+
+\ Opening a nonexistent file should fail.
+T{  s" definitely_not_a_real_file_12345.xyz" r/o open-file nip -> 0 = }T
+
+\ FILE-POSITION / FILE-SIZE / REPOSITION-FILE / WRITE-LINE
+s" tmp_file_seek_test.dat" 2constant fs-path
+T{  fs-path r/w create-file fa-ior ! fa-fid !  fa-ior @ -> 0 }T
+T{  s" hello" fa-fid @ write-line -> 0 }T
+T{  s" world" fa-fid @ write-line -> 0 }T
+T{  fa-fid @ file-position drop drop -> 14 }T        \ 5 + 2 + 5 + 2 = 14
+T{  fa-fid @ file-size     drop drop -> 14 }T
+\ Reposition to start, read the first 5 bytes.
+T{  0 0 fa-fid @ reposition-file -> 0 }T
+T{  fa-buf 5 fa-fid @ read-file fa-ior ! fa-n !  fa-ior @ fa-n @ -> 0 5 }T
+T{  fa-buf c@ -> 104 }T                              \ 'h'
+T{  fa-fid @ close-file -> 0 }T
+T{  fs-path delete-file -> 0 }T
+
+\ FLUSH-FILE / RENAME-FILE
+s" tmp_rename_src.dat" 2constant rn-src
+s" tmp_rename_dst.dat" 2constant rn-dst
+T{  rn-src r/w create-file fa-ior ! fa-fid !  fa-ior @ -> 0 }T
+T{  s" data" fa-fid @ write-file -> 0 }T
+T{  fa-fid @ flush-file -> 0 }T
+T{  fa-fid @ close-file -> 0 }T
+T{  rn-src rn-dst rename-file -> 0 }T
+\ Source no longer exists; destination opens cleanly.
+T{  rn-src r/o open-file nip -> 0 = }T
+T{  rn-dst r/o open-file fa-ior ! fa-fid !  fa-ior @ -> 0 }T
+T{  fa-fid @ close-file -> 0 }T
+T{  rn-dst delete-file -> 0 }T
+
+\ AT-XY / PAGE — output-only smoke tests, just confirm clean stack.
+T{  0 0 at-xy -> }T
+T{  page -> }T
+
+\ READ-LINE round-trip: write two lines, read them back.
+s" tmp_readline_test.dat" 2constant rl-path
+T{  rl-path r/w create-file fa-ior ! fa-fid !  fa-ior @ -> 0 }T
+T{  s" line one" fa-fid @ write-line -> 0 }T
+T{  s" line two" fa-fid @ write-line -> 0 }T
+T{  fa-fid @ close-file -> 0 }T
+T{  rl-path r/o open-file fa-ior ! fa-fid !  fa-ior @ -> 0 }T
+T{  fa-buf 256 fa-fid @ read-line -> 8 -1 0 }T          \ "line one"
+T{  fa-buf c@ -> 108 }T                                   \ 'l'
+T{  fa-buf 256 fa-fid @ read-line -> 8 -1 0 }T          \ "line two"
+T{  fa-buf 256 fa-fid @ read-line -> 0 0 0 }T            \ EOF
+T{  fa-fid @ close-file -> 0 }T
+T{  rl-path delete-file -> 0 }T
+
+\ ── Memory-Allocation: ALLOCATE / FREE / RESIZE ──────────────────────────
+
+s" Memory-Allocation" testing
+
+variable alloc-addr
+variable alloc-ior
+
+\ ALLOCATE 100 bytes — ior should be 0.
+T{  100 allocate alloc-ior ! alloc-addr !  alloc-ior @ -> 0 }T
+
+\ Write/read a byte through the allocated block.
+T{  65 alloc-addr @ c!  alloc-addr @ c@ -> 65 }T
+
+\ RESIZE to 200 — ior should be 0, save new addr.
+T{  alloc-addr @ 200 resize alloc-ior ! alloc-addr !  alloc-ior @ -> 0 }T
+
+\ Byte should still be there after resize.
+T{  alloc-addr @ c@ -> 65 }T
+
+\ FREE — ior should be 0.
+T{  alloc-addr @ free -> 0 }T
+
+\ Single-line round-trip.
+T{  64 allocate swap free -> 0 }T
+
+\ ── Facility-ext: MS / UTIME / TIME&DATE ─────────────────────────────────
+
+s" Facility-ext" testing
+
+\ MS: smoke — sleep 0 is a no-op, leaves stack empty.
+T{  0 ms -> }T
+
+\ UTIME: smoke — returns a double, both halves are non-negative integers.
+T{  utime drop 0 >= -> -1 }T              \ low cell >= 0 (always true)
+T{  utime nip 0 >= -> -1 }T               \ high cell >= 0
+
+\ TIME&DATE: ranges. sec 0..59, min 0..59, hour 0..23, day 1..31, month 1..12, year > 2020.
+T{  time&date  swap drop swap drop swap drop swap drop swap drop  2020 > -> -1 }T
+T{  time&date  drop drop drop drop drop  60 <        -> -1 }T   \ sec < 60
+
+\ ── Double-cell additions ────────────────────────────────────────────────
+
+s" Double-extras" testing
+
+\ D>S
+T{   5 0  d>s ->  5 }T
+T{  -5 -1 d>s -> -5 }T
+
+\ D<= D>= DU<= DU>=
+T{   1 0   2 0  d<=  -> -1 }T
+T{   2 0   1 0  d<=  ->  0 }T
+T{   2 0   2 0  d<=  -> -1 }T
+T{   1 0   2 0  d>=  ->  0 }T
+T{   2 0   1 0  d>=  -> -1 }T
+T{   2 0   2 0  d>=  -> -1 }T
+T{   1 0   2 0  du<= -> -1 }T
+T{   2 0   1 0  du>= -> -1 }T
+
+\ D0<> D0>= D0<= D0>
+T{   0  0  d0<> ->  0 }T
+T{   1  0  d0<> -> -1 }T
+T{   0  0  d0>= -> -1 }T
+T{   1  0  d0>= -> -1 }T
+T{  -1 -1  d0>= ->  0 }T
+T{   0  0  d0<= -> -1 }T
+T{   1  0  d0<= ->  0 }T
+T{  -1 -1  d0<= -> -1 }T
+T{   1  0  d0>  -> -1 }T
+T{   0  0  d0>  ->  0 }T
+T{  -1 -1  d0>  ->  0 }T
+
+\ UD.R smoke test (output only)
+T{   5 0  3 ud.r -> }T
+
+\ ── UNLESS / THIRD / ?: / F. / ASSERT ────────────────────────────────────
+
+s" Misc-convenience" testing
+
+\ UNLESS  inverts the IF test.
+T{  : u1 0  unless 1 else 2 then ;  u1 -> 1 }T
+T{  : u2 -1 unless 1 else 2 then ;  u2 -> 2 }T
+T{  : u3 5  unless 1 else 2 then ;  u3 -> 2 }T   \ any nonzero → else
+
+\ THIRD
+T{  10 20 30 third -> 10 20 30 10 }T
+
+\ ?:  pick first if flag, second otherwise
+T{  -1  10 20 ?: -> 10 }T
+T{   0  10 20 ?: -> 20 }T
+T{   1  10 20 ?: -> 10 }T
+
+\ F. (output-only; just verify it leaves no data-stack residue)
+T{   3e f. -> }T
+T{   0e f. -> }T
+T{   0e 1e f- f. -> }T
+
+\ ASSERT — true flag is a no-op
+T{  -1 s" should not abort" assert -> }T
+
+\ ── 2VALUE / 2TO / UNDER+ / FORGET ───────────────────────────────────────
+
+s" 2value/2to/under+" testing
+
+T{  10 20 2value 2v1     2v1 -> 10 20 }T
+T{  77 88 2to 2v1        2v1 -> 77 88 }T
+T{  : bump-2v 5 6 2to 2v1 ; bump-2v 2v1 -> 5 6 }T
+
+T{  1 2 3 under+ -> 4 2 }T
+T{  10 20 30 under+ -> 40 20 }T
+
+\ FORGET round-trip via marker checkpoint
+marker fg-anchor
+: fg-foo 111 ;
+: fg-bar 222 ;
+T{  fg-foo fg-bar -> 111 222 }T
+forget fg-foo
+T{  [defined] fg-foo -> 0 }T
+T{  [defined] fg-bar -> 0 }T
+fg-anchor
+
 \ ── String helpers: -LEADING / STARTS-WITH? ──────────────────────────────
 
 s" String-helpers" testing
@@ -359,6 +565,56 @@ T{   1e f2* 2e f= -> -1 }T
 \ FTRUNC (round toward zero via f>d d>f)
 T{   3e f2* 1e f+ ftrunc 7e f= -> -1 }T
 T{   0e 7e f- ftrunc 0e 7e f- f= -> -1 }T
+
+\ FROUND
+T{   3e 0.5e f+ fround 4e f= -> -1 }T          \ 3.5 → 4 (away from zero on positive)
+T{   3e 0.5e f- fround 3e f= -> -1 }T          \ 2.5 → 2 ??? actually 2.5 rounds to 3 with away-from-zero
+\ Let me redo the second test: 2.5 + 0.5 = 3.0 trunc → 3. OK ok.
+T{  0e 3e f- 0.5e f- fround 0e 4e f- f= -> -1 }T  \ -3.5 → -4
+
+\ FLOOR
+T{   3e 0.5e f+ floor 3e f= -> -1 }T            \ 3.5 → 3
+T{  0e 3e f- 0.5e f- floor 0e 4e f- f= -> -1 }T \ -3.5 → -4
+T{   3e floor 3e f= -> -1 }T                    \ exact integer unchanged
+T{  0e 3e f- floor 0e 3e f- f= -> -1 }T         \ -3 → -3
+
+\ >FLOAT
+T{  s" 3.14"      >float -> -1 }T
+T{  s" 3.14"      >float drop f0< 0= -> -1 }T   \ positive
+T{  s" not-a-num" >float -> 0 }T
+
+\ Float math (msvcrt)
+T{   4e fsqrt 2e f= -> -1 }T
+T{   9e fsqrt 3e f= -> -1 }T
+T{   0e fsin f0= -> -1 }T
+T{   0e fcos 1e f= -> -1 }T
+T{   0e ftan f0= -> -1 }T
+T{   0e fexp 1e f= -> -1 }T
+T{   1e fln  f0= -> -1 }T
+T{   1e flog f0= -> -1 }T
+T{  10e flog 1e f= -> -1 }T
+T{   0e fatan f0= -> -1 }T
+T{   0e fasin f0= -> -1 }T
+T{   1e facos f0= -> -1 }T
+T{   2e 3e f** 8e f= -> -1 }T            \ 2^3 = 8
+T{   3e 2e f** 9e f= -> -1 }T            \ 3^2 = 9
+T{   0e 1e fatan2 f0= -> -1 }T           \ atan2(0,1) = 0
+
+\ FALOG
+T{   0e falog 1e   f= -> -1 }T
+T{   1e falog 10e  f= -> -1 }T
+T{   2e falog 100e f= -> -1 }T
+T{  10e flog 1e f= -> -1 }T
+
+\ F0<>
+T{   0e f0<> -> 0 }T
+T{   1e f0<> -> -1 }T
+
+\ COMPILE-NAME — use inside an immediate helper that compiles a call to
+\ the named word into the surrounding colon definition.
+T{  : pn-helper  parse-name compile-name ; immediate
+    : pn-square  5 pn-helper dup * ;
+    pn-square -> 25 }T
 
 \ ── EXECUTE-PARSING / SAVE-INPUT / NAME>STRING ───────────────────────────
 

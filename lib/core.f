@@ -66,6 +66,8 @@ variable hld
 
 : ud. ( ud -- ) <# #s #> type space ;
 
+: du. ( du -- ) ud. ;
+
 : erase ( addr u -- ) 0 fill ;
 
 : f, here f! 1 floats allot ;
@@ -136,7 +138,8 @@ variable hld
 \ TO: parse next name; in interpret state store, in compile state compile a store.
 : to
     parse-name find-name dup 0= if drop throw_namereqd throw then
-    drop name>interpret >body
+    drop
+    name>interpret >body
     state @ if postpone literal ['] ! compile, else ! then
 ; immediate
 
@@ -299,6 +302,169 @@ variable sub-count
     repeat
     sub-dst @ sub-dstlen @ sub-count @ ;
 
+\ ── Double-cell additions ────────────────────────────────────────────────
+
+\ D>S ( d -- n )    discard the high cell.
+: d>s   ( d -- n )  drop ;
+
+\ Missing double-cell comparisons.
+: d<=   ( d1 d2 -- flag )  d>  0= ;
+: d>=   ( d1 d2 -- flag )  d<  0= ;
+: du<=  ( d1 d2 -- flag )  du> 0= ;
+: du>=  ( d1 d2 -- flag )  du< 0= ;
+
+\ Double-cell zero comparisons (D0< D0= exist as primitives).
+: d0<>  ( d -- flag )  d0= 0= ;
+: d0>=  ( d -- flag )  d0< 0= ;
+: d0<=  ( d -- flag )  2dup d0= -rot d0< or ;
+: d0>   ( d -- flag )  d0<= 0= ;
+
+\ UD.R ( ud width -- )    Print unsigned double right-justified.
+: ud.r  ( ud width -- )
+    >r <# #s #> r> over - 0 max spaces type ;
+
+\ ── Misc convenience ─────────────────────────────────────────────────────
+
+\ UNLESS — inverse of IF (immediate).
+: unless  postpone 0= postpone if ; immediate
+
+\ THIRD ( a b c -- a b c a )
+: third  >r over r> swap ;
+
+\ ?: ( flag a b -- a-or-b )    pick a if flag, b otherwise.
+: ?:  ( flag a b -- result )  rot if drop else nip then ;
+
+\ ASSERT ( flag c-addr u -- )    abort with message if flag is false.
+: assert  ( flag c-addr u -- )
+    rot 0= if type cr abort else 2drop then ;
+
+\ ── F. — print a float in fixed-point notation ────────────────────────────
+\ Prints sign, integer part, '.', then 6 fractional digits, then a space.
+: f.  ( F: r -- )
+    fdup f0< if [char] - emit fnegate then
+    fdup f>d
+    <# #s #> type
+    [char] . emit
+    fdup f>d d>f f-
+    1000000 s>d d>f f*
+    f>d drop
+    0 <# # # # # # # #> type
+    space ;
+
+\ ── READ-LINE (Forth 2012 File-Access) ───────────────────────────────────
+\ Read a line up to LF; strip a trailing CR if present.  Byte-at-a-time
+\ implementation (slow but correct); a chunked version would need
+\ SetFilePointerEx to push back overrun.
+
+variable rl-fid
+variable rl-buf
+variable rl-max
+variable rl-pos
+variable rl-ior
+variable rl-state                 \ 0=continue 1=EOF-no-data 2=clean-end 3=error
+
+: read-line  ( c-addr u1 fileid -- u2 flag ior )
+    rl-fid !  rl-max !  rl-buf !
+    0 rl-pos !  0 rl-ior !  0 rl-state !
+    begin rl-state @ 0= while
+        rl-pos @ rl-max @ >= if
+            2 rl-state !
+        else
+            rl-buf @ rl-pos @ + 1 rl-fid @ read-file
+            rl-ior !                                ( bytes-read )
+            rl-ior @ 0= if
+                dup 0= if
+                    rl-pos @ 0= if 1 else 2 then rl-state !
+                else
+                    rl-buf @ rl-pos @ + c@           ( bytes byte )
+                    case
+                        10 of
+                            rl-pos @ 0> if
+                                rl-buf @ rl-pos @ + 1- c@ 13 =
+                                if -1 rl-pos +! then
+                            then
+                            2 rl-state !
+                        endof
+                        1 rl-pos +!
+                    endcase
+                then
+                drop
+            else
+                drop  3 rl-state !
+            then
+        then
+    repeat
+    rl-pos @
+    rl-state @ 1 = if 0 else -1 then
+    rl-ior @ ;
+
+\ ── Console / terminal (Facility) ─────────────────────────────────────────
+\ Implemented via ANSI escape sequences. Modern Windows terminals
+\ (Windows Terminal, conhost on Windows 10+) handle these by default.
+
+\ AT-XY ( col row -- )    Position cursor at (col, row), zero-based.
+: at-xy  ( col row -- )
+    27 emit [char] [ emit
+    1+ 0 <# #s #> type
+    [char] ; emit
+    1+ 0 <# #s #> type
+    [char] H emit ;
+
+\ PAGE ( -- )    Clear screen and home cursor.
+: page   ( -- )
+    27 emit [char] [ emit [char] 2 emit [char] J emit
+    27 emit [char] [ emit [char] H emit ;
+
+\ ── File-Access constants ─────────────────────────────────────────────────
+\ R/O W/O R/W BIN are the file-access-method constants used by OPEN-FILE
+\ and CREATE-FILE. Values are implementation-defined; the kernel
+\ primitives translate them to Win32 access masks.
+1 constant r/o
+2 constant w/o
+3 constant r/w
+: bin   ( fam -- fam' )  ;        \ no-op on Windows (binary mode is implicit)
+
+\ ── Dictionary tools ──────────────────────────────────────────────────────
+
+\ FORGET ( "name" -- )    Roll back the dictionary past the named word
+\ by calling forget_last repeatedly until the name is no longer findable.
+\ Honors the kernel FORGET_FENCE (forget_last is a no-op past it).
+: forget  ( "name" -- )
+    parse-name 2dup find-name
+    0= if 2drop 2drop -13 throw then
+    drop                            ( c-addr u )
+    begin
+        2dup find-name
+        0= if
+            2drop -1                ( c-addr u -1 ) — stop
+        else
+            drop forget_last 0      ( c-addr u 0 ) — continue
+        then
+    until
+    2drop ;
+
+\ ORDER ( -- )    Display the current search order and current wordlist.
+: order  ( -- )
+    s" Search order:" type
+    get-order
+    dup 0 ?do  space dup pick u.  loop drop
+    cr
+    s" Current: " type  get-current u.  cr ;
+
+\ UNDER+ ( n1 n2 n3 -- n1+n3 n2 )    Add n3 to n1 leaving n2 unchanged on top.
+: under+  ( n1 n2 n3 -- n1+n3 n2 )  rot + swap ;
+
+\ ── 2VALUE / 2TO (Forth 2012, double-cell value) ─────────────────────────
+\ Note: this pair is independent of TO — use 2TO for 2VALUE writes.
+
+: 2value   ( x1 x2 "name" -- )  create , , does> 2@ ;
+
+: 2to
+    parse-name find-name dup 0= if drop -13 throw then
+    drop name>interpret >body
+    state @ if postpone literal ['] 2! compile, else 2! then
+; immediate
+
 \ ── String helpers ───────────────────────────────────────────────────────
 
 \ -LEADING ( c-addr u -- c-addr' u' )   strip leading spaces (mirror of -trailing).
@@ -359,6 +525,41 @@ variable ew-suffix-addr
 
 \ FTRUNC — truncate toward zero via the double-cell integer conversion.
 : ftrunc ( F: r -- r' )    f>d d>f ;
+
+\ A 0.5 constant for rounding (computed once at load time).
+1e 2e f/ fconstant 0.5e
+
+\ FROUND — round to nearest, ties away from zero.
+: fround ( F: r -- r' )
+    fdup f0<
+    if 0.5e f- ftrunc
+    else 0.5e f+ ftrunc
+    then ;
+
+\ FLOOR — round toward negative infinity.
+: floor ( F: r -- r' )
+    fdup ftrunc                                \ ( r trunc )
+    fswap fover                                \ ( trunc r trunc )
+    f<                                          \ ( trunc ; flag = r < trunc )
+    if 1e f- then ;
+
+\ FALOG ( F: r -- 10^r )    Base-10 antilog (Float-ext).
+: falog  ( F: r -- 10^r )  10e fswap f** ;
+
+\ F0<> ( F: r -- ; -- flag )
+: f0<>   ( F: r -- ; flag )  f0= 0= ;
+
+\ COMPILE-NAME ( c-addr u -- )   compile a call to the named word, or throw -13.
+: compile-name  ( c-addr u -- )
+    find-name 0= if -13 throw then
+    name>compile execute ;
+
+\ >FLOAT — string to float. Built on the kernel's float? primitive.
+\ float? returns ( -1 ) on success (consumed addr/u, pushed r onto FP),
+\ or ( c-addr u 0 ) on failure.
+: >float ( c-addr u -- flag ; F: -- r | )
+    float?
+    if -1 else 2drop 0 then ;
 
 \ ── Input-source manipulation ─────────────────────────────────────────────
 \ Direct user-area access (base = UP):

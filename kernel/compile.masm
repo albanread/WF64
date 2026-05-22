@@ -58,6 +58,20 @@ proc(do_slit)
     next()
 endp()
 
+; do_clit  ( -- c-addr )   [runtime helper, never user-callable]
+;     Compiled by `cliteral` as: call do_clit ; .byte len ; <len bytes>
+;     and pushes the address of the inline counted string.
+proc(do_clit)
+    mov     r9, [rsp]                       ; r9 = addr of count byte
+    movzx   r10, byte ptr [r9]              ; r10 = len
+    lea     rcx, [r9 + r10 + 1]             ; rcx = resume ip
+    mov     [rsp], rcx
+    mov     [DSP - cell], TOS               ; old TOS -> NOS
+    mov     TOS, r9                         ; counted string addr
+    stk(0, 1)
+    next()
+endp()
+
 ; compile  ( xt -- )
 ;     WF32-style compile token for ordinary words: duplicate xt, map the
 ;     duplicate to its comp-field address, then dispatch that helper while
@@ -823,6 +837,23 @@ proc(dot_quote_word)
     next()
 endp()
 
+; c"  ( "ccc<quote>" -- c-addr )                           IMMEDIATE
+;     Interpret: parse to closing " and leave a transient counted string.
+;     Compile: emit call do_clit ; .byte len ; <len bytes> and leave the
+;       counted string address at runtime.
+proc(c_quote_word)
+    call    skip_optional_source_blank
+    mov     [DSP - cell], TOS
+    mov     TOS, 34
+    stk(0, 1)
+    call    word_word                        ; ( -- c-addr ) counted string
+    cmp     qword ptr [UP + user_STATE], 0
+    je      .done
+    call    cliteral
+.done:
+    next()
+endp()
+
 ; abort"  ( "ccc<quote>" -- )                            IMMEDIATE
 ;     Compile: IF <inline-string> TYPE throw_abortq THROW THEN
 ;     The IF/THEN control-flow mark lives on the data stack during
@@ -1413,6 +1444,37 @@ proc(sliteral)
     mov     [UP + user_HERE], rdi
     mov     TOS, [DSP + cell]
     add     DSP, 2*cell
+    next()
+endp()
+
+; cliteral  ( c-addr -- )              [compile-time only, not in dict]
+;     Compile call do_clit ; .byte len ; <len bytes> at HERE.
+proc(cliteral)
+    mov     rsi, TOS                         ; counted-string addr
+    movzx   rcx, byte ptr [rsi]              ; len (truncated to 255 by WORD)
+    lea     rsi, [rsi + 1]                   ; source bytes
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8], 0xE8
+    lea     r9, [rip + do_clit]
+    sub     r9, r8
+    sub     r9, 5
+    mov     dword ptr [r8 + 1], r9d
+    mov     byte ptr [r8 + 5], cl
+    lea     rdi, [r8 + 6]
+    xor     r10, r10
+.copy_loop:
+    cmp     r10, rcx
+    jae     .copied
+    mov     al, byte ptr [rsi + r10]
+    mov     byte ptr [rdi + r10], al
+    inc     r10
+    jmp     .copy_loop
+
+.copied:
+    add     rdi, rcx
+    mov     [UP + user_HERE], rdi
+    mov     TOS, [DSP]
+    add     DSP, cell
     next()
 endp()
 
