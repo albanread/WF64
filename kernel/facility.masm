@@ -182,11 +182,14 @@ endp()
     mov     byte ptr [rdi], 0
 @endmacro
 
-; Translate r15 (small fam: 1=r/o, 2=w/o, 3=r/w; BIN bit ignored) to a
+; Translate r14 (small fam: 1=r/o, 2=w/o, 3=r/w; BIN bit ignored) to a
 ; Win32 access mask in r13.  On invalid fam, jumps to .open_fail_inv in
 ; the calling proc (via the .^ outer-scope label sigil).
+;
+; R15 is reserved as the locals-stack pointer (LP) and must not be
+; touched by primitives; we use r14 instead.
 @macro fam_to_access()
-    mov     rax, r15
+    mov     rax, r14
     and     eax, 7
     cmp     eax, 1
     je      .fma_ro
@@ -228,7 +231,7 @@ endp()
 
 ; open-file  ( c-addr u fam -- fileid ior )
 proc(open_file_word)
-    mov     r15, TOS
+    mov     r14, TOS
     mov     rsi, [DSP + cell]
     mov     rcx, [DSP]
     path_to_pad()
@@ -252,7 +255,7 @@ endp()
 
 ; create-file  ( c-addr u fam -- fileid ior )
 proc(create_file_word)
-    mov     r15, TOS
+    mov     r14, TOS
     mov     rsi, [DSP + cell]
     mov     rcx, [DSP]
     path_to_pad()
@@ -289,31 +292,30 @@ endp()
 
 ; read-file  ( c-addr u1 fileid -- u2 ior )
 ;     Reads up to u1 bytes; returns u2 = actually read, ior = error code.
+;     R13 holds the fileid across the Win64 call (callee-saved).  We
+;     read c-addr from [DSP+cell] and u1 from [DSP] directly when
+;     building the call args — staging them in R14/R15 isn't needed
+;     and would burn registers reserved for the locals-stack pointer.
 proc(read_file_word)
-    mov     r13, TOS                            ; fileid
-    mov     r14, [DSP]                           ; u1
-    mov     r15, [DSP + cell]                    ; c-addr
-
-    ; Use PAD+cell as scratch for the bytesRead DWORD.
+    mov     r13, TOS                            ; save fileid
     lea     rdi, [UP + user_PAD]
-    mov     qword ptr [rdi], 0                  ; zero whole qword first
+    mov     qword ptr [rdi], 0                  ; zero bytesRead output
 
     mov     r12, rsp
     and     rsp, -16
     sub     rsp, 48
     mov     rcx, r13                             ; handle
-    mov     rdx, r15                             ; buffer
-    mov     r8,  r14                             ; bytes to read
-    lea     r9,  [UP + user_PAD]                 ; &bytesRead
-    mov     qword ptr [rsp + 32], 0              ; lpOverlapped = NULL
+    mov     rdx, [DSP + cell]                    ; buffer (c-addr) — read from memory
+    mov     r8,  [DSP]                           ; bytes to read (u1)
+    lea     r9,  [UP + user_PAD]
+    mov     qword ptr [rsp + 32], 0
     call    ReadFile
     mov     rsp, r12
 
     test    rax, rax
     jz      .read_fail
 
-    ; Success: ( c-addr u1 fileid -- u2 0 )
-    mov     rax, [UP + user_PAD]                 ; bytesRead (DWORD in low 32 bits)
+    mov     rax, [UP + user_PAD]                 ; bytesRead
     mov     [DSP + cell], rax                    ; new NOS = u2
     xor     TOS, TOS
     stk(3, 2)
@@ -328,10 +330,7 @@ endp()
 
 ; write-file  ( c-addr u fileid -- ior )
 proc(write_file_word)
-    mov     r13, TOS                            ; fileid
-    mov     r14, [DSP]                           ; u
-    mov     r15, [DSP + cell]                    ; c-addr
-
+    mov     r13, TOS                            ; save fileid
     lea     rdi, [UP + user_PAD]
     mov     qword ptr [rdi], 0
 
@@ -339,8 +338,8 @@ proc(write_file_word)
     and     rsp, -16
     sub     rsp, 48
     mov     rcx, r13
-    mov     rdx, r15
-    mov     r8,  r14
+    mov     rdx, [DSP + cell]                    ; buffer
+    mov     r8,  [DSP]                            ; u
     lea     r9,  [UP + user_PAD]
     mov     qword ptr [rsp + 32], 0
     call    WriteFile
@@ -446,10 +445,11 @@ endp()
 
 ; write-line  ( c-addr u fileid -- ior )
 ;     Write the buffer followed by a CR/LF terminator.
+;     R13 carries the fileid across both Win64 calls (callee-saved).
+;     The data-stack memory still holds c-addr/u while we're in this
+;     proc — we read them directly instead of staging in R14/R15.
 proc(write_line_word)
-    mov     r13, TOS                            ; fileid
-    mov     r14, [DSP]                           ; u
-    mov     r15, [DSP + cell]                    ; c-addr
+    mov     r13, TOS                            ; save fileid
     mov     qword ptr [UP + user_PAD], 0
 
     ; First WriteFile: the data buffer.
@@ -457,8 +457,8 @@ proc(write_line_word)
     and     rsp, -16
     sub     rsp, 48
     mov     rcx, r13
-    mov     rdx, r15
-    mov     r8,  r14
+    mov     rdx, [DSP + cell]                    ; buffer
+    mov     r8,  [DSP]                            ; u
     lea     r9,  [UP + user_PAD]
     mov     qword ptr [rsp + 32], 0
     call    WriteFile
@@ -466,8 +466,7 @@ proc(write_line_word)
     test    rax, rax
     jz      .wl_fail
 
-    ; Second WriteFile: CRLF stored at PAD+16 (well clear of the
-    ; bytesWritten DWORD at PAD+0).
+    ; Second WriteFile: CRLF at PAD+16.
     mov     byte ptr [UP + user_PAD + 16], 13
     mov     byte ptr [UP + user_PAD + 17], 10
     mov     r12, rsp
@@ -509,30 +508,30 @@ endp()
 ;     Rename (or move) from name1 to name2.  Paths clamped to 127 bytes
 ;     each; PAD is split into [0..127] for the source and [128..255]
 ;     for the destination.
+;
+;     Reads args directly from data-stack memory — no register staging
+;     needed since both copies are done before any Win64 call clobbers
+;     the volatile registers, and the data stack memory persists until
+;     stk(4, 1) at the bottom of the proc.
 proc(rename_file_word)
-    mov     r14, TOS                              ; u2
-    mov     r15, [DSP]                             ; c-addr2
-    mov     r13, [DSP + cell]                      ; u1
-    mov     r12, [DSP + 2*cell]                    ; c-addr1
-
-    ; Copy old name to PAD[0..127].
-    cmp     r13, 127
+    ; Copy old name (c-addr1, u1) to PAD[0..127].
+    mov     rcx, [DSP + cell]                       ; u1
+    cmp     rcx, 127
     jbe     .old_ok
-    mov     r13, 127
+    mov     rcx, 127
 .old_ok:
-    mov     rsi, r12
-    mov     rcx, r13
+    mov     rsi, [DSP + 2*cell]                     ; c-addr1
     lea     rdi, [UP + user_PAD]
     rep     movsb
     mov     byte ptr [rdi], 0
 
-    ; Copy new name to PAD[128..255].
-    cmp     r14, 127
+    ; Copy new name (c-addr2, u2) to PAD[128..255].
+    mov     rcx, TOS                                ; u2
+    cmp     rcx, 127
     jbe     .new_ok
-    mov     r14, 127
+    mov     rcx, 127
 .new_ok:
-    mov     rsi, r15
-    mov     rcx, r14
+    mov     rsi, [DSP]                              ; c-addr2
     lea     rdi, [UP + user_PAD + 128]
     rep     movsb
     mov     byte ptr [rdi], 0

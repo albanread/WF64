@@ -63,7 +63,7 @@ endp()
 ;     rt_forth_brk, then fires INT 3 so a native debugger can also catch
 ;     it. The VEH handler resumes execution after INT 3.
 proc(brk_word)
-    mov     r15, TOS                        ; save TOS (callee-saved, survives the call)
+    mov     r14, TOS                        ; save TOS (r14 callee-saved; r15 reserved for LP)
     ; ── Call rt_forth_brk(tos, dsp, sp0, rsp, up) ─────────────────
     ; Win64 5-arg convention: rcx/rdx/r8/r9 for args 1-4; arg5 at
     ; [rsp+32] after the shadow-space allocation.  We allocate
@@ -81,12 +81,12 @@ proc(brk_word)
     mov     rsp, r12
     ; ── Fire INT 3 for native debugger ──────────────────────────────
     int 3
-    mov     TOS, r15                        ; restore TOS
+    mov     TOS, r14                        ; restore TOS
     next()
 endp()
 
 proc(int3_word)
-    mov     r15, TOS
+    mov     r14, TOS
     mov     rcx, TOS
     mov     rdx, DSP
     mov     r8,  [UP + user_SP0]
@@ -98,7 +98,7 @@ proc(int3_word)
     call    rt_forth_brk
     mov     rsp, r12
     int 3
-    mov     TOS, r15
+    mov     TOS, r14
     next()
 endp()
 

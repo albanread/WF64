@@ -23,13 +23,13 @@ endp()
 ;     Print the current stack without consuming it.
 ;     Format for now: "[depth sp=... rp=...] tos nos ... " or "[empty ...]".
 proc(dot_s)
-    mov     r15, TOS
-    mov     rcx, r15
+    mov     r14, TOS              ; save TOS (r14 is callee-saved; r15 is reserved for LP)
+    mov     rcx, r14
     mov     rdx, DSP
     mov     r8, [UP + user_SP0]
     mov     r9, rsp
     win64_call(rt_dot_s)
-    mov     TOS, r15
+    mov     TOS, r14
     next()
 endp()
 

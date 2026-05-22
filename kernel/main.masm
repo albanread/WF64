@@ -87,7 +87,10 @@ proc(forth_main)
     push    r12
     push    r13
     push    r14
-    push    r15
+    push    r15                              ; preserved for the Rust caller
+                                              ; (R15 is reserved as the locals
+                                              ; stack pointer LP inside Forth;
+                                              ; primitives must not scribble on it)
 
     ; Install Forth registers.
     mov     UP,  r9

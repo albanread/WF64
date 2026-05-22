@@ -204,7 +204,8 @@ cargo run --bin port-wf32 -- '+'             # optional legacy translator helper
 | RSP | **return stack** — also the CPU call/ret stack (STC) |
 | R12 | **RSP-save slot** for Win64 callouts (callee-saved; do NOT use R11) |
 | RCX, RDX, RSI, RDI, R8–R11 | scratch — don't expect them to survive a `call` |
-| R13, R14, R15 | reserved for future use; treat as callee-saved |
+| R13, R14 | available callee-saved scratch (used by some primitives to carry args across Win64 calls) |
+| **R15** | **reserved for the locals stack pointer (LP).** No primitive may use it as scratch. `forth_main`'s prologue pushes it for the Rust caller; eventually it will be initialised from `user_LP0`. |
 
 `@assign cell = 8`. NOS = `[DSP]`, NNOS = `[DSP + cell]`. A cell push is `mov [DSP - cell], TOS ; mov TOS, <new> ; sub DSP, cell` (or let `stk` emit the `sub`).
 
