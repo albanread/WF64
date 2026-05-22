@@ -530,13 +530,19 @@ fn eval_dot_quote_compiles_runtime_output() {
 }
 
 #[test]
-fn eval_s_quote_and_dot_quote_are_compile_only() {
+fn eval_dot_quote_works_in_interpret_mode() {
+    // Extended: ." prints in both interpret and compile state.
     let mut s = sess();
-    let err = s.eval("s\" HI\"\n").unwrap_err().to_string();
-    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+    let out = s.eval(".\" HI\" cr\nbye\n").unwrap();
+    assert_eq!(out, "HI\n ok\n");
+}
 
-    let err = s.eval(".\" HI\"\n").unwrap_err().to_string();
-    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+#[test]
+fn eval_s_quote_works_in_interpret_mode() {
+    // ANS Forth: s" is valid in both interpret and compile state.
+    let mut s = sess();
+    let out = s.eval("s\" HI\" type cr\nbye\n").unwrap();
+    assert_eq!(out, "HI\n ok\n");
 }
 
 #[test]
@@ -562,6 +568,15 @@ fn eval_source_id_tracks_repl_and_evaluate_input() {
         .eval("source-id .\n: source-id-from-eval s\" source-id\" evaluate ;\nsource-id-from-eval .\nsource-id .\nbye\n")
         .unwrap();
     assert_eq!(out, "0  ok\n ok\n-1  ok\n0  ok\n");
+}
+
+#[test]
+fn eval_restore_input_does_not_reparse_own_token() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval("save-input restore-input 0= .\nbye\n").unwrap();
+    assert_eq!(out, "-1  ok\n");
 }
 
 #[test]
@@ -684,6 +699,13 @@ fn eval_backslash_comment_ignores_rest_of_line() {
     let mut s = sess();
     let out = s.eval("1 \\ keep this out of the token stream\n2 + .\nbye\n").unwrap();
     assert_eq!(out, " ok\n3  ok\n");
+}
+
+#[test]
+fn eval_backslash_prefixed_token_is_not_a_comment() {
+    let mut s = sess();
+    let out = s.eval("\\foo 123 .\nbye\n").unwrap();
+    assert_eq!(out, "? 123  ok\n");
 }
 
 #[test]
@@ -899,6 +921,37 @@ fn load_source_file_provides_case_words() {
         )
         .unwrap();
     assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n111  ok\n222  ok\n999  ok\n");
+}
+
+#[test]
+fn load_source_file_include_loads_file() {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let fs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("include_test.fs");
+    let include_cmd = format!("include {}\n4 double .\nbye\n", fs_path.display());
+    let out = s.eval(&include_cmd).unwrap();
+    assert_eq!(out, " ok\n8  ok\n");
+}
+
+#[test]
+fn m7_ans_core_tests_pass() {
+    let mut s = sess();
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    s.load_source_file(&manifest.join("lib").join("core.f")).unwrap();
+    s.load_source_file(&manifest.join("lib").join("tester.fs")).unwrap();
+    s.load_source_file(&manifest.join("lib").join("ans_core_tests.fs")).unwrap();
+    let out = s.eval("bye\n").unwrap();
+    // Tally is printed by the test file; we just need it to be reachable.
+    // Any INCORRECT RESULT or WRONG NUMBER OF RESULTS lines mean failure.
+    assert!(
+        !out.contains("INCORRECT RESULT"),
+        "ANS core test failures:\n{out}"
+    );
+    assert!(
+        !out.contains("WRONG NUMBER OF RESULTS"),
+        "ANS core test failures:\n{out}"
+    );
 }
 
 #[test]

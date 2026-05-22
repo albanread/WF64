@@ -65,6 +65,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("nip",        "nip_",       0),
     ("tuck",       "tuck_",      0),
     ("pick",       "pick",       0),
+    ("roll",       "roll_",      0),
     ("depth",      "depth",      0),
     // Return-stack ops (WF32 gkernel32.fs:197-273)
     ("dup>r",      "dup_to_r",   0),
@@ -383,6 +384,12 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("abort\"",   "abort_quote_word", 1),
     ("postpone",   "postpone_word", 1),
     ("does>",      "does_word",   1),
+    ("compile,",   "compile_comma", 0),
+    // File include runtime helpers (M6)
+    ("rt-slurp-file", "rt_slurp_file_word", 0),
+    ("rt-slurp-len",  "rt_slurp_len_word",  0),
+    ("rt-slurp-pop",  "rt_slurp_pop_word",  0),
+    (":noname",    "noname_word", 0),
     (":",          "colon",      0),
     ("create",     "create_word", 0),
     ("exit",       "exit_word",   1),
@@ -442,6 +449,7 @@ const USER_STATE_VAR:    u64 = 0x08;
 const USER_LATEST_VAR:   u64 = 0x10;
 const USER_HERE_VAR:     u64 = 0x18;
 const USER_DICT_END_VAR: u64 = 0x20;
+const USER_PARSE_BARRIER:u64 = 0x48;
 const USER_BYE_REQ:      u64 = 0x50;
 const USER_DSP_SAVE:     u64 = 0x60;
 const USER_SP0:          u64 = 0x68;
@@ -745,6 +753,9 @@ impl Wf64Session {
                 "rt_to_float"    => Some(runtime::rt_to_float    as *mut c_void),
                 "rt_forth_brk"   => Some(runtime::rt_forth_brk   as *mut c_void),
                 "rt_forth_trace" => Some(runtime::rt_forth_trace  as *mut c_void),
+                "rt_slurp_file"  => Some(runtime::rt_slurp_file   as *mut c_void),
+                "rt_slurp_len"   => Some(runtime::rt_slurp_len    as *mut c_void),
+                "rt_slurp_pop"   => Some(runtime::rt_slurp_pop    as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;
@@ -770,6 +781,7 @@ impl Wf64Session {
             write_u64(up, USER_LATEST_VAR,   0);                 // empty
             write_u64(up, USER_HERE_VAR,     dict_base);
             write_u64(up, USER_DICT_END_VAR, debug_meta_base);
+            write_u64(up, USER_PARSE_BARRIER, 0);
             write_u64(up, USER_BYE_REQ,      0);
             write_u64(up, USER_SP0,          dsp_top);
             write_u64(up, USER_RSP_CURRENT,  rsp_top);
@@ -1140,6 +1152,7 @@ impl Wf64Session {
         self.write_user_u64(USER_HERE_VAR,     self.boot_here);
         self.write_user_u64(USER_LATEST_VAR,   self.boot_latest);
         self.write_user_u64(USER_STATE_VAR,    0);
+        self.write_user_u64(USER_PARSE_BARRIER, 0);
         self.write_user_u64(USER_BYE_REQ,      0);
         self.write_user_u64(USER_RSP_CURRENT,  self.rsp_top);
         self.write_user_u64(USER_DSP_SAVE,     self.dsp_top);

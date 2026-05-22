@@ -458,6 +458,56 @@ pub extern "C" fn rt_to_float(addr: u64, len: u64, out_bits: u64) -> u64 {
     u64::MAX
 }
 
+// ── File include support ──────────────────────────────────────────────
+//
+// `included` ( c-addr u -- ) reads a Forth source file and evaluates it.
+// We implement this without re-entering the JIT by reading the file into
+// a Rust-owned Vec and exposing its address+len to Forth, which then calls
+// the existing `evaluate` word. A stack allows nested includes: each call
+// to `rt_slurp_file` pushes a new Vec; `rt_slurp_pop` releases the top.
+
+thread_local! {
+    static SLURP_STACK: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+}
+
+/// Read file at path (c-addr u) into a Rust-owned Vec, push it onto
+/// SLURP_STACK, and return a pointer to the content (stable until
+/// `rt_slurp_pop` is called). Returns 0 on any error (file not found,
+/// UTF-8 etc.).
+#[no_mangle]
+pub extern "C" fn rt_slurp_file(path_addr: u64, path_len: u64) -> u64 {
+    let path_bytes =
+        unsafe { std::slice::from_raw_parts(path_addr as *const u8, path_len as usize) };
+    let Ok(path_str) = std::str::from_utf8(path_bytes) else {
+        return 0;
+    };
+    match std::fs::read(path_str.trim()) {
+        Ok(bytes) => SLURP_STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            stack.push(bytes);
+            stack.last().map(|v| v.as_ptr() as u64).unwrap_or(0)
+        }),
+        Err(_) => 0,
+    }
+}
+
+/// Return the byte length of the top slurped file (0 if stack is empty).
+#[no_mangle]
+pub extern "C" fn rt_slurp_len() -> u64 {
+    SLURP_STACK.with(|s| {
+        s.borrow().last().map(|v| v.len() as u64).unwrap_or(0)
+    })
+}
+
+/// Pop (and free) the top slurped file from the stack.
+#[no_mangle]
+pub extern "C" fn rt_slurp_pop() -> u64 {
+    SLURP_STACK.with(|s| {
+        s.borrow_mut().pop();
+        0
+    })
+}
+
 /// Write to current output. Buffered: append to vec. Live: stdout + flush.
 fn write_bytes(bytes: &[u8]) {
     with_current_io(|io| match io {
