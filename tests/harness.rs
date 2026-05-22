@@ -2275,11 +2275,18 @@ fn code_dsl_compiled_into_colon_definition() {
     assert_eq!(out, " ok\n ok\n25  ok\n");
 }
 
-// Note: bad asm syntax inside a CODE: body currently aborts the
-// process because LLVM-MC's parser uses its fatal-error handler when
-// it sees an invalid mnemonic.  Graceful recovery requires an
-// LLVM diagnostic-handler install in wfasm — TODO.  For now,
-// just don't write invalid asm.
+#[test]
+fn code_dsl_invalid_asm_reports_throw() {
+    // Bad mnemonics inside a CODE: body used to abort the test process
+    // (LLVM-MC's default error handling).  With wfasm's diagnostic
+    // handler installed, MC parse errors flow back through JitError::Llvm
+    // and surface as a Forth THROW.
+    let mut s = sess();
+    let err = s.eval("CODE: bad  wibblywobbly ;CODE\nbye\n").unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2057") || msg.contains("THROW"),
+        "expected -2057 throw, got: {msg}");
+}
 
 #[test]
 fn code_dsl_unterminated_body_reports_error() {

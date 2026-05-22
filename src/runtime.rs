@@ -840,9 +840,7 @@ unsafe fn try_compile_code(up: u64) -> Result<u64, String> {
         let current_tail_str = std::str::from_utf8(current_tail)
             .map_err(|_| "CODE: source is not UTF-8".to_string())?;
         let (extra, n_from_buf) = peek_until_code_terminator()
-            .ok_or_else(|| "no closing ';CODE' token found \
-                (in interactive REPL the body must be on one line; \
-                 multi-line CODE: is only supported via the buffered input modes)".to_string())?;
+            .ok_or_else(|| "no closing ';CODE' token found before EOF".to_string())?;
         // Combine: current line tail + newline + extra
         body_string = format!("{current_tail_str}\n{extra}");
         consumed_in_current = current_tail.len();
@@ -893,25 +891,70 @@ unsafe fn try_compile_code(up: u64) -> Result<u64, String> {
     Ok(fn_addr)
 }
 
-/// Peek into the current session's Io::Buffered input past `in_cursor`,
+/// Peek into the current session's input past the kernel's `TO_IN`,
 /// scanning for `;CODE`.  Returns (body_bytes_before_terminator,
-/// total_bytes_consumed_including_terminator_and_its_trailing_newline).
-/// Returns None if no terminator is found, or if Io is Live (we can't
-/// pre-read live stdin without losing the byte if the user types it).
+/// bytes_consumed_from_buffered_input).
+///
+/// * Buffered mode: scans `input[in_cursor..]`, returns the consumed
+///   byte count so the caller can advance `in_cursor`.
+/// * Live mode: reads lines from stdin via `BufRead::read_line` until
+///   it sees `;CODE`.  Stdin has been advanced past those lines as a
+///   side effect, so the kernel's next refill picks up after `;CODE`.
+///   `consumed` is irrelevant in this mode — returned as 0.
+///
+/// Returns None on EOF or read error.
 fn peek_until_code_terminator() -> Option<(String, usize)> {
-    CURRENT_IO.with(|cell| {
-        let borrow = cell.borrow();
-        let io = borrow.as_ref()?;
-        match io {
-            Io::Buffered { input, in_cursor, .. } => {
+    // First snapshot: is the current Io Buffered or Live?  We can't
+    // hold the borrow across stdin reads (would deadlock on Live mode's
+    // re-entry into with_current_io somewhere downstream), so check
+    // first, release, then act.
+    let mode = CURRENT_IO.with(|cell| {
+        cell.borrow().as_ref().map(|io| matches!(io, Io::Buffered { .. }))
+    })?;
+
+    if mode {
+        // Buffered: scan the input vec directly.
+        CURRENT_IO.with(|cell| {
+            let borrow = cell.borrow();
+            let io = borrow.as_ref()?;
+            if let Io::Buffered { input, in_cursor, .. } = io {
                 let rest = &input[*in_cursor..];
                 let (body, consumed) = find_code_terminator(rest)?;
                 let body_str = std::str::from_utf8(body).ok()?.to_string();
                 Some((body_str, consumed))
+            } else {
+                None
             }
-            Io::Live { .. } => None,
+        })
+    } else {
+        // Live: read lines from stdin until we see ;CODE.  Each
+        // BufRead::read_line consumes from stdin, so the kernel's
+        // next refill picks up after our last consumed line.
+        use std::io::{self, BufRead};
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        let mut accumulator = String::new();
+        loop {
+            let mut line = String::new();
+            match handle.read_line(&mut line) {
+                Ok(0) => return None,             // EOF
+                Err(_) => return None,
+                Ok(_) => {
+                    // Normalise line endings.
+                    while line.ends_with('\n') || line.ends_with('\r') {
+                        line.pop();
+                    }
+                    if let Some((body, _)) = find_code_terminator(line.as_bytes()) {
+                        let body_str = std::str::from_utf8(body).ok()?;
+                        accumulator.push_str(body_str);
+                        return Some((accumulator, 0));
+                    }
+                    accumulator.push_str(&line);
+                    accumulator.push('\n');
+                }
+            }
         }
-    })
+    }
 }
 
 /// Advance the Io::Buffered in_cursor by `n` bytes. Only meaningful in
