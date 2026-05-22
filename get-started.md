@@ -178,7 +178,7 @@ When you encounter an oddity or bug, fix it in WF64 and document the local reaso
 ```powershell
 cd E:\WF64
 cargo build
-cargo test                                   # 44 tests + ~96 data-driven primitive tests, 0.02s
+cargo test                                   # currently 219 tests total (27 unit + 192 harness)
 cargo test --test harness -- --nocapture     # show PASS / FAIL / NYIMP summary
 cargo run                                    # interactive REPL — type `2 3 + . bye`
 cargo run --bin port-wf32 -- '+'             # optional legacy translator helper
@@ -190,7 +190,7 @@ cargo run --bin port-wf32 -- '+'             # optional legacy translator helper
 - `WF64_BOOT_INFO=1 cargo run` — print region base / HERE / LATEST on boot.
 - `WF32_KERNEL=<path>` — override the legacy translator input path.
 
-**Sub-second iteration discipline.** Tests share one `Wf64Session` (rebuilding the session was the bottleneck). `cargo test` rebuild + link on Windows is ~10s; actual test execution is ~0.02s for the whole suite. If something feels slow, suspect the Rust linker, not the kernel.
+**Sub-second iteration discipline.** Harness tests share one `Wf64Session` (rebuilding the session was the bottleneck). Once the crate is already built, the full `cargo test` run is still sub-second in practice; rebuild time is dominated by Rust compile/link work rather than by kernel execution.
 
 ---
 
@@ -220,17 +220,11 @@ cargo run --bin port-wf32 -- '+'             # optional legacy translator helper
 | M2 | `2 3 + .` prints `5` | ✅ |
 | M3 | Tokenised REPL with `accept` / `parse-name` / `find-name` / `execute` / `quit` | ✅ |
 | M4 | Colon-definition compiler (`:` … `;`) | ✅ |
-| M5 | Control flow (`IF`/`THEN`/`BEGIN`/`UNTIL`/`DO`/`LOOP`) | next |
-| M6 | File loading (`INCLUDE`) | |
-| M7 | ANS Forth core test suite passes | |
+| M5 | Control flow (`IF`/`THEN`/`BEGIN`/`UNTIL`/`DO`/`LOOP`) | ✅ |
+| M6 | File loading (`INCLUDE`) | ✅ |
+| M7 | ANS Forth core test suite passes | ✅ |
 
-**Primitive coverage:** live queue (NYIMP list) visible via `cargo test --test harness -- --nocapture`. Categories outstanding:
-
-1. Control-flow primitives — `bra`, `?bra`, `-?bra`, `bra-?do`, `do-part1/2`, `_loop`, `_+loop`, `_-loop`, `i`, `j`, `n>r`, `nr>` (M5 prerequisite — testable only via compiled bodies)
-2. Exception machinery — broader THROW/reporting layer beyond the current minimal `catch` / `throw`, `abort`, `?throw`, named throw-code words, and `(comp-only)`
-3. Remaining string ops — `place`, `+place`, `c+place`, `tr`, `s-reverse`, plus the upcase table (`ucasetab`) and the deferred `istr=` that depends on it
-4. Number parsing — `digit`, `>number`, `parse-name` extensions
-5. Miscellaneous — `un-link`, `(exec-val)`, `dovoc`, `imp-resolve`, `imp-call`, `init-k32`, broader exception/context plumbing
+**`cargo test` is green: 219 tests total (27 Rust unit tests + 192 harness tests).**
 
 ---
 

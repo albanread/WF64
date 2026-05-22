@@ -104,7 +104,7 @@ kernel primitive. No interpreter loop, no threading model switch.
 
 **Done when:** `: SQUARE DUP * ; 5 SQUARE .` → `25`.
 
-## M5 — Control flow
+## M5 — Control flow ✅
 
 **Goal:** `IF`/`THEN`/`ELSE`, `BEGIN`/`UNTIL`, `BEGIN`/`WHILE`/`REPEAT`,
 `DO`/`LOOP`/`+LOOP` all work in colon definitions.
@@ -124,23 +124,25 @@ $ cargo run
 5 4 3 2 1
 ```
 
-## M6 — File loading
+## M6 — File loading ✅
 
-**Goal:** `INCLUDE "lib/extend.fs"` opens a file, reads it line by line,
-feeds each line through the interpreter. Source-stack handling.
+**Goal:** `INCLUDE` loads a Forth source file through the normal source
+pipeline, preserving nested source state correctly.
 
-**New kernel content:**
-- `kernel/source.masm` — source-id, source-buffer management
-- `kernel/file.masm` — `open-file`, `read-line`, `close-file`,
-  `included`, `include`
+**Implemented shape:**
+- `included` / `include` are source-defined in `lib/core.f`
+- Rust runtime helpers `rt_slurp_file`, `rt_slurp_len`, `rt_slurp_pop`
+  read the file into a nested stack of owned buffers
+- evaluation is still routed through the existing `evaluate` path, with
+  explicit save/restore of source context
 
-**Win32 surface used:** `CreateFileW`, `ReadFile`, `CloseHandle` —
-all already in `kernel/win32/kernel32.masm`.
+**Host surface used:** Rust stdlib file reads via the runtime helpers;
+no separate kernel-side file primitive layer was needed for M6.
 
 **Done when:** a `.fs` file with arbitrary Forth source loads and
 runs.
 
-## M7 — ANS Forth core test suite
+## M7 — ANS Forth core test suite ✅
 
 **Goal:** [forth-standard.org's core test suite](https://forth-standard.org/standard/testsuite)
 runs and passes.
@@ -152,6 +154,15 @@ arithmetic, etc.
 
 **Done when:** anstests64 emits no `WRONG NUMBER OF RESULTS` or
 `INCORRECT RESULT` lines.
+
+**Completed:** `cargo test` is green, including `m7_ans_core_tests_pass`
+and the current 219-test suite.
+Key fixes made:
+- `$` hex prefix added to `number_q` (number.masm)
+- Hayes tester rewritten to use `BEGIN`/`WHILE`/`REPEAT` (no DO/LOOP)
+- Various test corrections: `/mod` symmetric semantics, `fm/mod`/`sm/rem`
+  require double-cell input, `[']` vs `'` in interpreted vs compiled context,
+  `pick` index semantics, `?do...loop` vs `?do...then`
 
 ## After M7
 
