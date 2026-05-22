@@ -151,6 +151,39 @@ proc(rdtsc_word)
     next()
 endp()
 
+; ── File include runtime helpers ──────────────────────────────────────────
+
+; rt-slurp-file  ( c-addr u -- ptr )
+;     Read file at path (c-addr u) into a Rust-owned Vec and push it onto
+;     the slurp stack. Return the content pointer, or 0 on error.
+proc(rt_slurp_file_word)
+    mov     rcx, [DSP]               ; arg1 = path addr
+    mov     rdx, TOS                 ; arg2 = path len
+    win64_call(rt_slurp_file)
+    ; rax = content ptr or 0
+    stk(2, 1)
+    next()
+endp()
+
+; rt-slurp-len  ( -- u )
+;     Return the byte length of the top slurped file, or 0 if empty.
+proc(rt_slurp_len_word)
+    mov     [DSP - cell], TOS
+    win64_call(rt_slurp_len)
+    ; rax = len
+    stk(0, 1)
+    next()
+endp()
+
+; rt-slurp-pop  ( -- )
+;     Pop and free the top slurped file from the stack.
+proc(rt_slurp_pop_word)
+    mov     [DSP - cell], TOS        ; spill TOS across the Win64 call
+    win64_call(rt_slurp_pop)
+    mov     TOS, [DSP - cell]        ; restore TOS (rax was clobbered)
+    next()
+endp()
+
 ; bye  ( -- )
 ;     Request termination. Cooperative: writes 1 into user_BYE_REQ;
 ;     quit's dispatch loop checks the flag at the top of every line

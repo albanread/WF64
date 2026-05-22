@@ -53,6 +53,7 @@
 @assign user_SOURCE_ADDR = 0x30      ; pointer to source text
 @assign user_SOURCE_LEN  = 0x38      ; length of source text
 @assign user_TO_IN       = 0x40      ; current parse offset (>IN)
+@assign user_PARSE_BARRIER = 0x48    ; one-shot minimum >IN after restore-input
 @assign user_BYE_REQ     = 0x50      ; `bye` writes 1 here; quit checks it cooperatively
 @assign user_HOST_RSP    = 0x58      ; forth_main stashes host's RSP here on entry
 @assign user_DSP_SAVE    = 0x60      ; forth_main writes final logical_dsp here on exit

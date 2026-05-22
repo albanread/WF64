@@ -17,3 +17,6 @@
 @extern rt_to_float(3)          ; parse addr+len as decimal float, store bits, return flag
 @extern rt_forth_brk(5)         ; Forth-tuned breakpoint dump: tos, dsp, sp0, rsp, up
 @extern rt_forth_trace(4)       ; per-word trace: nt, tos, dsp, sp0
+@extern rt_slurp_file(2)        ; read file at (addr,len) into Rust Vec, return content ptr or 0
+@extern rt_slurp_len(0)         ; return byte length of top slurped file
+@extern rt_slurp_pop(0)         ; pop and free the top slurped file

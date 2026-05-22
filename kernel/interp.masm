@@ -116,7 +116,7 @@ proc(interpret_source)
     mov     TOS, rdx
     sub     DSP, cell
     call    rcx
-    jmp     .tokens
+    jmp     .after_word
 
 .compile_exec_empty:
     ; Immediate words use ct = execute. When the logical data stack is
@@ -128,7 +128,7 @@ proc(interpret_source)
 .compile_exec_ready:
     mov     TOS, rdx
     call    rcx
-    jmp     .tokens
+    jmp     .after_word
 
 .exec_xt:
     ; ── Empty-stack guard ─────────────────────────────────────────────
@@ -158,7 +158,7 @@ proc(interpret_source)
     mov     TOS, rdx
     sub     DSP, cell                       ; commit spilled NOS
     call    execute
-    jmp     .tokens
+    jmp     .after_word
 .trace_empty:
     ; Stack is empty — don't create a fake NOS cell.
     cmp     DSP, [UP + user_SP0]
@@ -173,7 +173,7 @@ proc(interpret_source)
     pop     rdx                             ; restore xt
     mov     TOS, rdx                        ; TOS = xt; DSP stays at SP0
     call    execute
-    jmp     .tokens
+    jmp     .after_word
 .do_exec:
     test    r13d, r13d
     jz      .exec_empty
@@ -181,7 +181,7 @@ proc(interpret_source)
     mov     TOS, rdx
     sub     DSP, cell
     call    execute
-    jmp     .tokens
+    jmp     .after_word
 .exec_empty:
     cmp     DSP, [UP + user_SP0]
     ja      .exec_empty_ready
@@ -189,6 +189,17 @@ proc(interpret_source)
 .exec_empty_ready:
     mov     TOS, rdx                        ; TOS = xt; DSP stays at SP0
     call    execute
+    jmp     .after_word
+
+.after_word:
+    mov     r8, [UP + user_PARSE_BARRIER]
+    test    r8, r8
+    jz      .tokens
+    cmp     [UP + user_TO_IN], r8
+    jae     .clear_parse_barrier
+    mov     [UP + user_TO_IN], r8
+.clear_parse_barrier:
+    mov     qword ptr [UP + user_PARSE_BARRIER], 0
     jmp     .tokens
 
 .got_number:

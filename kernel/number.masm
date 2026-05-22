@@ -134,12 +134,22 @@ proc(number_q)
     ; Optional leading minus.
     movzx   rax, byte ptr [rsi]
     cmp     al, '-'
-    jne     .digits
+    jne     .check_dollar
     mov     r9, 1
     add     rsi, 1
     sub     rcx, 1
     ; "-" by itself is not a number.
     jz      .invalid
+
+    ; Optional $ prefix (forces hex base, may follow -).
+.check_dollar:
+    movzx   rax, byte ptr [rsi]
+    cmp     al, '$'
+    jne     .digits
+    mov     rdi, 16             ; force hex for this literal
+    add     rsi, 1
+    sub     rcx, 1
+    jz      .invalid            ; "$" or "-$" alone is not a number
 
 .digits:
     test    rcx, rcx

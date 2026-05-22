@@ -94,6 +94,27 @@ proc(pick)
     next()
 endp()
 
+; roll  ( xu xu-1 ... x1 x0 u -- xu-1 ... x1 x0 xu )
+;     Remove the item at depth u (0-based from TOS) and put it at TOS,
+;     shifting items 0..u-1 one slot deeper. Net: -1 (consumes u).
+proc(roll_)
+    mov     rcx, TOS                         ; u (loop counter)
+    mov     rdx, [DSP + rcx*cell]            ; xu — item to bring to top
+    test    rcx, rcx
+    jz      .done                            ; 0 roll: pop count, promote NOS
+    lea     r8, [DSP + rcx*cell - cell]      ; start at slot u-1
+.shift:
+    mov     r9, [r8]                         ; item at this slot
+    mov     [r8 + cell], r9                  ; shift it one slot deeper
+    sub     r8, cell
+    dec     rcx
+    jnz     .shift
+.done:
+    add     DSP, cell                        ; net: one slot freed
+    mov     TOS, rdx                         ; new TOS = xu
+    next()
+endp()
+
 ; depth  ( -- n )
 ;     Push the current data-stack depth (in cells).
 ;     depth = (sp0 - DSP)/cell + 1  ; +1 because TOS is cached in rax.

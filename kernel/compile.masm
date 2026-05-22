@@ -773,12 +773,20 @@ proc(fliteral_word)
     next()
 endp()
 
-; s"  ( "ccc<quote>" -- )                                 IMMEDIATE
-;     Compile a runtime string literal.
+; s"  ( "ccc<quote>" -- c-addr u )                        IMMEDIATE
+;     Compile or interpret a string literal.
+;     Interpret: parse to closing " and leave ( c-addr u ) on the stack.
+;       The c-addr points into the source buffer; valid until next REFILL.
+;     Compile: emit call do_slit + inline bytes (standard sliteral).
 proc(s_quote_word)
     cmp     qword ptr [UP + user_STATE], 0
     jne     .in_compile
-    call    comp_only_word
+    ; Interpret mode: parse string, push (c-addr u) from source buffer.
+    call    skip_optional_source_blank
+    mov     [DSP - cell], TOS
+    mov     TOS, 34                              ; delimiter = '"'
+    stk(0, 1)
+    call    parse_word                           ; ( -- c-addr u )
     next()
 .in_compile:
     call    skip_optional_source_blank
@@ -791,11 +799,17 @@ proc(s_quote_word)
 endp()
 
 ; ."  ( "ccc<quote>" -- )                                  IMMEDIATE
-;     Compile a runtime string literal followed by TYPE.
+;     Interpret: parse string and type it immediately.
+;     Compile: embed string literal and compile call to TYPE.
 proc(dot_quote_word)
     cmp     qword ptr [UP + user_STATE], 0
     jne     .in_compile
-    call    comp_only_word
+    call    skip_optional_source_blank
+    mov     [DSP - cell], TOS
+    mov     TOS, 34
+    stk(0, 1)
+    call    parse_word
+    call    type_word
     next()
 .in_compile:
     call    skip_optional_source_blank
@@ -1516,5 +1530,19 @@ proc(create_word)
 
     mov     [UP + user_HERE], r10
     mov     [UP + user_LATESTXT], r9
+    next()
+endp()
+
+; :noname  ( -- xt )
+;     Start an anonymous colon definition. Pushes the current HERE as the
+;     xt onto the data stack, records it in LATESTXT (so RECURSE works),
+;     and enters compile mode. Does NOT create a dictionary header.
+proc(noname_word)
+    mov     r8, [UP + user_HERE]            ; xt = current code address
+    mov     [UP + user_LATESTXT], r8        ; RECURSE targets this xt
+    mov     [DSP - cell], TOS               ; spill old TOS
+    mov     TOS, r8                         ; new TOS = xt
+    stk(0, 1)
+    mov     qword ptr [UP + user_STATE], 1  ; enter compile mode
     next()
 endp()

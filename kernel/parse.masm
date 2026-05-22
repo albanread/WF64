@@ -13,6 +13,8 @@
 ;     returns (anywhere, 0).
 ;
 ;     Treats space (0x20), tab (0x09), LF (0x0A), CR (0x0D) as whitespace.
+;     `\` starts a line comment only when it is the standalone Forth
+;     word `\`, i.e. when the next character is a delimiter or EOF.
 ;     `(` starts a parenthesized comment only when it is the standalone
 ;     Forth word `(`, i.e. when the next character is a delimiter or EOF.
 ;     Names like `(comp-cons)` are ordinary tokens, not comments.
@@ -35,13 +37,28 @@ proc(parse_name)
     cmp     r8b, 13
     je      .ws
     cmp     r8b, '\\'
-    je      .line_comment
+    je      .maybe_line_comment
     cmp     r8b, '('
     je      .maybe_paren_comment
     jmp     .scan_start
 .ws:
     inc     rdx
     jmp     .skip
+
+.maybe_line_comment:
+    lea     r9, [rdx + 1]
+    cmp     r9, rcx
+    jae     .line_comment
+    movzx   r8, byte ptr [rsi + r9]
+    cmp     r8b, ' '
+    je      .line_comment
+    cmp     r8b, 9
+    je      .line_comment
+    cmp     r8b, 10
+    je      .line_comment
+    cmp     r8b, 13
+    je      .line_comment
+    jmp     .scan_start
 
 .line_comment:
     inc     rdx
