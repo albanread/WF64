@@ -314,6 +314,82 @@ mod integration_tests {
         );
     }
 
+    // ── Comparison operators and select ──────────────────────────────
+
+    #[test]
+    fn jit_compiles_less_than_yields_1_or_0() {
+        run_let("LET (x) -> (y) = x < 5 END", "let_lt_true",  &[3.0], &[1.0]);
+        run_let("LET (x) -> (y) = x < 5 END", "let_lt_false", &[7.0], &[0.0]);
+        run_let("LET (x) -> (y) = x < 5 END", "let_lt_eq",    &[5.0], &[0.0]);
+    }
+
+    #[test]
+    fn jit_compiles_all_comparison_operators() {
+        run_let("LET (a, b) -> (y) = a == b END", "let_eq_t", &[3.0, 3.0], &[1.0]);
+        run_let("LET (a, b) -> (y) = a == b END", "let_eq_f", &[3.0, 4.0], &[0.0]);
+        run_let("LET (a, b) -> (y) = a != b END", "let_ne_t", &[3.0, 4.0], &[1.0]);
+        // Inputs in memory: [b, a]. a=10, b=5 → "10 > 5" true.
+        run_let("LET (a, b) -> (y) = a > b  END", "let_gt", &[5.0, 10.0], &[1.0]);
+        run_let("LET (a, b) -> (y) = a >= b END", "let_ge_eq", &[3.0, 3.0], &[1.0]);
+        run_let("LET (a, b) -> (y) = a <= b END", "let_le_eq", &[3.0, 3.0], &[1.0]);
+    }
+
+    #[test]
+    fn jit_compiles_compare_result_as_arithmetic_value() {
+        // (x < 0) * -1 + (x >= 0) * 1  ⇒ sign function returning ±1.
+        run_let(
+            "LET (x) -> (y) = (x < 0) * -1 + (x >= 0) * 1 END",
+            "let_sign", &[5.0], &[1.0],
+        );
+        run_let(
+            "LET (x) -> (y) = (x < 0) * -1 + (x >= 0) * 1 END",
+            "let_sign_neg", &[-5.0], &[-1.0],
+        );
+    }
+
+    #[test]
+    fn jit_compiles_select_basic() {
+        // select(cond, then, else): cond != 0 → then, else → else.
+        run_let("LET () -> (y) = select(1, 99, 42) END", "let_sel_true",  &[], &[99.0]);
+        run_let("LET () -> (y) = select(0, 99, 42) END", "let_sel_false", &[], &[42.0]);
+    }
+
+    #[test]
+    fn jit_compiles_select_with_comparison() {
+        // abs() implementable as select(x < 0, -x, x).
+        run_let(
+            "LET (x) -> (y) = select(x < 0, -x, x) END",
+            "let_abs_via_select_pos", &[3.5], &[3.5],
+        );
+        run_let(
+            "LET (x) -> (y) = select(x < 0, -x, x) END",
+            "let_abs_via_select_neg", &[-3.5], &[3.5],
+        );
+    }
+
+    #[test]
+    fn jit_compiles_clamp_via_nested_select() {
+        // clamp(x, lo, hi). Inputs in memory: [hi, lo, x] (TOS first).
+        // x clamped to [lo, hi]: select(x < lo, lo, select(x > hi, hi, x))
+        let src = "LET (x, lo, hi) -> (y) = \
+                       select(x < lo, lo, select(x > hi, hi, x)) END";
+        run_let(src, "let_clamp_in",    &[10.0, 0.0, 5.0],  &[5.0]);   // x=5 in range
+        run_let(src, "let_clamp_below", &[10.0, 0.0, -3.0], &[0.0]);   // x=-3 → lo=0
+        run_let(src, "let_clamp_above", &[10.0, 0.0, 99.0], &[10.0]);  // x=99 → hi=10
+    }
+
+    #[test]
+    fn jit_compiles_smoothstep_via_select() {
+        // smoothstep(0, 1, t) = clamped t * t * (3 - 2*t).
+        let src = "LET (t) -> (y) = \
+                       u * u * (3 - 2 * u) \
+                       WHERE u = select(t < 0, 0, select(t > 1, 1, t)) \
+                   END";
+        run_let(src, "let_smooth_low",  &[-1.0], &[0.0]);
+        run_let(src, "let_smooth_mid",  &[0.5],  &[0.5]);     // 0.25 * 2 = 0.5
+        run_let(src, "let_smooth_high", &[2.0],  &[1.0]);
+    }
+
     #[test]
     fn jit_compiles_distance_2d() {
         // The point-distance example from the spec — Euclidean distance via hypot.

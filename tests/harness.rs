@@ -2400,6 +2400,43 @@ fn let_dsl_star_star_operator() {
 }
 
 #[test]
+fn let_dsl_comparisons_via_forth_repl() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": lt5 LET (x) -> (y) = x < 5 END ;\n\
+         3.0 lt5 f.\n7.0 lt5 f.\nbye\n"
+    ).unwrap();
+    assert!(out.contains("1.000000") && out.contains("0.000000"), "got {out:?}");
+}
+
+#[test]
+fn let_dsl_select_via_forth_repl() {
+    let mut s = sess_with_core();
+    // abs() built via select.
+    let out = s.eval(
+        ": myabs LET (x) -> (y) = select(x < 0, -x, x) END ;\n\
+         -7.5 myabs f.\n3.25 myabs f.\nbye\n"
+    ).unwrap();
+    assert!(out.contains("7.500000"), "expected 7.500000 in {out:?}");
+    assert!(out.contains("3.250000"), "expected 3.250000 in {out:?}");
+}
+
+#[test]
+fn let_dsl_clamp_via_forth_repl() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": clamp LET (x, lo, hi) -> (y) = \
+              select(x < lo, lo, select(x > hi, hi, x)) END ;\n\
+         5.0 0.0 10.0 clamp f.\n\
+         -3.0 0.0 10.0 clamp f.\n\
+         99.0 0.0 10.0 clamp f.\nbye\n"
+    ).unwrap();
+    assert!(out.contains("5.000000"),  "got {out:?}");
+    assert!(out.contains("0.000000"),  "got {out:?}");
+    assert!(out.contains("10.000000"), "got {out:?}");
+}
+
+#[test]
 fn let_dsl_compile_only_outside_colon() {
     let mut s = sess_with_core();
     // LET in interpret state runs `comp_only_word` → THROW -14.

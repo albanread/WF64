@@ -29,7 +29,11 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOp { Add, Sub, Mul, Div, Pow }
+pub enum BinOp {
+    Add, Sub, Mul, Div, Pow,
+    // Comparison ops: each yields 1.0 (true) or 0.0 (false).
+    Eq, Ne, Lt, Gt, Le, Ge,
+}
 
 #[derive(Debug)]
 pub struct LetForm {
@@ -59,6 +63,7 @@ impl std::error::Error for LetError {}
 enum Tok {
     LParen, RParen, Comma, Equals, Arrow,
     Plus, Minus, Star, Slash, StarStar,
+    EqEq, NotEq, Less, Greater, LessEq, GreaterEq,
     LetKw, EndKw, WhereKw,
     Ident(String),
     Num(f64),
@@ -121,7 +126,44 @@ impl<'s> Lexer<'s> {
             b'(' => { self.pos += 1; Ok((Tok::LParen, start)) }
             b')' => { self.pos += 1; Ok((Tok::RParen, start)) }
             b',' => { self.pos += 1; Ok((Tok::Comma, start)) }
-            b'=' => { self.pos += 1; Ok((Tok::Equals, start)) }
+            b'=' => {
+                if self.src.get(self.pos + 1) == Some(&b'=') {
+                    self.pos += 2;
+                    Ok((Tok::EqEq, start))
+                } else {
+                    self.pos += 1;
+                    Ok((Tok::Equals, start))
+                }
+            }
+            b'!' => {
+                if self.src.get(self.pos + 1) == Some(&b'=') {
+                    self.pos += 2;
+                    Ok((Tok::NotEq, start))
+                } else {
+                    return Err(LetError {
+                        message: "stray '!' (did you mean '!='?)".into(),
+                        pos: start,
+                    });
+                }
+            }
+            b'<' => {
+                if self.src.get(self.pos + 1) == Some(&b'=') {
+                    self.pos += 2;
+                    Ok((Tok::LessEq, start))
+                } else {
+                    self.pos += 1;
+                    Ok((Tok::Less, start))
+                }
+            }
+            b'>' => {
+                if self.src.get(self.pos + 1) == Some(&b'=') {
+                    self.pos += 2;
+                    Ok((Tok::GreaterEq, start))
+                } else {
+                    self.pos += 1;
+                    Ok((Tok::Greater, start))
+                }
+            }
             b'+' => { self.pos += 1; Ok((Tok::Plus, start)) }
             b'-' => {
                 if self.src.get(self.pos + 1) == Some(&b'>') {
@@ -299,7 +341,30 @@ impl<'s> Parser<'s> {
         Ok(LetForm { inputs, outputs, results, wheres })
     }
 
-    fn parse_expr(&mut self) -> Result<Expr, LetError> { self.parse_add() }
+    fn parse_expr(&mut self) -> Result<Expr, LetError> { self.parse_compare() }
+
+    /// Comparisons (`< > <= >= == !=`) at one precedence level below
+    /// `+`/`-`.  Left-associative; the result of each comparison is a
+    /// numeric value (1.0 true, 0.0 false) that can flow into arithmetic
+    /// or into `select(cond, ...)`.
+    fn parse_compare(&mut self) -> Result<Expr, LetError> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op = match self.cur.0 {
+                Tok::Less      => BinOp::Lt,
+                Tok::Greater   => BinOp::Gt,
+                Tok::LessEq    => BinOp::Le,
+                Tok::GreaterEq => BinOp::Ge,
+                Tok::EqEq      => BinOp::Eq,
+                Tok::NotEq     => BinOp::Ne,
+                _ => break,
+            };
+            self.bump()?;
+            let rhs = self.parse_add()?;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
 
     fn parse_add(&mut self) -> Result<Expr, LetError> {
         let mut lhs = self.parse_mul()?;

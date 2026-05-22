@@ -55,6 +55,10 @@ enum FnKind {
     /// finalize time through the runtime memory manager (which on
     /// Windows finds ucrtbase.dll's exports automatically).
     Libm { arity: usize, symbol: &'static str },
+    /// `select(cond, then, else)` — branchless conditional via cmpsd +
+    /// andpd/andnpd/orpd blend.  Special-cased because it's 3-arg and
+    /// the codegen pattern is different from other functions.
+    Select,
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +101,7 @@ fn classify_function(name: &str) -> Option<FnKind> {
         "pow"   => Some(Libm { arity: 2, symbol: "pow" }),
         "hypot" => Some(Libm { arity: 2, symbol: "hypot" }),
         "fmod"  => Some(Libm { arity: 2, symbol: "fmod" }),
+        "select" => Some(Select),
         _ => None,
     }
 }
@@ -228,9 +233,11 @@ pub fn lower(form: &LetForm, fn_name: &str, libm_table: &LibmTable) -> Result<St
             ));
         }
     }
-    // Sign mask for unary negate, and abs mask for fabs(x).  Both are
-    // 16 bytes (used as xmmword by xorpd / andpd).  Emit unconditionally;
-    // 32 bytes of dead space at function end is cheap.
+    // Bitmasks used by the codegen: sign-bit for unary negate,
+    // abs-mask for fabs (sign cleared), and one_bits (low qword = the
+    // IEEE-754 bit pattern of 1.0) for converting compare-mask results
+    // to a real 1.0 / 0.0 value.  All three are 16 bytes so the SSE
+    // logical ops can operate on them as xmmword memory operands.
     s.push_str("    .p2align 4\n");
     s.push_str(&format!(
         "{fn_name}$$sign_mask: .quad 0x8000000000000000, 0x0000000000000000\n",
@@ -238,6 +245,10 @@ pub fn lower(form: &LetForm, fn_name: &str, libm_table: &LibmTable) -> Result<St
     s.push_str("    .p2align 4\n");
     s.push_str(&format!(
         "{fn_name}$$abs_mask:  .quad 0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF\n",
+    ));
+    s.push_str("    .p2align 4\n");
+    s.push_str(&format!(
+        "{fn_name}$$one_bits:  .quad 0x3FF0000000000000, 0x0000000000000000\n",
     ));
 
     Ok(s)
@@ -286,16 +297,38 @@ fn emit_expr(
                     pos: 0,
                 });
             }
-            emit_expr(l, target, vars, const_pool, next_scratch, fn_name, out)?;
-            emit_expr(r, next_scratch, vars, const_pool, next_scratch + 1, fn_name, out)?;
-            let m = match op {
-                BinOp::Add => "addsd",
-                BinOp::Sub => "subsd",
-                BinOp::Mul => "mulsd",
-                BinOp::Div => "divsd",
-                BinOp::Pow => unreachable!("** should have been desugared to pow() by A-normal form"),
+            // Comparison ops `>` / `>=` have no direct SSE encoding;
+            // we swap operands and use the corresponding `<` / `<=`.
+            let (l_first, r_first, eff_op) = match op {
+                BinOp::Gt => (r, l, BinOp::Lt),
+                BinOp::Ge => (r, l, BinOp::Le),
+                _ => (l, r, *op),
             };
-            out.push_str(&format!("    {m} xmm{target}, xmm{next_scratch}\n"));
+            emit_expr(l_first, target, vars, const_pool, next_scratch, fn_name, out)?;
+            emit_expr(r_first, next_scratch, vars, const_pool, next_scratch + 1, fn_name, out)?;
+            match eff_op {
+                BinOp::Add => out.push_str(&format!("    addsd xmm{target}, xmm{next_scratch}\n")),
+                BinOp::Sub => out.push_str(&format!("    subsd xmm{target}, xmm{next_scratch}\n")),
+                BinOp::Mul => out.push_str(&format!("    mulsd xmm{target}, xmm{next_scratch}\n")),
+                BinOp::Div => out.push_str(&format!("    divsd xmm{target}, xmm{next_scratch}\n")),
+                BinOp::Pow => unreachable!("** should have been desugared by A-normal form"),
+                // Comparisons: cmpCCsd target, next_scratch produces a
+                // mask (all-1s if true else all-0s) in target's low 64
+                // bits. We then `andpd` with a constant whose low qword
+                // is the bit pattern of 1.0 to convert the mask into
+                // 1.0 (true) or 0.0 (false) — a real numeric value the
+                // user can flow into arithmetic or feed to `select`.
+                BinOp::Eq => out.push_str(&format!("    cmpeqsd xmm{target}, xmm{next_scratch}\n")),
+                BinOp::Ne => out.push_str(&format!("    cmpneqsd xmm{target}, xmm{next_scratch}\n")),
+                BinOp::Lt => out.push_str(&format!("    cmpltsd xmm{target}, xmm{next_scratch}\n")),
+                BinOp::Le => out.push_str(&format!("    cmplesd xmm{target}, xmm{next_scratch}\n")),
+                BinOp::Gt | BinOp::Ge => unreachable!("rewritten via operand swap above"),
+            }
+            if matches!(eff_op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le) {
+                out.push_str(&format!(
+                    "    andpd xmm{target}, xmmword ptr [rip + {fn_name}$$one_bits]\n",
+                ));
+            }
         }
         Expr::Neg(e) => {
             emit_expr(e, target, vars, const_pool, next_scratch, fn_name, out)?;
@@ -335,6 +368,7 @@ fn emit_call(
     let arity = match kind {
         FnKind::Intrinsic(k) => intrinsic_arity(k),
         FnKind::Libm { arity, .. } => arity,
+        FnKind::Select => 3,
     };
     if args.len() != arity {
         return Err(LetError {
@@ -359,6 +393,7 @@ fn emit_call(
             })?;
             emit_libm_call(symbol, addr, args, target, vars, const_pool, fn_name, out)
         }
+        FnKind::Select => emit_select(args, target, vars, const_pool, fn_name, out),
     }
 }
 
@@ -502,6 +537,59 @@ fn emit_libm_call(
     Ok(())
 }
 
+/// Emit `select(cond, then, else)` as a branchless blend.
+///
+/// `cond` arrives as a numeric value where 0.0 means false and anything
+/// else means true (so it composes naturally with comparison ops, which
+/// produce 0.0/1.0, and with arithmetic flags users build by hand).
+///
+/// Strategy:
+///   1. Load cond into a scratch reg, materialise the mask
+///      `mask = (cond != 0)` via `cmpneqsd cond_reg, zero`.
+///      Now cond_reg's low qword is all-1s if true, all-0s if false.
+///   2. Load `then` and `else` into other scratch regs.
+///   3. Compute `target = (mask & then) | (~mask & else)`:
+///        movsd target, mask
+///        andnpd target, else        ; target = ~mask & else
+///        andpd  mask,   then        ; mask   =  mask & then
+///        orpd   target, mask        ; target = blended result
+///
+/// All three intermediate regs live in xmm0..xmm5 (scratch), so this
+/// safely composes with the surrounding A-normal-form binding pattern.
+fn emit_select(
+    args: &[Expr],
+    target: u8,
+    vars: &HashMap<String, u8>,
+    const_pool: &mut Vec<u64>,
+    fn_name: &str,
+    out: &mut String,
+) -> Result<(), LetError> {
+    // Pin three caller-saved scratch regs for cond, then, else.  These
+    // never collide with named values (xmm6+) and we don't need to
+    // worry about them surviving any call — emit_select is leaf code.
+    let r_cond = FIRST_SCRATCH_REG;
+    let r_then = FIRST_SCRATCH_REG + 1;
+    let r_else = FIRST_SCRATCH_REG + 2;
+    let r_zero = FIRST_SCRATCH_REG + 3;
+
+    load_leaf_into(&args[0], r_cond, vars, const_pool, fn_name, out)?;
+    load_leaf_into(&args[1], r_then, vars, const_pool, fn_name, out)?;
+    load_leaf_into(&args[2], r_else, vars, const_pool, fn_name, out)?;
+
+    // Materialise 0.0 in r_zero so we can compare against it.  Use
+    // xorpd self,self — clears both 64-bit lanes — instead of loading
+    // a constant; saves a memory access.
+    out.push_str(&format!("    xorpd xmm{r_zero}, xmm{r_zero}\n"));
+    // mask = (cond != 0)
+    out.push_str(&format!("    cmpneqsd xmm{r_cond}, xmm{r_zero}\n"));
+    // target = mask  (we'll andn with else, then or with masked then)
+    out.push_str(&format!("    movsd xmm{target}, xmm{r_cond}\n"));
+    out.push_str(&format!("    andnpd xmm{target}, xmm{r_else}\n"));
+    out.push_str(&format!("    andpd  xmm{r_cond}, xmm{r_then}\n"));
+    out.push_str(&format!("    orpd   xmm{target}, xmm{r_cond}\n"));
+    Ok(())
+}
+
 fn emit_load_const(target: u8, value: f64, pool: &mut Vec<u64>, fn_name: &str, out: &mut String) {
     let bits = value.to_bits();
     let idx = pool.iter().position(|&b| b == bits).unwrap_or_else(|| {
@@ -547,6 +635,7 @@ fn validate_expr(expr: &Expr, form: &LetForm) -> Result<(), LetError> {
             let arity = match kind {
                 FnKind::Intrinsic(k) => intrinsic_arity(k),
                 FnKind::Libm { arity, .. } => arity,
+                FnKind::Select => 3,
             };
             if args.len() != arity {
                 return Err(LetError {
