@@ -10,3 +10,4 @@ __pycache__/
 desktop.ini
 Thumbs.db
 LLVM-C.dll
+*.out
