@@ -342,6 +342,354 @@ proc(fold_xor_comp)
     jmp     compile_comma
 endp()
 
+; ── More literal folds: shifts ──────────────────────────────────────
+; Shifts only fold when the literal fits in a signed imm8 (the only
+; encoding the SHL/SHR/SAR-by-immediate form supports).  Out-of-range
+; literals fall back to a normal CALL.
+;
+;   op       | imm8 form
+;   lshift   | 48 C1 E0 ii   SHL rax, imm8
+;   rshift   | 48 C1 E8 ii   SHR rax, imm8
+;   arshift  | 48 C1 F8 ii   SAR rax, imm8
+
+proc(fold_lshift_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    movsx   rdx, cl
+    cmp     rdx, rcx
+    jne     .no_fold                         ; shifts need imm8 fit
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0xC1
+    mov     byte ptr [r8 + 2], 0xE0          ; /4 = SHL
+    mov     byte ptr [r8 + 3], cl
+    add     r8, 4
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_rshift_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    movsx   rdx, cl
+    cmp     rdx, rcx
+    jne     .no_fold
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0xC1
+    mov     byte ptr [r8 + 2], 0xE8          ; /5 = SHR
+    mov     byte ptr [r8 + 3], cl
+    add     r8, 4
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_arshift_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    movsx   rdx, cl
+    cmp     rdx, rcx
+    jne     .no_fold
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0xC1
+    mov     byte ptr [r8 + 2], 0xF8          ; /7 = SAR
+    mov     byte ptr [r8 + 3], cl
+    add     r8, 4
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+; ── More literal folds: equality ────────────────────────────────────
+; `n = lit`  → sub rax, lit ; sub rax, 1     ; sbb rax, rax  (11/13 B)
+;     CF=1 iff (rax - lit) == 0, i.e. rax == lit.
+; `n <> lit` → sub rax, lit ; add rax, -1    ; sbb rax, rax  (11/13 B)
+;     CF=1 iff (rax - lit) != 0, i.e. rax != lit.
+
+proc(fold_equal_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    movsx   rdx, cl
+    cmp     rdx, rcx
+    jne     .imm32
+    ; imm8 form (11 B)
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xE8          ; SUB rax, imm8
+    mov     byte ptr [r8 + 3], cl
+    mov     byte ptr [r8 + 4], 0x48
+    mov     byte ptr [r8 + 5], 0x83
+    mov     byte ptr [r8 + 6], 0xE8          ; SUB rax, 1
+    mov     byte ptr [r8 + 7], 0x01
+    mov     byte ptr [r8 + 8], 0x48
+    mov     byte ptr [r8 + 9], 0x19          ; SBB rax, rax
+    mov     byte ptr [r8 + 10], 0xC0
+    add     r8, 11
+    jmp     .commit
+.imm32:
+    ; imm32 form (13 B)
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x2D          ; SUB rax, imm32 (accumulator)
+    mov     dword ptr [r8 + 2], ecx
+    mov     byte ptr [r8 + 6], 0x48
+    mov     byte ptr [r8 + 7], 0x83
+    mov     byte ptr [r8 + 8], 0xE8
+    mov     byte ptr [r8 + 9], 0x01
+    mov     byte ptr [r8 + 10], 0x48
+    mov     byte ptr [r8 + 11], 0x19
+    mov     byte ptr [r8 + 12], 0xC0
+    add     r8, 13
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_not_equal_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    movsx   rdx, cl
+    cmp     rdx, rcx
+    jne     .imm32
+    ; imm8 form (11 B)
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xE8          ; SUB rax, imm8
+    mov     byte ptr [r8 + 3], cl
+    mov     byte ptr [r8 + 4], 0x48
+    mov     byte ptr [r8 + 5], 0x83
+    mov     byte ptr [r8 + 6], 0xC0          ; ADD rax, imm8
+    mov     byte ptr [r8 + 7], 0xFF          ;     (-1 as imm8)
+    mov     byte ptr [r8 + 8], 0x48
+    mov     byte ptr [r8 + 9], 0x19          ; SBB rax, rax
+    mov     byte ptr [r8 + 10], 0xC0
+    add     r8, 11
+    jmp     .commit
+.imm32:
+    ; imm32 form (13 B)
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x2D          ; SUB rax, imm32 (accumulator)
+    mov     dword ptr [r8 + 2], ecx
+    mov     byte ptr [r8 + 6], 0x48
+    mov     byte ptr [r8 + 7], 0x83
+    mov     byte ptr [r8 + 8], 0xC0          ; ADD rax, -1
+    mov     byte ptr [r8 + 9], 0xFF
+    mov     byte ptr [r8 + 10], 0x48
+    mov     byte ptr [r8 + 11], 0x19
+    mov     byte ptr [r8 + 12], 0xC0
+    add     r8, 13
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+; ── More literal folds: unsigned-less (cheap cmp+sbb form) ──────────
+; `n u< lit` → cmp rax, lit ; sbb rax, rax           (7/9 B)
+;     CF=1 iff rax < lit unsigned.  sbb rax, rax materialises -1/0.
+proc(fold_u_less_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    movsx   rdx, cl
+    cmp     rdx, rcx
+    jne     .imm32
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xF8          ; CMP rax, imm8
+    mov     byte ptr [r8 + 3], cl
+    mov     byte ptr [r8 + 4], 0x48
+    mov     byte ptr [r8 + 5], 0x19          ; SBB rax, rax
+    mov     byte ptr [r8 + 6], 0xC0
+    add     r8, 7
+    jmp     .commit
+.imm32:
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x3D          ; CMP rax, imm32 (accumulator)
+    mov     dword ptr [r8 + 2], ecx
+    mov     byte ptr [r8 + 6], 0x48
+    mov     byte ptr [r8 + 7], 0x19
+    mov     byte ptr [r8 + 8], 0xC0
+    add     r8, 9
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+; ── More literal folds: general comparisons (cmp + setCC + movzx + neg) ─
+; All seven of these share the same shape; only the setCC opcode byte
+; differs.  Pattern:
+;   cmp rax, lit       (4 B imm8 / 6 B imm32 accumulator)
+;   setCC al           (3 B)
+;   movzx eax, al      (3 B)
+;   neg rax            (3 B)
+; Totals: 13 B (imm8) or 15 B (imm32).
+;
+; setCC second-opcode byte cheat-sheet:
+;   <  setl  0x9C   |   u>  seta  0x97
+;   >  setg  0x9F   |   u<= setbe 0x96
+;   <= setle 0x9E   |   u>= setae 0x93
+;   >= setge 0x9D   |
+
+@macro emit_cmp_setcc(setcc_byte)
+    movsx   rdx, cl
+    cmp     rdx, rcx
+    jne     .imm32
+    ; imm8 form (13 B)
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x83
+    mov     byte ptr [r8 + 2], 0xF8          ; CMP rax, imm8
+    mov     byte ptr [r8 + 3], cl
+    mov     byte ptr [r8 + 4], 0x0F
+    mov     byte ptr [r8 + 5], &setcc_byte   ; setCC al
+    mov     byte ptr [r8 + 6], 0xC0
+    mov     byte ptr [r8 + 7], 0x0F
+    mov     byte ptr [r8 + 8], 0xB6          ; MOVZX eax, al
+    mov     byte ptr [r8 + 9], 0xC0
+    mov     byte ptr [r8 + 10], 0x48
+    mov     byte ptr [r8 + 11], 0xF7
+    mov     byte ptr [r8 + 12], 0xD8         ; NEG rax
+    add     r8, 13
+    jmp     .^commit
+.imm32:
+    ; imm32 form (15 B)
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0x3D          ; CMP rax, imm32 (accumulator)
+    mov     dword ptr [r8 + 2], ecx
+    mov     byte ptr [r8 + 6], 0x0F
+    mov     byte ptr [r8 + 7], &setcc_byte
+    mov     byte ptr [r8 + 8], 0xC0
+    mov     byte ptr [r8 + 9], 0x0F
+    mov     byte ptr [r8 + 10], 0xB6
+    mov     byte ptr [r8 + 11], 0xC0
+    mov     byte ptr [r8 + 12], 0x48
+    mov     byte ptr [r8 + 13], 0xF7
+    mov     byte ptr [r8 + 14], 0xD8
+    add     r8, 15
+@endmacro
+
+proc(fold_less_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    emit_cmp_setcc(0x9C)                     ; setl
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_greater_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    emit_cmp_setcc(0x9F)                     ; setg
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_less_equal_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    emit_cmp_setcc(0x9E)                     ; setle
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_greater_equal_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    emit_cmp_setcc(0x9D)                     ; setge
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_u_greater_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    emit_cmp_setcc(0x97)                     ; seta
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_u_less_equal_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    emit_cmp_setcc(0x96)                     ; setbe
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
+proc(fold_u_greater_equal_comp)
+    call    try_fold_literal
+    jc      .no_fold
+    emit_cmp_setcc(0x93)                     ; setae
+.commit:
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.no_fold:
+    jmp     compile_comma
+endp()
+
 ; (inline,)  ( xt -- )
 ;     A drop-in alternative for xt-call,/compile, that inlines a leaf
 ;     word's body rather than emitting a CALL.  Reads the body length

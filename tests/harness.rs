@@ -2055,6 +2055,135 @@ fn literal_fold_skipped_when_no_preceding_literal() {
 }
 
 #[test]
+fn literal_fold_shifts_emit_shift_imm8() {
+    // `3 lshift` → SHL rax, 3 (4 bytes), no CALL.
+    let cases: &[(&str, u8)] = &[
+        (": shl3 3 lshift ;",  0xE0),   // SHL /4
+        (": shr3 3 rshift ;",  0xE8),   // SHR /5
+        (": sar3 3 arshift ;", 0xF8),   // SAR /7
+    ];
+    let mut s = sess();
+    for &(src, modrm) in cases {
+        s.eval(&format!("{src}\nbye\n")).unwrap();
+        s.call("latestxt").unwrap();
+        let xt = s.pop() as u64;
+        let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 5) };
+        assert_eq!(bytes, &[0x48, 0xC1, modrm, 0x03, 0xC3],
+            "fold mismatch for `{src}` — got {:02X?}", bytes);
+    }
+
+    // Runtime: 4 3 lshift → 32; 32 3 rshift → 4; -32 3 arshift → -4.
+    let out = s.eval("4 shl3 . 32 shr3 . -32 sar3 .\nbye\n").unwrap();
+    assert_eq!(out, "32 4 -4  ok\n");
+}
+
+#[test]
+fn literal_fold_shift_out_of_imm8_range_falls_back() {
+    // Literal that doesn't fit in signed imm8 (300) must NOT fold for
+    // shifts — we'd have to truncate or mask, and we'd rather fall back
+    // cleanly to the unfolded `300 lshift` semantics.
+    let mut s = sess();
+    s.eval(": shbig 300 lshift ;\nbye\n").unwrap();
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 14) };
+    // First byte should be a CALL/JMP to do_lit, NOT 48 C1 ...
+    assert_ne!(&bytes[..3], &[0x48, 0xC1, 0xE0]);
+    assert!(bytes[0] == 0xE8 || bytes[0] == 0xE9,
+        "expected CALL/JMP fallback, got {:02X}", bytes[0]);
+}
+
+#[test]
+fn literal_fold_equality_emits_sub_sub_sbb_pattern() {
+    // `= 5` fold → sub rax, 5 ; sub rax, 1 ; sbb rax, rax (11 bytes)
+    let mut s = sess();
+    s.eval(": eq5 5 = ;\nbye\n").unwrap();
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 12) };
+    assert_eq!(bytes, &[
+        0x48, 0x83, 0xE8, 0x05,            // sub  rax, 5
+        0x48, 0x83, 0xE8, 0x01,            // sub  rax, 1
+        0x48, 0x19, 0xC0,                  // sbb  rax, rax
+        0xC3,                               // ret
+    ], "got {:02X?}", bytes);
+
+    // Runtime
+    let out = s.eval("5 eq5 . 6 eq5 . -1 eq5 .\nbye\n").unwrap();
+    assert_eq!(out, "-1 0 0  ok\n");
+}
+
+#[test]
+fn literal_fold_not_equal_emits_sub_add_sbb_pattern() {
+    // `<> 5` fold → sub rax, 5 ; add rax, -1 ; sbb rax, rax (11 bytes)
+    let mut s = sess();
+    s.eval(": ne5 5 <> ;\nbye\n").unwrap();
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 12) };
+    assert_eq!(bytes, &[
+        0x48, 0x83, 0xE8, 0x05,            // sub  rax, 5
+        0x48, 0x83, 0xC0, 0xFF,            // add  rax, -1
+        0x48, 0x19, 0xC0,                  // sbb  rax, rax
+        0xC3,                               // ret
+    ], "got {:02X?}", bytes);
+
+    let out = s.eval("5 ne5 . 6 ne5 . 0 ne5 .\nbye\n").unwrap();
+    assert_eq!(out, "0 -1 -1  ok\n");
+}
+
+#[test]
+fn literal_fold_u_less_emits_cmp_sbb_short_form() {
+    // `u< 10` fold → cmp rax, 10 ; sbb rax, rax (7 bytes — the cheap path)
+    let mut s = sess();
+    s.eval(": ulow 10 u< ;\nbye\n").unwrap();
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 8) };
+    assert_eq!(bytes, &[
+        0x48, 0x83, 0xF8, 0x0A,            // cmp rax, 10
+        0x48, 0x19, 0xC0,                  // sbb rax, rax
+        0xC3,                               // ret
+    ], "got {:02X?}", bytes);
+
+    let out = s.eval("3 ulow . 10 ulow . 15 ulow .\nbye\n").unwrap();
+    assert_eq!(out, "-1 0 0  ok\n");
+}
+
+#[test]
+fn literal_fold_signed_compares_emit_cmp_setcc_pattern() {
+    // Each: cmp rax, lit ; setCC al ; movzx eax, al ; neg rax (13 bytes)
+    // For consistency we only check the setCC opcode byte at offset +5.
+    let cases: &[(&str, u8, &str)] = &[
+        (": lt10 10 < ;",   0x9C, "setl"),
+        (": gt10 10 > ;",   0x9F, "setg"),
+        (": le10 10 <= ;",  0x9E, "setle"),
+        (": ge10 10 >= ;",  0x9D, "setge"),
+        (": ugt10 10 u> ;", 0x97, "seta"),
+        (": ule10 10 u<= ;",0x96, "setbe"),
+        (": uge10 10 u>= ;",0x93, "setae"),
+    ];
+    let mut s = sess();
+    for &(src, setcc_byte, name) in cases {
+        s.eval(&format!("{src}\nbye\n")).unwrap();
+        s.call("latestxt").unwrap();
+        let xt = s.pop() as u64;
+        let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 14) };
+        assert_eq!(bytes[0..4], [0x48, 0x83, 0xF8, 0x0A],
+            "expected `cmp rax, 10` prefix for `{src}`, got {:02X?}", &bytes[..4]);
+        assert_eq!(bytes[4], 0x0F, "expected 0F prefix for {name}");
+        assert_eq!(bytes[5], setcc_byte,
+            "expected {name} opcode 0x{:02X} for `{src}`, got 0x{:02X}", setcc_byte, bytes[5]);
+        assert_eq!(bytes[6], 0xC0, "expected setCC al modrm");
+        assert_eq!(bytes[13], 0xC3, "expected trailing RET");
+    }
+
+    // Behaviour: 5 lt10 = true, 15 lt10 = false, etc.
+    let out = s.eval("5 lt10 . 15 lt10 . 5 gt10 . 15 gt10 .\nbye\n").unwrap();
+    assert_eq!(out, "-1 0 0 -1  ok\n");
+}
+
+#[test]
 fn literal_fold_chains_through_consecutive_lit_op_pairs() {
     // `1 + 2 * 3 -` should fold to three immediate-form instructions
     // back to back: add rax,1 ; imul rax,rax,2 ; sub rax,3 ; ret.
