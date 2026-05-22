@@ -101,6 +101,52 @@ proc(compile_comma)
     next()
 endp()
 
+; (inline,)  ( xt -- )
+;     A drop-in alternative for xt-call,/compile, that inlines a leaf
+;     word's body rather than emitting a CALL.  Reads the body length
+;     from the word's header.dh_ofa (u16, set by `inline` in core.f
+;     after `;` measures `HERE - xt - 1`, i.e. excluding the trailing
+;     RET).  When dh_ofa is 0, falls back to a plain `compile,`-style
+;     CALL emission, so words that haven't been marked inline still
+;     work correctly.
+;
+;     Safe only for LEAF words (no internal CALLs).  Copying a non-
+;     leaf body to a new address breaks the rel32 offsets inside it.
+;     `inline` (the source-level declarator) doesn't currently verify
+;     leafness -- use only on words you know contain no calls.
+proc(inline_comma_word)
+    mov     r9, TOS                          ; r9 = xt
+    mov     rdx, [r9 - cell]                 ; xt-side backoffset (xt → dh_ct)
+    add     rdx, r9                          ; = address of dh_ct
+    sub     rdx, dh_ct                       ; = header base
+    movzx   r8, word ptr [rdx + dh_ofa]     ; length-to-inline
+
+    test    r8, r8
+    jz      .fallback_call
+
+    ; Copy r8 bytes from xt (r9) to HERE.
+    mov     rsi, r9
+    mov     rdi, [UP + user_HERE]
+    mov     rcx, r8
+    rep     movsb
+    mov     [UP + user_HERE], rdi
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+
+.fallback_call:
+    mov     r10, [UP + user_HERE]
+    mov     byte ptr [r10], 0xE8
+    sub     TOS, r10
+    sub     TOS, 5
+    mov     dword ptr [r10 + 1], eax
+    add     r10, 5
+    mov     [UP + user_HERE], r10
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
 ; inline-dup,  ( xt -- )
 ;     First real WF32-style inline compile helper: ignore xt and emit the
 ;     body of DUP directly into the current definition, with no CALL/RET

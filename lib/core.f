@@ -645,6 +645,30 @@ forth-wordlist set-current
     find-name 0= if -13 throw then
     name>compile execute ;
 
+\ INLINE ( -- )    Declarator used right after a colon definition's ;.
+\ Measures the body bytes (excluding the trailing RET that ; emitted)
+\ and stores the length in the header's dh_ofa field (u16). Sets the
+\ word's compile-action to (inline,), so subsequent references to the
+\ word copy the body bytes inline instead of emitting a CALL.
+\
+\ Usage:
+\     : square dup * ; inline
+\
+\ WARNING: only safe for LEAF words (no internal CALLs in the body).
+\ A non-leaf body's rel32 offsets break when copied. We don't detect
+\ this -- the user is responsible for using `inline` only on words
+\ whose bodies contain no CALL instructions.
+\
+\ user_LATEST is at base+16; dh_xtptr at header+16; dh_ofa at header+42;
+\ dh_comp at header+24.
+
+: inline  ( -- )
+    base 16 + @                              ( latest )
+    here over 16 + @ - 1-                    ( latest length )  \ HERE - xt - 1
+    dup $FFFF u> if drop 0 then              ( latest length )  \ clamp; 0 == disable
+    over 42 + w!                              ( latest )          \ store dh_ofa
+    ['] (inline,) swap 24 + ! ;              ( )                 \ store dh_comp
+
 \ >FLOAT — string to float. Built on the kernel's float? primitive.
 \ float? returns ( -1 ) on success (consumed addr/u, pushed r onto FP),
 \ or ( c-addr u 0 ) on failure.

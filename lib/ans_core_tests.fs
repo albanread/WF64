@@ -858,6 +858,35 @@ T{  trial-word -> 12345 }T
 rollback
 T{  [defined] trial-word -> 0 }T
 
+\ ── INLINE declarator (WF32-style optimisation) ─────────────────────────
+
+s" Inline" testing
+
+\ Helper: read dh_ofa (the inline-body length) from an xt.
+\ xt - cell holds the backoffset to dh_ct; subtract dh_ct (8) to get the
+\ header base, then dh_ofa is at +42.
+: ofa-of  ( xt -- ofa )  dup cell - @ + 8 - 42 + w@ ;
+
+\ Define a leaf word and mark it inline; behaviour must be unchanged.
+: my-double  dup + ;  inline
+T{  3 my-double                          -> 6 }T
+T{  10 my-double                         -> 20 }T
+
+\ inline set dh_ofa to the body length (non-zero).
+T{  ' my-double ofa-of  0>               -> -1 }T
+
+\ A second word that REFERENCES my-double should now compile inlined
+\ copies of my-double's body, not CALLs to it. Verifies correctness.
+: quad-via-inline  my-double my-double ;
+T{  3 quad-via-inline                    -> 12 }T
+T{  -2 quad-via-inline                   -> -8 }T
+
+\ A word with dh_ofa = 0 falls back to CALL, so calling via (inline,)
+\ on an unmarked word still works.
+: not-inlined  3 * ;
+T{  ' not-inlined ofa-of                 -> 0 }T
+T{  5 not-inlined                        -> 15 }T
+
 \ ── Tally ─────────────────────────────────────────────────────────────────
 
 tally

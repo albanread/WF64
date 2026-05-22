@@ -366,6 +366,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("locals#",        "locals_count_word",       0),
     ("locals#!",       "locals_count_store_word", 0),
     ("check-local-emit","check_local_emit_word", 0),
+    ("(inline,)",      "inline_comma_word",       0),
     // Parse & dict
     ("evaluate",   "evaluate_word", 0),
     ("parse-name", "parse_name", 0),
@@ -564,6 +565,8 @@ pub const PRIVATE_WORDS: &[&str] = &[
     "forget_last", "latestxt",
     // Raw stack-pointer access
     "sp@", "sp!", "rp@", "rp!",
+    // Inliner support
+    "(inline,)",
 ];
 
 // (Dictionary header layout deliberately not mirrored here — it lives
