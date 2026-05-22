@@ -84,6 +84,8 @@
 @assign user_CONTEXT     = 0x1528    ; search order array, wid1 at slot 0
 @assign search_order_max = 16
 @assign user_TRACE       = 0x15A8    ; trace flag: 0 = off, 1 = on
+@assign user_LP0         = 0x15B0    ; initial locals-stack pointer (high end of LP region)
+@assign user_LP_LIMIT    = 0x15B8    ; low limit of locals stack (overflow check)
 
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier

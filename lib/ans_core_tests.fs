@@ -369,6 +369,31 @@ T{  fa-buf 256 fa-fid @ read-line -> 0 0 0 }T            \ EOF
 T{  fa-fid @ close-file -> 0 }T
 T{  rl-path delete-file -> 0 }T
 
+\ ── Locals stack scaffolding (R15 = LP) ──────────────────────────────────
+
+s" Locals-stack-R15" testing
+
+\ At rest, LP = LP0 (no frame allocated).
+T{  lp@ lp0@ =  -> -1 }T
+
+\ The locals region is 1 MB.
+T{  lp0@ lp-limit -  -> 1048576 }T
+
+\ Smoke: allocate 1 cell, store/read 42, free.
+T{  lp-smoke  -> 42 }T
+
+\ R15 survives many smoke calls (no leak each round-trip).
+T{  lp-smoke lp-smoke lp-smoke  -> 42 42 42 }T
+T{  lp@ lp0@ =  -> -1 }T
+
+\ R15 survives Win32 calls (msvcrt, kernel32).
+T{  4e fsqrt  lp@ lp0@ =  -> -1 }T
+T{  4e fsqrt 2e f=  -> -1 }T               \ also confirm fsqrt still returns 2.0
+T{  0 ms  lp@ lp0@ =  -> -1 }T              \ kernel32 Sleep preserves R15
+
+\ The region is writable through R15.
+T{  lp-smoke lp-smoke +  -> 84 }T
+
 \ ── Memory-Allocation: ALLOCATE / FREE / RESIZE ──────────────────────────
 
 s" Memory-Allocation" testing

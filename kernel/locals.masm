@@ -1,0 +1,49 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — locals-stack scaffolding.
+;
+; R15 is dedicated as LP (locals stack pointer).  forth_main initialises
+; it from [UP + user_LP0] (one past the high end of the 1 MB locals
+; region the Rust host VirtualAlloc'd).  LP grows downward; allocating
+; N cells of locals is `sub r15, N*cell`; freeing is `add r15, N*cell`.
+;
+; This file currently only exposes accessors and a self-contained smoke
+; word.  The real `(LOCAL)` / `LOCAL@` / `LOCAL!` / `{:` / `:}` machinery
+; will land on top of this once the runtime contract is settled.
+; ─────────────────────────────────────────────────────────────────────
+
+; lp@   ( -- a-addr )   Current locals stack pointer (R15).
+proc(lp_fetch_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, r15
+    stk(0, 1)
+    next()
+endp()
+
+; lp0@  ( -- a-addr )   Initial locals stack pointer (top of LP region).
+proc(lp0_fetch_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_LP0]
+    stk(0, 1)
+    next()
+endp()
+
+; lp-limit  ( -- a-addr )   Low limit of LP region (overflow check).
+proc(lp_limit_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_LP_LIMIT]
+    stk(0, 1)
+    next()
+endp()
+
+; lp-smoke  ( -- 42 )   Allocate one local cell on LP, store 42, read
+;                       back, free.  Round-trip; lp@ must equal lp0@
+;                       after this returns.
+proc(lp_smoke_word)
+    sub     r15, cell                       ; allocate 1 local
+    mov     qword ptr [r15], 42             ; store
+    mov     [DSP - cell], TOS
+    mov     TOS, [r15]                       ; read back
+    add     r15, cell                        ; free
+    stk(0, 1)
+    next()
+endp()

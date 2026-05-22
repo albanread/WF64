@@ -354,6 +354,11 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("facos",      "facos_word",       0),
     ("f**",        "f_pow_word",       0),
     ("fatan2",     "fatan2_word",      0),
+    // Locals-stack scaffolding (R15 = LP)
+    ("lp@",        "lp_fetch_word",    0),
+    ("lp0@",       "lp0_fetch_word",   0),
+    ("lp-limit",   "lp_limit_word",    0),
+    ("lp-smoke",   "lp_smoke_word",    0),
     // Parse & dict
     ("evaluate",   "evaluate_word", 0),
     ("parse-name", "parse_name", 0),
@@ -479,6 +484,11 @@ const OFFSET_RSP_TOP:   u64 = 0x80000;
 const OFFSET_USER_BASE: u64 = 0x80000;
 const OFFSET_DICT_BASE: u64 = 0xC0000;
 
+// Locals stack — a separate 1 MB region, R15 = LP grows downward.
+// Not constrained to the ±2 GB near-region (only relative addressing
+// off R15 is used, so the absolute address doesn't matter).
+const LOCALS_REGION_SIZE: usize = 1 * 1024 * 1024;
+
 // User-area offsets — mirror kernel/macros.masm.
 const USER_BASE_VAR:     u64 = 0x00;
 const USER_STATE_VAR:    u64 = 0x08;
@@ -504,6 +514,8 @@ const USER_INDEX_HERE:   u64 = 0x1518;
 const USER_INDEX_LATEST: u64 = 0x1520;
 const USER_CONTEXT:      u64 = 0x1528;
 const USER_TRACE:        u64 = 0x15A8;  // trace flag; mirrors user_TRACE in macros.masm
+const USER_LP0:          u64 = 0x15B0;  // initial LP (top of locals region)
+const USER_LP_LIMIT:     u64 = 0x15B8;  // low limit of locals stack
 
 // (Dictionary header layout deliberately not mirrored here — it lives
 // entirely in kernel/macros.masm and kernel/dict.masm. The bootstrap
@@ -670,6 +682,37 @@ fn alloc_forth_region(kernel_addr: u64) -> Result<*mut c_void> {
     Ok(base)
 }
 
+// Locals stack region — a separate 1 MB block. Addressed exclusively
+// through R15-relative loads, so it doesn't need to live near the
+// kernel; plain VirtualAlloc is enough.
+extern "system" {
+    fn VirtualAlloc(
+        lpAddress: *mut c_void,
+        dwSize: usize,
+        flAllocationType: u32,
+        flProtect: u32,
+    ) -> *mut c_void;
+    fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: u32) -> i32;
+}
+const PAGE_READWRITE: u32 = 0x04;
+const MEM_RELEASE:    u32 = 0x8000;
+
+fn alloc_locals_region() -> Result<*mut c_void> {
+    let base = unsafe {
+        VirtualAlloc(
+            ptr::null_mut(),
+            LOCALS_REGION_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    };
+    if base.is_null() {
+        let err = unsafe { GetLastError() };
+        anyhow::bail!("locals region VirtualAlloc returned null (GetLastError = {err})");
+    }
+    Ok(base)
+}
+
 // ── Wf64Session ──────────────────────────────────────────────────────
 
 /// `forth_main(target_xt, logical_dsp_in, rsp_top, user_base) → 0`.
@@ -680,6 +723,11 @@ pub struct Wf64Session {
     forth_main: ForthMain,
     #[allow(dead_code)]
     region_base: u64,
+    /// Base of the 1 MB locals stack region (separate VirtualAlloc).
+    /// Released by `Drop`. R15 (the locals stack pointer) is initialised
+    /// to `locals_base + LOCALS_REGION_SIZE` (top) at every `forth_main`
+    /// entry and grows downward.
+    locals_base: *mut c_void,
     pub dsp_top:   u64,
     pub rsp_top:   u64,
     pub user_base: u64,
@@ -802,6 +850,13 @@ impl Wf64Session {
         let region_base = alloc_forth_region(kernel_addr)?;
         let region_u64 = region_base as u64;
 
+        // Locals stack — independent 1 MB allocation, R15 grows down from
+        // the top. Released by Drop. Far address is fine: only ever
+        // accessed via R15-relative loads, no rel32 constraint.
+        let locals_base = alloc_locals_region()?;
+        let locals_base_u64 = locals_base as u64;
+        let locals_top = locals_base_u64 + LOCALS_REGION_SIZE as u64;
+
         let dsp_top   = region_u64 + OFFSET_DSP_TOP;
         let rsp_top   = region_u64 + OFFSET_RSP_TOP;
         let user_base = region_u64 + OFFSET_USER_BASE;
@@ -832,6 +887,8 @@ impl Wf64Session {
             write_u64(up, USER_ORDER_COUNT,  0);
             write_u64(up, USER_INDEX_HERE,   debug_meta_base);
             write_u64(up, USER_INDEX_LATEST, 0);
+            write_u64(up, USER_LP0,          locals_top);
+            write_u64(up, USER_LP_LIMIT,     locals_base_u64);
         }
 
         // Register kernel procs with SEH for symbolic crash dumps.
@@ -849,6 +906,7 @@ impl Wf64Session {
             jit,
             forth_main,
             region_base: region_u64,
+            locals_base,
             dsp_top,
             rsp_top,
             user_base,
@@ -1339,6 +1397,10 @@ impl Wf64Session {
 impl Drop for Wf64Session {
     fn drop(&mut self) {
         self.clear_runtime_unwind_table();
+        if !self.locals_base.is_null() {
+            unsafe { VirtualFree(self.locals_base, 0, MEM_RELEASE); }
+            self.locals_base = ptr::null_mut();
+        }
     }
 }
 

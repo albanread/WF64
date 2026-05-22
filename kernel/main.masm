@@ -42,6 +42,7 @@
 @include "io.masm"
 @include "facility.masm"
 @include "fmath.masm"
+@include "locals.masm"
 @include "parse.masm"
 @include "dict.masm"
 @include "execute.masm"
@@ -96,6 +97,12 @@ proc(forth_main)
     mov     UP,  r9
     mov     [UP + user_HOST_RSP], rsp
     mov     DSP, rdx
+    ; Load the locals stack pointer (R15 = LP).  Initialized by the Rust
+    ; host to point one past the top of the locals region; locals frames
+    ; allocate by `sub r15, N*cell` on entry and `add r15, N*cell` before
+    ; `next()`.  Win64 callouts (msvcrt / kernel32) preserve R15, so it
+    ; survives across all external calls without spilling.
+    mov     r15, [UP + user_LP0]
     ; Restore the Forth return-stack pointer so any cells `>r` left
     ; from a previous forth_main invocation are still visible. The
     ; r8 argument (rsp_top) is ignored — the boot path seeds
