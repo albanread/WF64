@@ -21,3 +21,4 @@
 @extern rt_slurp_len(0)         ; return byte length of top slurped file
 @extern rt_slurp_pop(0)         ; pop and free the top slurped file
 @extern rt_let_compile(1)       ; compile a LET form (arg = UP)
+@extern rt_code_compile_body(1) ; compile a CODE: body, returns fn_addr (arg = UP)

@@ -750,6 +750,222 @@ unsafe fn write_u64_le(dst: *mut u8, val: u64) {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8); }
 }
 
+// ── CODE: DSL compilation ────────────────────────────────────────────
+//
+// `rt_code_compile_body(up)` is the worker behind the `CODE:` immediate
+// word.  It reads the assembly source from the current input buffer up
+// to the next `;CODE` token, wraps it in a `proc(...)` / `endp()` pair,
+// hands it to a thread-local JASM `Assembler` (preloaded with
+// `macros.masm`, so the user's source can use `proc/endp/next/pushd/stk`
+// etc. naturally), JIT-compiles into a fresh module, and returns the
+// resulting function address.  The kernel's `CODE:` word then builds
+// the dict header and emits a 12-byte JMP trampoline at HERE that
+// transfers control to the compiled function.
+//
+// Returns the function address on success, 0 on any error (details
+// printed to stderr).
+
+const MACROS_SOURCE: &str = include_str!("../kernel/macros.masm");
+
+thread_local! {
+    /// Each compiled CODE: word lives in its own JIT module.  We keep
+    /// the Jit alive for the session lifetime so its executable memory
+    /// stays mapped while colon definitions still reference the
+    /// function via the trampoline.
+    static CODE_JITS: RefCell<Vec<Jit>> = RefCell::new(Vec::new());
+
+    /// Shared JASM Assembler pre-loaded with `macros.masm`. Stored as
+    /// `Option` so we lazily initialise on first use — at that point the
+    /// kernel layout is already established and macros.masm parses cleanly.
+    static CODE_ASSEMBLER: RefCell<Option<wfasm::Assembler>> = const { RefCell::new(None) };
+}
+
+static CODE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn reset_code_session() {
+    CODE_JITS.with(|j| j.borrow_mut().clear());
+    // CODE_ASSEMBLER intentionally kept — re-bootstrapping macros.masm
+    // for every reset would be wasteful, and its expansion-time state
+    // (defines, assigns, macros) doesn't accumulate per call.
+}
+
+/// Compile the next CODE: body in the input buffer.
+///
+/// Returns the address of the JIT-compiled function on success, or 0
+/// on any failure (the kernel surfaces this as a THROW).
+#[no_mangle]
+pub extern "C" fn rt_code_compile_body(up: u64) -> u64 {
+    match unsafe { try_compile_code(up) } {
+        Ok(addr) => addr,
+        Err(msg) => {
+            eprintln!("CODE: compile error: {msg}");
+            0
+        }
+    }
+}
+
+unsafe fn try_compile_code(up: u64) -> Result<u64, String> {
+    let src_base = unsafe { read_u64(up + RT_USER_SOURCE_ADDR) };
+    let src_len  = unsafe { read_u64(up + RT_USER_SOURCE_LEN)  };
+    let to_in    = unsafe { read_u64(up + RT_USER_TO_IN)        };
+
+    if to_in > src_len {
+        return Err(format!("TO_IN ({to_in}) past SOURCE_LEN ({src_len})"));
+    }
+
+    // Assemble the full CODE: body, which may span multiple input lines
+    // when the user types it across several REPL lines.  We scan first
+    // the current SOURCE buffer (rest of THIS line) and then, if no
+    // `;CODE` is found there, the Io's input buffer past `in_cursor`.
+    let current_tail = unsafe {
+        std::slice::from_raw_parts(
+            (src_base + to_in) as *const u8,
+            (src_len - to_in) as usize,
+        )
+    };
+
+    let body_string: String;
+    let consumed_in_current: usize;
+    let consumed_from_buffer: usize;
+
+    if let Some((body, n)) = find_code_terminator(current_tail) {
+        // Body fits on the current line.
+        body_string = std::str::from_utf8(body)
+            .map_err(|_| "CODE: body is not UTF-8".to_string())?
+            .to_string();
+        consumed_in_current = n;
+        consumed_from_buffer = 0;
+    } else {
+        // Need to peek into the Io input buffer for additional lines.
+        let current_tail_str = std::str::from_utf8(current_tail)
+            .map_err(|_| "CODE: source is not UTF-8".to_string())?;
+        let (extra, n_from_buf) = peek_until_code_terminator()
+            .ok_or_else(|| "no closing ';CODE' token found \
+                (in interactive REPL the body must be on one line; \
+                 multi-line CODE: is only supported via the buffered input modes)".to_string())?;
+        // Combine: current line tail + newline + extra
+        body_string = format!("{current_tail_str}\n{extra}");
+        consumed_in_current = current_tail.len();
+        consumed_from_buffer = n_from_buf;
+    }
+    let body_str = &body_string;
+
+    let counter = CODE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let fn_label = format!("code_user_{counter:04}");
+
+    // Wrap in proc/endp so the user can write idiomatic kernel asm with
+    // `next()` / `pushd` / `popd` / `stk(in,out)` / etc.  We auto-emit a
+    // trailing `next()` (= ret) so the user doesn't have to remember it,
+    // but if they wrote their own that just becomes dead bytes.
+    let asm_source = format!(
+        ".intel_syntax noprefix\n\
+         .text\n\
+         proc({fn_label})\n\
+         {body_str}\n\
+         next()\n\
+         endp()\n",
+    );
+
+    let mc_text = with_code_assembler(|asm| -> Result<String, String> {
+        asm.assemble(&format!("code_body_{counter:04}"), &asm_source)
+            .map_err(|e| format!("{e}"))
+    })?;
+
+    let mut jit = Jit::new(&format!("code_mod_{counter:04}"))
+        .map_err(|e| format!("Jit::new: {e:?}"))?;
+    jit.add_asm(&mc_text)
+        .map_err(|e| format!("add_asm: {e:?}\nasm was:\n{mc_text}"))?;
+    jit.declare_fn(&fn_label, 0)
+        .map_err(|e| format!("declare_fn({fn_label}): {e:?}"))?;
+    let fn_addr = jit.lookup_addr(&fn_label)
+        .map_err(|e| format!("lookup_addr({fn_label}): {e:?}"))?;
+
+    CODE_JITS.with(|j| j.borrow_mut().push(jit));
+
+    // Advance TO_IN past the consumed portion of the current line.
+    unsafe {
+        write_u64(up + RT_USER_TO_IN, to_in + consumed_in_current as u64);
+    }
+    // If we consumed lines from the Io buffer too, advance in_cursor.
+    if consumed_from_buffer > 0 {
+        advance_io_cursor(consumed_from_buffer);
+    }
+    Ok(fn_addr)
+}
+
+/// Peek into the current session's Io::Buffered input past `in_cursor`,
+/// scanning for `;CODE`.  Returns (body_bytes_before_terminator,
+/// total_bytes_consumed_including_terminator_and_its_trailing_newline).
+/// Returns None if no terminator is found, or if Io is Live (we can't
+/// pre-read live stdin without losing the byte if the user types it).
+fn peek_until_code_terminator() -> Option<(String, usize)> {
+    CURRENT_IO.with(|cell| {
+        let borrow = cell.borrow();
+        let io = borrow.as_ref()?;
+        match io {
+            Io::Buffered { input, in_cursor, .. } => {
+                let rest = &input[*in_cursor..];
+                let (body, consumed) = find_code_terminator(rest)?;
+                let body_str = std::str::from_utf8(body).ok()?.to_string();
+                Some((body_str, consumed))
+            }
+            Io::Live { .. } => None,
+        }
+    })
+}
+
+/// Advance the Io::Buffered in_cursor by `n` bytes. Only meaningful in
+/// Buffered mode; no-op in Live.
+fn advance_io_cursor(n: usize) {
+    CURRENT_IO.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(Io::Buffered { in_cursor, .. }) = borrow.as_mut() {
+            *in_cursor += n;
+        }
+    });
+}
+
+fn find_code_terminator(src: &[u8]) -> Option<(&[u8], usize)> {
+    const TAG: &[u8] = b";CODE";
+    let mut i = 0;
+    while i + TAG.len() <= src.len() {
+        if &src[i..i + TAG.len()] == TAG {
+            let prev_ok = i == 0 || src[i - 1].is_ascii_whitespace();
+            let next_ok = i + TAG.len() == src.len() || src[i + TAG.len()].is_ascii_whitespace();
+            if prev_ok && next_ok {
+                // Consume the trailing newline (and any preceding CR), so
+                // the next refill picks up at the START of the line after
+                // ;CODE instead of seeing an empty line.
+                let mut consumed = i + TAG.len();
+                if consumed < src.len() && src[consumed] == b'\r' { consumed += 1; }
+                if consumed < src.len() && src[consumed] == b'\n' { consumed += 1; }
+                return Some((&src[..i], consumed));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn with_code_assembler<R>(
+    f: impl FnOnce(&mut wfasm::Assembler) -> Result<R, String>,
+) -> Result<R, String> {
+    CODE_ASSEMBLER.with(|cell| {
+        let mut borrowed = cell.borrow_mut();
+        if borrowed.is_none() {
+            let mut asm = wfasm::Assembler::new();
+            asm.register_macro("stk", wfasm::asm::macros::stk);
+            // Preload kernel macros (proc, endp, next, pushd, popd, stk,
+            // win64_call, brk, plus the @assigns for cell / user-area
+            // offsets / tfa constants).
+            asm.assemble("macros.masm", MACROS_SOURCE)
+                .map_err(|e| format!("preload macros.masm: {e}"))?;
+            *borrowed = Some(asm);
+        }
+        f(borrowed.as_mut().unwrap())
+    })
+}
+
 /// Write to current output. Buffered: append to vec. Live: stdout + flush.
 fn write_bytes(bytes: &[u8]) {
     with_current_io(|io| match io {

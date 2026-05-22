@@ -2292,6 +2292,80 @@ proc(noname_word)
     next()
 endp()
 
+; CODE:  ( "name" ASM-TEXT ";CODE" -- )
+;     Defines a new word `name` whose body is raw machine code,
+;     written in JASM-flavour MASM between CODE: and ;CODE.
+;
+;     User asm can use `proc/endp/next/pushd/popd/stk(in,out)` and the
+;     standard register conventions (TOS=rax, DSP=rbp, UP=rbx) -- the
+;     same vocabulary the kernel itself uses.  A trailing `next()` is
+;     auto-appended so the user only has to write the meaningful bytes.
+;
+;     The body compiles in a fresh JIT module via rt_code_compile_body,
+;     which returns the function's address (0 on error).  We then build
+;     a standard dict header for `name` and emit a 12-byte
+;     `mov rax, fn_addr ; jmp rax` trampoline at HERE.  When `name` is
+;     invoked the trampoline does a tail-jump into the compiled code;
+;     the function's own `ret` returns directly to the caller, so the
+;     trampoline costs only two extra instructions per call site.
+;
+;     Interpret-only (like `:`); error throws -2057.
+proc(code_colon_word)
+    call    parse_name                       ; ( -- c-addr u )
+    test    TOS, TOS
+    jnz     .got_name
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    call    throw_namereqd_const
+    call    throw_word
+    next()
+
+.got_name:
+    ; ( c-addr u ) on stack.  Compile body FIRST (so a syntax error in
+    ; the asm doesn't leave a half-baked header in the dictionary).
+    ; Spill u to PAD; the data stack survives the win64_call (DSP=rbp
+    ; is callee-saved) but TOS=rax is the return-value register.
+    mov     [UP + user_PAD], TOS
+
+    mov     rcx, UP
+    win64_call(rt_code_compile_body)
+    test    rax, rax
+    jz      .compile_error
+    mov     [UP + user_PAD + 8], rax         ; stash fn_addr
+
+    mov     TOS, [UP + user_PAD]             ; restore u
+    call    create                           ; consumes (c-addr u); HERE = body
+
+    mov     r8, [UP + user_LATEST]
+    mov     byte ptr [r8 + dh_tfa], tfa_tcol
+
+    ; Emit trampoline: mov rcx, imm64 ; jmp rcx  (12 bytes).  We use
+    ; rcx, not rax, because rax holds the user's TOS at the moment the
+    ; trampoline is entered — clobbering it would silently destroy the
+    ; caller's input value.  rcx is caller-saved and the interpreter
+    ; only puts xt there before jumping in, so we can safely overwrite.
+    mov     rcx, [UP + user_PAD + 8]         ; fn_addr
+    mov     r8,  [UP + user_HERE]
+    mov     byte ptr [r8 + 0], 0x48
+    mov     byte ptr [r8 + 1], 0xB9          ; mov rcx, imm64
+    mov     [r8 + 2], rcx                    ; the 8-byte fn_addr
+    mov     byte ptr [r8 + 10], 0xFF         ; jmp rcx
+    mov     byte ptr [r8 + 11], 0xE1
+    add     r8, 12
+    mov     [UP + user_HERE], r8
+    next()
+
+.compile_error:
+    ; Drop (c-addr u); restore caller's TOS that they had when CODE: ran.
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2057
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
 ; LET  (immediate)
 ;     The whole LET form lives in user-source between current TO_IN and
 ;     the closing `END` token.  We hand it off to the Rust runtime

@@ -98,6 +98,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("repeat",     "repeat_word", 1),
     ("recurse",    "recurse_word", 1),
     ("LET",        "let_word",     1),
+    ("CODE:",      "code_colon_word", 0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -919,6 +920,7 @@ impl Wf64Session {
                 "rt_slurp_len"   => Some(runtime::rt_slurp_len    as *mut c_void),
                 "rt_slurp_pop"   => Some(runtime::rt_slurp_pop    as *mut c_void),
                 "rt_let_compile" => Some(runtime::rt_let_compile as *mut c_void),
+                "rt_code_compile_body" => Some(runtime::rt_code_compile_body as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;

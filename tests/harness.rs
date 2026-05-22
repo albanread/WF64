@@ -2237,6 +2237,59 @@ fn eval_compiled_loop_steps_update_i() {
     assert_eq!(out, " ok\n ok\n ok\n4  ok\n5  ok\n8  ok\n");
 }
 
+#[test]
+fn code_dsl_defines_simple_primitive() {
+    let mut s = sess();
+    // Smallest possible CODE: word — just add 3 to TOS.
+    let out = s.eval("CODE: add3  add rax, 3 ;CODE\n40 add3 .\nbye\n").unwrap();
+    assert_eq!(out, " ok\n43  ok\n");
+}
+
+#[test]
+fn code_dsl_supports_macro_vocabulary() {
+    // The user can write `pushd`, `popd`, `stk(in,out)`, `next()` — all
+    // resolved from the kernel's macros.masm which the CODE: assembler
+    // preloads once.  Body spans multiple lines; rt_code_compile_body
+    // peeks past the current SOURCE buffer into the Io input.
+    let mut s = sess();
+    let out = s.eval(
+        "CODE: triple   ; ( n -- n*3 )\n\
+             mov rcx, rax\n\
+             add rax, rax\n\
+             add rax, rcx\n\
+             stk(1, 1)\n\
+         ;CODE\n\
+         7 triple .\nbye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n21  ok\n");
+}
+
+#[test]
+fn code_dsl_compiled_into_colon_definition() {
+    let mut s = sess();
+    let out = s.eval(
+        "CODE: sq  imul rax, rax ;CODE\n\
+         : sum-of-squares  sq swap sq + ;\n\
+         3 4 sum-of-squares .\nbye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n25  ok\n");
+}
+
+// Note: bad asm syntax inside a CODE: body currently aborts the
+// process because LLVM-MC's parser uses its fatal-error handler when
+// it sees an invalid mnemonic.  Graceful recovery requires an
+// LLVM diagnostic-handler install in wfasm — TODO.  For now,
+// just don't write invalid asm.
+
+#[test]
+fn code_dsl_unterminated_body_reports_error() {
+    let mut s = sess();
+    let err = s.eval("CODE: never_ends  add rax, 1\nbye\n").unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2057") || msg.contains("THROW"),
+        "expected -2057 throw, got: {msg}");
+}
+
 /// LET tests load core.f because they need `f.` and friends from there.
 fn sess_with_core() -> SessionGuard {
     let mut s = sess();
