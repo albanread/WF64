@@ -550,6 +550,83 @@ pub fn reset_let_session() {
     LET_JITS.with(|j| j.borrow_mut().clear());
 }
 
+/// libm functions the LET codegen may reference, with their declared
+/// arity.  Resolved via GetProcAddress on ucrtbase.dll (the Windows
+/// C runtime); missing ones are simply not registered, so a LET that
+/// doesn't use them still compiles fine.
+const LIBM_FUNCTIONS: &[(&str, usize)] = &[
+    ("sin", 1), ("cos", 1), ("tan", 1),
+    ("asin", 1), ("acos", 1), ("atan", 1),
+    ("exp", 1), ("log", 1), ("log2", 1), ("log10", 1),
+    ("atan2", 2), ("pow", 2), ("hypot", 2), ("fmod", 2),
+];
+
+#[cfg(windows)]
+mod win_libm {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_void};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    }
+
+    /// Get a handle to ucrtbase.dll. It's a process-global module — the
+    /// C runtime is already loaded — so LoadLibraryW just bumps the
+    /// refcount.  Cached per-thread to avoid hammering LoadLibrary on
+    /// every LET.
+    pub fn ucrtbase_handle() -> *mut c_void {
+        thread_local! {
+            static HANDLE: std::cell::Cell<*mut c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+        }
+        HANDLE.with(|h| {
+            let cur = h.get();
+            if !cur.is_null() {
+                return cur;
+            }
+            // UTF-16 "ucrtbase.dll\0"
+            let wname: Vec<u16> = "ucrtbase.dll".encode_utf16().chain(std::iter::once(0)).collect();
+            let new = unsafe { LoadLibraryW(wname.as_ptr()) };
+            h.set(new);
+            new
+        })
+    }
+
+    /// GetProcAddress wrapper. Returns None on missing symbol.
+    pub fn proc_addr(module: *mut c_void, name: &str) -> Option<*mut c_void> {
+        if module.is_null() {
+            return None;
+        }
+        let cname = CString::new(name).ok()?;
+        let addr = unsafe { GetProcAddress(module, cname.as_ptr()) };
+        if addr.is_null() { None } else { Some(addr) }
+    }
+}
+
+/// Resolve every libm function in LIBM_FUNCTIONS via GetProcAddress.
+/// Returns the (name → host address) table used by the LET codegen to
+/// bake direct `mov rax, addr; call rax` sequences into compiled LETs.
+/// Missing symbols are simply omitted; the codegen produces an error
+/// only if the user's LET references one that's absent.
+#[cfg(windows)]
+pub fn libm_address_table() -> let_lang::LibmTable {
+    let mut t = let_lang::LibmTable::new();
+    let h = win_libm::ucrtbase_handle();
+    if h.is_null() { return t; }
+    for &(name, _arity) in LIBM_FUNCTIONS {
+        if let Some(addr) = win_libm::proc_addr(h, name) {
+            t.insert(name.to_string(), addr as u64);
+        }
+    }
+    t
+}
+
+#[cfg(not(windows))]
+pub fn libm_address_table() -> let_lang::LibmTable {
+    let_lang::LibmTable::new()
+}
+
 unsafe fn read_u64(addr: u64) -> u64 { unsafe { *(addr as *const u64) } }
 unsafe fn write_u64(addr: u64, val: u64) { unsafe { *(addr as *mut u64) = val } }
 
@@ -599,7 +676,8 @@ unsafe fn try_compile_let(up: u64) -> Result<(), String> {
     let counter = LET_COUNTER.fetch_add(1, Ordering::SeqCst);
     let fn_name = format!("let_user_{counter:04}");
 
-    let compiled = let_lang::compile(&source, &fn_name)
+    let libm_table = libm_address_table();
+    let compiled = let_lang::compile(&source, &fn_name, &libm_table)
         .map_err(|e| e.to_string())?;
 
     // Compile into a fresh JIT module so the main kernel module stays

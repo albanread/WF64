@@ -23,7 +23,17 @@
 pub mod parser;
 pub mod codegen;
 
+use std::collections::HashMap;
+
 pub use parser::{LetError, LetForm};
+
+/// Map from libm function name (e.g. "sin") to its absolute address in
+/// the host process. Populated by the caller (typically the WF64 runtime)
+/// before calling [`compile`], so the LET codegen can bake direct
+/// `mov rax, addr ; call rax` sequences instead of relying on LLVM-MC
+/// symbol resolution (which doesn't auto-find ucrtbase exports on
+/// Windows MCJIT and is awkward to teach).
+pub type LibmTable = HashMap<String, u64>;
 
 /// Result of compiling one LET form to MC-flavour Intel asm text.
 #[derive(Debug)]
@@ -40,9 +50,14 @@ pub struct CompiledLet {
 }
 
 /// Parse and lower a LET form. Does not JIT-compile.
-pub fn compile(source: &str, fn_name: &str) -> Result<CompiledLet, LetError> {
+///
+/// `libm_table`, if present, supplies absolute addresses for libm
+/// functions the LET source may reference (sin, cos, sqrt, pow, ...).
+/// Missing entries cause an error at lower time.  Pass an empty map
+/// for LETs that don't use any libm functions.
+pub fn compile(source: &str, fn_name: &str, libm_table: &LibmTable) -> Result<CompiledLet, LetError> {
     let form = parser::parse(source)?;
-    let asm_text = codegen::lower(&form, fn_name)?;
+    let asm_text = codegen::lower(&form, fn_name, libm_table)?;
     Ok(CompiledLet {
         fn_name: fn_name.to_string(),
         asm_text,
@@ -65,7 +80,12 @@ mod integration_tests {
     /// then c — at call time the stack reads `[c, b, a]` and our test
     /// passes `&[c, b, a]`.
     fn run_let(source: &str, fn_name: &str, inputs: &[f64], expected: &[f64]) {
-        let compiled = compile(source, fn_name)
+        // Get JASM's SEH dumper installed so access violations etc.
+        // produce a readable register/stack dump instead of a silent exit.
+        let _ = wfasm::seh::install();
+
+        let libm = crate::runtime::libm_address_table();
+        let compiled = compile(source, fn_name, &libm)
             .unwrap_or_else(|e| panic!("compile failed: {e}\nsource: {source}"));
         let mut jit = Jit::new(&format!("let_test_{fn_name}")).expect("Jit::new");
         jit.add_asm(&compiled.asm_text)
@@ -169,6 +189,141 @@ mod integration_tests {
         // Forth: `100. 8. div`  → b=8 at TOS, a=100 at NOS.
         // memory order (TOS first): [b=8, a=100].
         run_let("LET (a, b) -> (q) = a / b END", "let_div", &[8.0, 100.0], &[12.5]);
+    }
+
+    // ── SSE intrinsics ───────────────────────────────────────────────
+
+    #[test]
+    fn jit_compiles_sqrt_intrinsic() {
+        run_let("LET (x) -> (y) = sqrt(x) END", "let_sqrt", &[16.0], &[4.0]);
+    }
+
+    #[test]
+    fn jit_compiles_abs_intrinsic() {
+        run_let("LET (x) -> (y) = abs(x) END", "let_abs_neg", &[-3.5], &[3.5]);
+        run_let("LET (x) -> (y) = abs(x) END", "let_abs_pos", &[7.25], &[7.25]);
+    }
+
+    #[test]
+    fn jit_compiles_min_max_intrinsics() {
+        // memory layout: [b, a]
+        run_let("LET (a, b) -> (m) = min(a, b) END", "let_min", &[7.0, 3.0], &[3.0]);
+        run_let("LET (a, b) -> (m) = max(a, b) END", "let_max", &[7.0, 3.0], &[7.0]);
+    }
+
+    #[test]
+    fn jit_compiles_floor_ceil_round_trunc() {
+        run_let("LET (x) -> (y) = floor(x) END", "let_floor", &[2.7], &[2.0]);
+        run_let("LET (x) -> (y) = ceil(x)  END", "let_ceil",  &[2.3], &[3.0]);
+        run_let("LET (x) -> (y) = round(x) END", "let_round", &[2.5], &[2.0]); // banker's: 2.5 → 2
+        run_let("LET (x) -> (y) = trunc(x) END", "let_trunc", &[-2.7], &[-2.0]);
+    }
+
+    // ── libm functions ───────────────────────────────────────────────
+
+    #[test]
+    fn jit_compiles_sin_cos() {
+        // sin(0) = 0, cos(0) = 1
+        run_let("LET (x) -> (y) = sin(x) END", "let_sin_zero", &[0.0], &[0.0]);
+        run_let("LET (x) -> (y) = cos(x) END", "let_cos_zero", &[0.0], &[1.0]);
+    }
+
+    #[test]
+    fn jit_compiles_sin_of_pi_over_2() {
+        // sin(pi/2) ≈ 1.0
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        run_let("LET (x) -> (y) = sin(x) END", "let_sin_pi2", &[half_pi], &[1.0]);
+    }
+
+    #[test]
+    fn jit_compiles_pow_via_libm() {
+        run_let(
+            "LET (b, e) -> (r) = pow(b, e) END",
+            "let_pow_explicit",
+            &[3.0, 2.0],  // [e=3, b=2] — e is TOS, b deeper
+            &[8.0],       // 2^3 = 8
+        );
+    }
+
+    #[test]
+    fn jit_compiles_star_star_operator() {
+        // ** is desugared to pow(lhs, rhs) by A-normal form.
+        run_let(
+            "LET (x) -> (y) = x ** 3 END",
+            "let_cube_via_starstar",
+            &[2.0],
+            &[8.0],
+        );
+    }
+
+    #[test]
+    fn jit_compiles_hypot() {
+        // hypot(3, 4) = 5
+        run_let(
+            "LET (a, b) -> (r) = hypot(a, b) END",
+            "let_hypot",
+            &[4.0, 3.0],  // [b=4, a=3] in memory
+            &[5.0],
+        );
+    }
+
+    #[test]
+    fn libm_atan2_direct_callable() {
+        // Sanity check: the address GetProcAddress gave us is in fact a
+        // working atan2 — call it directly from Rust before involving the
+        // JIT.  If THIS crashes too, the address itself is bogus and the
+        // problem isn't in our codegen.
+        let libm = crate::runtime::libm_address_table();
+        let addr = *libm.get("atan2").expect("atan2 in libm table");
+        let f: unsafe extern "system" fn(f64, f64) -> f64 = unsafe { std::mem::transmute(addr) };
+        let r = unsafe { f(1.0, 1.0) };
+        assert!((r - std::f64::consts::FRAC_PI_4).abs() < 1e-10, "got {r}");
+    }
+
+    #[test]
+    fn jit_compiles_atan2() {
+        // atan2(1, 1) = pi/4
+        let pi_4 = std::f64::consts::FRAC_PI_4;
+        run_let(
+            "LET (y, x) -> (a) = atan2(y, x) END",
+            "let_atan2",
+            &[1.0, 1.0],
+            &[pi_4],
+        );
+    }
+
+    #[test]
+    fn jit_compiles_exp_log_roundtrip() {
+        // log(exp(x)) ≈ x
+        run_let(
+            "LET (x) -> (y) = log(exp(x)) END",
+            "let_explog",
+            &[2.0],
+            &[2.0],
+        );
+    }
+
+    #[test]
+    fn jit_compiles_nested_calls_via_a_normal_form() {
+        // sqrt(sin(x)*sin(x) + cos(x)*cos(x)) = 1.0
+        run_let(
+            "LET (x) -> (y) = sqrt(sin(x)*sin(x) + cos(x)*cos(x)) END",
+            "let_sin2_plus_cos2",
+            &[1.5],
+            &[1.0],
+        );
+    }
+
+    #[test]
+    fn jit_compiles_distance_2d() {
+        // The point-distance example from the spec — Euclidean distance via hypot.
+        // Inputs in memory: [y2, x2, y1, x1].
+        run_let(
+            "LET (x1, y1, x2, y2) -> (d) = hypot(x2 - x1, y2 - y1) END",
+            "let_dist",
+            &[200.0, 200.0, 100.0, 100.0],
+            &[141.4213562373095],
+        );
     }
 }
 

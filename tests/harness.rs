@@ -2358,6 +2358,48 @@ fn let_dsl_where_bindings_topo_sort() {
 }
 
 #[test]
+fn let_dsl_sqrt_via_forth_repl() {
+    let mut s = sess_with_core();
+    // Hypotenuse of (3, 4) = 5.
+    let out = s.eval(
+        ": hyp LET (x, y) -> (h) = sqrt(x*x + y*y) END ;\n\
+         3.0 4.0 hyp f.\nbye\n"
+    ).unwrap();
+    assert!(out.contains("5.000000"), "got {out:?}");
+}
+
+#[test]
+fn let_dsl_sin_cos_via_forth_repl() {
+    let mut s = sess_with_core();
+    // sin(0) + cos(0) = 0 + 1 = 1.
+    let out = s.eval(
+        ": both LET (x) -> (y) = sin(x) + cos(x) END ;\n\
+         0.0 both f.\nbye\n"
+    ).unwrap();
+    assert!(out.contains("1.000000"), "got {out:?}");
+}
+
+#[test]
+fn let_dsl_hypot_via_forth_repl() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": dist LET (x, y) -> (d) = hypot(x, y) END ;\n\
+         3.0 4.0 dist f.\nbye\n"
+    ).unwrap();
+    assert!(out.contains("5.000000"), "got {out:?}");
+}
+
+#[test]
+fn let_dsl_star_star_operator() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": cube LET (x) -> (y) = x ** 3 END ;\n\
+         2.0 cube f.\nbye\n"
+    ).unwrap();
+    assert!(out.contains("8.000000"), "got {out:?}");
+}
+
+#[test]
 fn let_dsl_compile_only_outside_colon() {
     let mut s = sess_with_core();
     // LET in interpret state runs `comp_only_word` → THROW -14.
