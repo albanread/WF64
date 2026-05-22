@@ -129,7 +129,9 @@ variable hld
 
 \ ANS Forth Core / Core-ext words
 
+tools-wordlist set-current
 : ?  @ . ;
+forth-wordlist set-current
 
 : buffer: create allot ;
 
@@ -198,6 +200,9 @@ variable hld
 \ string; SUBSTITUTE walks a source string and expands %name% references
 \ into a user-supplied destination buffer.
 
+\ ── SUBSTITUTE / REPLACES internal state (PRIVATE) ───────────────────────
+private-wordlist set-current
+
 16 constant subst-max
 create subst-table subst-max 4 cells * allot
 variable subst-count
@@ -224,6 +229,9 @@ subst-init
         then
     loop  2drop false ;
 
+\ User-facing REPLACES / SUBSTITUTE return to FORTH:
+forth-wordlist set-current
+
 \ REPLACES ( c-addr1 u1 c-addr2 u2 -- )
 \ Bind name (c-addr2 u2) to value (c-addr1 u1).
 : replaces  ( v-addr v-len n-addr n-len -- )
@@ -246,7 +254,8 @@ subst-init
         then
     then ;
 
-\ SUBSTITUTE state (variables keep stack juggling sane).
+\ SUBSTITUTE state (variables keep stack juggling sane) -- PRIVATE.
+private-wordlist set-current
 variable sub-src    variable sub-srclen
 variable sub-dst    variable sub-dstmax    variable sub-dstlen
 variable sub-count
@@ -262,6 +271,7 @@ variable sub-count
 
 : sub-advance  ( -- )   1 sub-src +!   -1 sub-srclen +! ;
 : sub-peek     ( -- ch )  sub-src @ c@ ;
+forth-wordlist set-current
 
 \ SUBSTITUTE ( c-addr1 u1 c-addr2 u2 -- c-addr2 u3 n )
 \ Copy c-addr1/u1 to c-addr2/u2 expanding %name% (and %% → %).
@@ -356,12 +366,15 @@ variable sub-count
 \ implementation (slow but correct); a chunked version would need
 \ SetFilePointerEx to push back overrun.
 
+\ READ-LINE state is PRIVATE; READ-LINE itself is FORTH (defined just below).
+private-wordlist set-current
 variable rl-fid
 variable rl-buf
 variable rl-max
 variable rl-pos
 variable rl-ior
 variable rl-state                 \ 0=continue 1=EOF-no-data 2=clean-end 3=error
+forth-wordlist set-current
 
 : read-line  ( c-addr u1 fileid -- u2 flag ior )
     rl-fid !  rl-max !  rl-buf !
@@ -418,7 +431,10 @@ variable rl-state                 \ 0=continue 1=EOF-no-data 2=clean-end 3=error
 \ The kernel's ; and EXIT auto-emit `add r15, N*cell` before the RET
 \ based on user_LOCALS_COUNT, then ; zeros that count.
 
-\ Scratch helpers for the locals table.
+\ Scratch helpers for the locals table -- PRIVATE.  The user-facing
+\ {: word itself stays in FORTH (defined just below).
+private-wordlist set-current
+
 : locals-table  ( -- addr )       base $15C8 + ;
 : locals-slot   ( idx -- addr )   5 lshift  locals-table + ;
 
@@ -436,6 +452,8 @@ variable ls-len
     ls-idx @ cells  ls-idx @ locals-slot 16 + ! ;  \ byte-offset
 
 : locals-closer?  ( c-addr u -- flag )  s" :}" str= ;
+
+forth-wordlist set-current
 
 : {:
     0                                       ( cell-offset )
@@ -498,6 +516,7 @@ variable ls-len
 \ FORGET ( "name" -- )    Roll back the dictionary past the named word
 \ by calling forget_last repeatedly until the name is no longer findable.
 \ Honors the kernel FORGET_FENCE (forget_last is a no-op past it).
+tools-wordlist set-current
 : forget  ( "name" -- )
     parse-name 2dup find-name
     0= if 2drop 2drop -13 throw then
@@ -519,6 +538,7 @@ variable ls-len
     dup 0 ?do  space dup pick u.  loop drop
     cr
     s" Current: " type  get-current u.  cr ;
+forth-wordlist set-current
 
 \ UNDER+ ( n1 n2 n3 -- n1+n3 n2 )    Add n3 to n1 leaving n2 unchanged on top.
 : under+  ( n1 n2 n3 -- n1+n3 n2 )  rot + swap ;
@@ -555,8 +575,10 @@ variable ls-len
     then ;
 
 \ ENDS-WITH? ( c-addr u suffix-addr suffix-u -- flag )
+private-wordlist set-current
 variable ew-suffix-u
 variable ew-suffix-addr
+forth-wordlist set-current
 
 : ends-with?  ( c-addr u suffix-addr suffix-u -- flag )
     ew-suffix-u !   ew-suffix-addr !
@@ -686,6 +708,8 @@ variable ew-suffix-addr
 \ Interpret mode: leaves (addr len) pointing into a static 256-byte buffer.
 \ Compile mode:  embeds the processed bytes inline via SLITERAL.
 
+\ Scratch buffer + helper words are PRIVATE; s\" itself is FORTH.
+private-wordlist set-current
 256 buffer: s-q-buf
 
 : s-q-getch  ( -- ch )
@@ -722,6 +746,7 @@ variable ew-suffix-addr
         dup
     endcase ;
 
+forth-wordlist set-current
 : s\"
     s-q-buf 0                            ( dst count )
     begin
@@ -819,6 +844,7 @@ variable ew-suffix-addr
 \ MARKER ( "name" -- )  Create a word that, when executed, restores the
 \ dictionary state (HERE, LATEST) to what it was just before MARKER ran.
 \ user_HERE = 0x18 = 24, user_LATEST = 0x10 = 16 (base = UP).
+tools-wordlist set-current
 : marker  ( "name" -- )
     base 24 + @  base 16 + @         \ snapshot ( here-before latest-before )
     create swap , ,
@@ -826,8 +852,12 @@ variable ew-suffix-addr
         dup @ base 24 + !            \ restore HERE
         cell+ @ base 16 + !          \ restore LATEST
 ;
+forth-wordlist set-current
 
 \ ── [DEFINED] / [UNDEFINED] / [IF] / [ELSE] / [THEN] (Tools-ext) ──────────
+\ User-facing bracket words are TOOLS; the [skip] helper and the two
+\ state variables are PRIVATE.
+tools-wordlist set-current
 
 : [defined]    ( "name" -- flag )
     parse-name find-name if drop -1 else 2drop 0 then ; immediate
@@ -835,6 +865,7 @@ variable ew-suffix-addr
 : [undefined]  ( "name" -- flag )
     postpone [defined] 0= ; immediate
 
+private-wordlist set-current
 variable bracket-depth
 variable bracket-stop-else
 
@@ -858,17 +889,34 @@ variable bracket-stop-else
         then
     until ;
 
+tools-wordlist set-current
 : [if]    ( flag -- )   0= if true [skip] then ; immediate
 : [else]  ( -- )        false [skip] ;          immediate
 : [then]  ( -- )        ;                        immediate
+forth-wordlist set-current
 
 \ ── Programmer's tools ─────────────────────────────────────────────────────
-: words  ( -- )
-    base 16 + @
-    begin dup while
-        dup link>name count type space
-        @
-    repeat drop cr ;
+\ Each wordlist is a 512-slot bucket array starting at the wid.  Each
+\ bucket points to a chain of overlay nodes; each node's [+16] cell
+\ holds a pointer back to the dictionary header.  dh_nt (offset 47)
+\ points at the counted name string.
+tools-wordlist set-current
+
+: words-in  ( wid -- )
+    512 0 ?do
+        dup i cells + @                       ( wid node )
+        begin dup while
+            dup 16 + @ 47 + count type space
+            @                                  ( wid next-node )
+        repeat drop
+    loop drop cr ;
+
+: words  ( -- )  get-current words-in ;
+
+\ Per-vocabulary listing words for convenience.
+: forth-words    forth-wordlist   words-in ;
+: tools-words    tools-wordlist   words-in ;
+: private-words  private-wordlist words-in ;
 
 : .byte  ( n -- )
     base @ >r hex
@@ -882,3 +930,5 @@ variable bracket-stop-else
         over 15 and 15 = if cr then
         1+
     repeat 2drop cr ;
+
+forth-wordlist set-current

@@ -623,6 +623,22 @@ proc(forth_wordlist_word)
     next()
 endp()
 
+; tools-wordlist  ( -- wid )
+proc(tools_wordlist_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_TOOLS_WID]
+    stk(0, 1)
+    next()
+endp()
+
+; private-wordlist  ( -- wid )
+proc(private_wordlist_word)
+    mov     [DSP - cell], TOS
+    mov     TOS, [UP + user_PRIVATE_WID]
+    stk(0, 1)
+    next()
+endp()
+
 
 ; get-current  ( -- wid )
 proc(get_current_word)

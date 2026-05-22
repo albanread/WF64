@@ -2422,6 +2422,47 @@ fn bootstrap_splits_primitives_into_three_wordlists() {
     assert_eq!(probe(&mut s, "(create)", forth_wid),   0);
     assert_eq!(probe(&mut s, "(create)", tools_wid),   0);
     assert_ne!(probe(&mut s, "(create)", private_wid), 0);
+
+}
+
+#[test]
+fn core_f_categorises_source_defined_words_correctly() {
+    // After loading core.f, source-defined words must end up in the
+    // wordlist their inline `set-current` directives put them in.
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+
+    let forth_wid   = unsafe { ((s.user_base + 0x1508) as *const u64).read_unaligned() } as i64;
+    let tools_wid   = unsafe { ((s.user_base + 0x17C8) as *const u64).read_unaligned() } as i64;
+    let private_wid = unsafe { ((s.user_base + 0x17D0) as *const u64).read_unaligned() } as i64;
+
+    s.eval(": probe-sw  ( c-addr u wid -- flag )  search-wordlist dup if nip then ;\nbye\n")
+        .unwrap();
+    fn probe(s: &mut Wf64Session, name: &str, wid: i64) -> i64 {
+        let code = format!(
+            "s\" {name}\" {wid} probe-sw .\nbye\n",
+            name = name, wid = wid
+        );
+        let out = s.eval(&code).unwrap();
+        out.split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    // TOOLS-tagged source words.
+    assert_ne!(probe(&mut s, "words",      tools_wid),   0);
+    assert_ne!(probe(&mut s, "marker",     tools_wid),   0);
+    assert_ne!(probe(&mut s, "[defined]",  tools_wid),   0);
+    assert_eq!(probe(&mut s, "marker",     forth_wid),   0);
+
+    // PRIVATE-tagged source words.
+    assert_ne!(probe(&mut s, "locals-set", private_wid), 0);
+    assert_ne!(probe(&mut s, "subst-find", private_wid), 0);
+    assert_eq!(probe(&mut s, "locals-set", forth_wid),   0);
+
+    // FORTH-tagged source words (user-facing).
+    assert_ne!(probe(&mut s, "constant",   forth_wid),   0);
+    assert_ne!(probe(&mut s, "{:",         forth_wid),   0);
+    assert_ne!(probe(&mut s, "floor",      forth_wid),   0);
 }
 
 #[test]

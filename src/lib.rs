@@ -379,6 +379,8 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     (">in",        "to_in_word", 0),
     ("find-name",  "find_name",  0),
     ("forth-wordlist", "forth_wordlist_word", 0),
+    ("tools-wordlist", "tools_wordlist_word", 0),
+    ("private-wordlist", "private_wordlist_word", 0),
     ("wordlist",   "wordlist_word", 0),
     ("get-current", "get_current_word", 0),
     ("set-current", "set_current_word", 0),
@@ -817,6 +819,8 @@ pub struct Wf64Session {
     /// pointers that create circular chains when the next test reuses
     /// the same overlay addresses.
     boot_wl_buckets: Vec<u64>,
+    boot_tools_buckets: Vec<u64>,
+    boot_private_buckets: Vec<u64>,
 }
 
 // SAFETY: Wf64Session holds raw LLVM pointers via `Jit` that aren't
@@ -976,6 +980,8 @@ impl Wf64Session {
             boot_index_here: 0,
             boot_index_latest: 0,
             boot_wl_buckets: Vec::new(),
+            boot_tools_buckets: Vec::new(),
+            boot_private_buckets: Vec::new(),
         };
 
         let xt_init_dictionary_overlay = session.xt_of("init_dictionary_overlay")?;
@@ -995,8 +1001,18 @@ impl Wf64Session {
         // leave stale bucket heads that create circular chains when the
         // next test reuses the same overlay addresses.
         let forth_wid = session.user_u64(USER_FORTH_WID);
+        let tools_wid_snap   = session.user_u64(USER_TOOLS_WID);
+        let private_wid_snap = session.user_u64(USER_PRIVATE_WID);
         session.boot_wl_buckets = unsafe {
             std::slice::from_raw_parts(forth_wid as *const u64, 512)
+                .to_vec()
+        };
+        session.boot_tools_buckets = unsafe {
+            std::slice::from_raw_parts(tools_wid_snap as *const u64, 512)
+                .to_vec()
+        };
+        session.boot_private_buckets = unsafe {
+            std::slice::from_raw_parts(private_wid_snap as *const u64, 512)
                 .to_vec()
         };
         session.write_user_u64(USER_FORGET_FENCE, session.boot_latest);
@@ -1374,6 +1390,23 @@ impl Wf64Session {
             std::ptr::copy_nonoverlapping(
                 self.boot_wl_buckets.as_ptr(),
                 forth_wid as *mut u64,
+                512,
+            );
+        }
+        // Same for TOOLS and PRIVATE -- without this, overlay entries
+        // added to those wordlists during a test leave stale bucket
+        // heads that create circular chains on the next test.
+        let tools_wid_r = self.user_u64(USER_TOOLS_WID);
+        let private_wid_r = self.user_u64(USER_PRIVATE_WID);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.boot_tools_buckets.as_ptr(),
+                tools_wid_r as *mut u64,
+                512,
+            );
+            std::ptr::copy_nonoverlapping(
+                self.boot_private_buckets.as_ptr(),
+                private_wid_r as *mut u64,
                 512,
             );
         }
