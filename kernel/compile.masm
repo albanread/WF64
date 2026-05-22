@@ -2291,3 +2291,34 @@ proc(noname_word)
     mov     qword ptr [UP + user_STATE], 1  ; enter compile mode
     next()
 endp()
+
+; LET  (immediate)
+;     The whole LET form lives in user-source between current TO_IN and
+;     the closing `END` token.  We hand it off to the Rust runtime
+;     `rt_let_compile`, which parses, lowers via let_lang::compile, JITs
+;     into a fresh module, and emits a Win64 trampoline at HERE that
+;     loads the inputs from the Forth FP stack, calls the compiled
+;     function, and adjusts FSP.
+;
+;     Compile-only.  On any compile error rt_let_compile prints to
+;     stderr and returns u64::MAX; we surface that as THROW -2056.
+proc(let_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    call    comp_only_word
+    next()
+.in_compile:
+    mov     rcx, UP                          ; arg1 = UP
+    win64_call(rt_let_compile)
+    test    rax, rax
+    jz      .ok
+    ; LET compile failed; throw a distinct error code.  rt_let_compile
+    ; has already printed details to stderr.
+    mov     [DSP - cell], TOS
+    mov     TOS, -2056
+    stk(0, 1)
+    call    throw_word
+    next()
+.ok:
+    next()
+endp()

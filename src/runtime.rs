@@ -508,6 +508,248 @@ pub extern "C" fn rt_slurp_pop() -> u64 {
     })
 }
 
+// ── LET DSL compilation ──────────────────────────────────────────────
+//
+// `rt_let_compile(up)` is called by the kernel's immediate `LET` word.
+// It reads the LET source from the current input buffer up to the next
+// `END` token, compiles it via [`crate::let_lang`], JITs the result in
+// a fresh module (kept alive in `LET_JITS`), and emits a Win64
+// trampoline at HERE that loads inputs from the Forth FP stack,
+// invokes the compiled function, and adjusts FSP.
+//
+// Returns 0 on success or `u64::MAX` (= -1 as i64) on any error;
+// error details are printed to stderr.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use wfasm::Jit;
+
+use crate::let_lang;
+
+// User-area offsets — keep in sync with macros.masm.
+const RT_USER_SOURCE_ADDR: u64 = 0x30;
+const RT_USER_SOURCE_LEN:  u64 = 0x38;
+const RT_USER_TO_IN:       u64 = 0x40;
+const RT_USER_HERE:        u64 = 0x18;
+const RT_USER_FSP:         u64 = 0x1218;
+
+thread_local! {
+    /// Compiled LET functions live in their own JIT modules.  We keep
+    /// every Jit alive for the duration of the session so the executable
+    /// pages don't get freed under us when a colon definition still
+    /// holds a CALL to the compiled function pointer.
+    static LET_JITS: RefCell<Vec<Jit>> = RefCell::new(Vec::new());
+}
+
+/// Counter for generating unique LET function names. Persists for the
+/// process lifetime; we don't reuse names because old Jits may still hold
+/// the old name (and that's fine, but a fresh counter avoids confusion).
+static LET_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Drop every LET-compiled Jit. Called by session reset between tests.
+pub fn reset_let_session() {
+    LET_JITS.with(|j| j.borrow_mut().clear());
+}
+
+unsafe fn read_u64(addr: u64) -> u64 { unsafe { *(addr as *const u64) } }
+unsafe fn write_u64(addr: u64, val: u64) { unsafe { *(addr as *mut u64) = val } }
+
+/// Compile a LET form from the current input buffer.
+///
+/// # Safety
+/// `up` must point to a valid Forth user area whose SOURCE_ADDR /
+/// SOURCE_LEN / TO_IN / HERE fields are correctly maintained by the
+/// kernel.
+#[no_mangle]
+pub extern "C" fn rt_let_compile(up: u64) -> u64 {
+    match unsafe { try_compile_let(up) } {
+        Ok(()) => 0,
+        Err(msg) => {
+            eprintln!("LET compile error: {msg}");
+            u64::MAX
+        }
+    }
+}
+
+unsafe fn try_compile_let(up: u64) -> Result<(), String> {
+    let src_base = unsafe { read_u64(up + RT_USER_SOURCE_ADDR) };
+    let src_len  = unsafe { read_u64(up + RT_USER_SOURCE_LEN)  };
+    let to_in    = unsafe { read_u64(up + RT_USER_TO_IN)        };
+
+    if to_in > src_len {
+        return Err(format!("TO_IN ({to_in}) past SOURCE_LEN ({src_len})"));
+    }
+
+    let remaining = unsafe {
+        std::slice::from_raw_parts(
+            (src_base + to_in) as *const u8,
+            (src_len - to_in) as usize,
+        )
+    };
+
+    let (body_bytes, consumed) = find_end_token(remaining)
+        .ok_or_else(|| "no closing 'END' token in LET body".to_string())?;
+    let body_str = std::str::from_utf8(body_bytes)
+        .map_err(|_| "LET body is not UTF-8".to_string())?;
+
+    // Our parser starts at `LET`; the keyword was already consumed by
+    // the Forth interpreter before dispatching to our word.  Prepend
+    // it back, plus the closing END, so parser sees a complete form.
+    let source = format!("LET{body_str}END");
+
+    let counter = LET_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let fn_name = format!("let_user_{counter:04}");
+
+    let compiled = let_lang::compile(&source, &fn_name)
+        .map_err(|e| e.to_string())?;
+
+    // Compile into a fresh JIT module so the main kernel module stays
+    // frozen and we don't fight MCJIT's whole-module finalization rule.
+    let mut jit = Jit::new(&format!("let_mod_{counter:04}"))
+        .map_err(|e| format!("Jit::new: {e:?}"))?;
+    jit.add_asm(&compiled.asm_text)
+        .map_err(|e| format!("add_asm: {e:?}\nasm was:\n{}", compiled.asm_text))?;
+    jit.declare_fn(&compiled.fn_name, 0)
+        .map_err(|e| format!("declare_fn({}): {e:?}", compiled.fn_name))?;
+    let fn_addr = jit.lookup_addr(&compiled.fn_name)
+        .map_err(|e| format!("lookup_addr({}): {e:?}", compiled.fn_name))?;
+
+    LET_JITS.with(|j| j.borrow_mut().push(jit));
+
+    let here = unsafe { read_u64(up + RT_USER_HERE) };
+    let trampoline_len = unsafe {
+        emit_let_trampoline(here, fn_addr, compiled.n_inputs, compiled.n_outputs)
+    };
+    unsafe { write_u64(up + RT_USER_HERE, here + trampoline_len as u64); }
+    unsafe { write_u64(up + RT_USER_TO_IN, to_in + consumed as u64); }
+    Ok(())
+}
+
+/// Find the next "END" token in `src` (whitespace-delimited).
+/// Returns (body-before-END, total-bytes-consumed-including-END).
+fn find_end_token(src: &[u8]) -> Option<(&[u8], usize)> {
+    let mut i = 0;
+    while i + 3 <= src.len() {
+        if &src[i..i + 3] == b"END" {
+            let prev_ok = i == 0 || !is_ident_byte(src[i - 1]);
+            let next_ok = i + 3 == src.len() || !is_ident_byte(src[i + 3]);
+            if prev_ok && next_ok {
+                return Some((&src[..i], i + 3));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_ident_byte(b: u8) -> bool { b.is_ascii_alphanumeric() || b == b'_' }
+
+/// Emit Win64 trampoline at `here` calling fn_addr with rcx = FSP and
+/// rdx = FSP + delta, then bumping FSP by delta where delta = (n_in - n_out)*8.
+/// Returns the number of bytes emitted.
+unsafe fn emit_let_trampoline(here: u64, fn_addr: u64, n_in: usize, n_out: usize) -> usize {
+    let delta: i64 = (n_in as i64 - n_out as i64) * 8;
+    let delta_i32: i32 = delta as i32;
+    let dst = here as *mut u8;
+    let mut p: usize = 0;
+
+    // mov rcx, qword ptr [rbx + USER_FSP] :: 48 8B 8B disp32
+    unsafe {
+        *dst.add(p) = 0x48; p += 1;
+        *dst.add(p) = 0x8B; p += 1;
+        *dst.add(p) = 0x8B; p += 1;
+        write_i32(dst.add(p), RT_USER_FSP as i32); p += 4;
+    }
+
+    // rdx = rcx + delta
+    if delta == 0 {
+        unsafe {
+            // mov rdx, rcx :: 48 89 CA
+            *dst.add(p) = 0x48; p += 1;
+            *dst.add(p) = 0x89; p += 1;
+            *dst.add(p) = 0xCA; p += 1;
+        }
+    } else if (-128..=127).contains(&delta) {
+        unsafe {
+            // lea rdx, [rcx + imm8] :: 48 8D 51 imm8
+            *dst.add(p) = 0x48; p += 1;
+            *dst.add(p) = 0x8D; p += 1;
+            *dst.add(p) = 0x51; p += 1;
+            *dst.add(p) = (delta as i8) as u8; p += 1;
+        }
+    } else {
+        unsafe {
+            // lea rdx, [rcx + imm32] :: 48 8D 91 imm32
+            *dst.add(p) = 0x48; p += 1;
+            *dst.add(p) = 0x8D; p += 1;
+            *dst.add(p) = 0x91; p += 1;
+            write_i32(dst.add(p), delta_i32); p += 4;
+        }
+    }
+
+    // mov r12, rsp :: 49 89 E4
+    unsafe {
+        *dst.add(p) = 0x49; p += 1;
+        *dst.add(p) = 0x89; p += 1;
+        *dst.add(p) = 0xE4; p += 1;
+        // and rsp, -16 :: 48 83 E4 F0
+        *dst.add(p) = 0x48; p += 1;
+        *dst.add(p) = 0x83; p += 1;
+        *dst.add(p) = 0xE4; p += 1;
+        *dst.add(p) = 0xF0; p += 1;
+        // sub rsp, 32 :: 48 83 EC 20
+        *dst.add(p) = 0x48; p += 1;
+        *dst.add(p) = 0x83; p += 1;
+        *dst.add(p) = 0xEC; p += 1;
+        *dst.add(p) = 0x20; p += 1;
+        // mov rax, imm64 :: 48 B8 [8 bytes]
+        *dst.add(p) = 0x48; p += 1;
+        *dst.add(p) = 0xB8; p += 1;
+        write_u64_le(dst.add(p), fn_addr); p += 8;
+        // call rax :: FF D0
+        *dst.add(p) = 0xFF; p += 1;
+        *dst.add(p) = 0xD0; p += 1;
+        // mov rsp, r12 :: 4C 89 E4
+        *dst.add(p) = 0x4C; p += 1;
+        *dst.add(p) = 0x89; p += 1;
+        *dst.add(p) = 0xE4; p += 1;
+    }
+
+    // Adjust FSP by delta.
+    if delta == 0 {
+        // nothing to emit
+    } else if (-128..=127).contains(&delta) {
+        unsafe {
+            // add qword ptr [rbx + USER_FSP], imm8 :: 48 83 83 disp32 imm8
+            *dst.add(p) = 0x48; p += 1;
+            *dst.add(p) = 0x83; p += 1;
+            *dst.add(p) = 0x83; p += 1;
+            write_i32(dst.add(p), RT_USER_FSP as i32); p += 4;
+            *dst.add(p) = (delta as i8) as u8; p += 1;
+        }
+    } else {
+        unsafe {
+            // add qword ptr [rbx + USER_FSP], imm32 :: 48 81 83 disp32 imm32
+            *dst.add(p) = 0x48; p += 1;
+            *dst.add(p) = 0x81; p += 1;
+            *dst.add(p) = 0x83; p += 1;
+            write_i32(dst.add(p), RT_USER_FSP as i32); p += 4;
+            write_i32(dst.add(p), delta_i32); p += 4;
+        }
+    }
+
+    p
+}
+
+unsafe fn write_i32(dst: *mut u8, val: i32) {
+    let bytes = val.to_le_bytes();
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 4); }
+}
+
+unsafe fn write_u64_le(dst: *mut u8, val: u64) {
+    let bytes = val.to_le_bytes();
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8); }
+}
+
 /// Write to current output. Buffered: append to vec. Live: stdout + flush.
 fn write_bytes(bytes: &[u8]) {
     with_current_io(|io| match io {

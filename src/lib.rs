@@ -36,6 +36,8 @@ use std::ptr;
 use anyhow::{Context, Result};
 use wfasm::{Assembler, Jit};
 
+pub mod let_lang;
+
 pub const KERNEL_ENTRY: &str = "kernel/main.masm";
 
 /// (forth_name, asm_symbol, flags). Insertion order = scan order:
@@ -95,6 +97,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("until",      "until_word", 1),
     ("repeat",     "repeat_word", 1),
     ("recurse",    "recurse_word", 1),
+    ("LET",        "let_word",     1),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -915,6 +918,7 @@ impl Wf64Session {
                 "rt_slurp_file"  => Some(runtime::rt_slurp_file   as *mut c_void),
                 "rt_slurp_len"   => Some(runtime::rt_slurp_len    as *mut c_void),
                 "rt_slurp_pop"   => Some(runtime::rt_slurp_pop    as *mut c_void),
+                "rt_let_compile" => Some(runtime::rt_let_compile as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;

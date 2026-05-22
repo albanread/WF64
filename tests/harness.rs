@@ -2237,6 +2237,76 @@ fn eval_compiled_loop_steps_update_i() {
     assert_eq!(out, " ok\n ok\n ok\n4  ok\n5  ok\n8  ok\n");
 }
 
+/// LET tests load core.f because they need `f.` and friends from there.
+fn sess_with_core() -> SessionGuard {
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).expect("load core.f");
+    s
+}
+
+#[test]
+fn let_dsl_area_of_circle() {
+    let mut s = sess_with_core();
+    let out = s.eval(": area LET (r) -> (a) = pi * r * r END ;\n2.0 area f.\nbye\n").unwrap();
+    // pi * 4 = 12.566370614359172
+    assert!(out.contains("12.566"), "got {out:?}");
+}
+
+#[test]
+fn let_dsl_multi_input_multi_output_mbrot() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": mbrot LET (z_re, z_im, x, y) -> (z_next_re, z_next_im, mag) = \
+            re, im, rmag \
+            WHERE re   = z_re * z_re - z_im * z_im + x \
+            WHERE im   = 2 * z_re * z_im + y \
+            WHERE rmag = re * re + im * im \
+         END ;\n1.0 1.0 1.0 1.0 mbrot f. f. f.\nbye\n"
+    ).unwrap();
+    // f. prints TOS first: mag=10, im=3, z_next_re=1.
+    assert!(out.contains("10."), "expected '10.' in output: {out:?}");
+    assert!(out.contains("3."),  "expected '3.' in output: {out:?}");
+    assert!(out.contains("1."),  "expected '1.' in output: {out:?}");
+}
+
+#[test]
+fn let_dsl_arithmetic_chain() {
+    let mut s = sess_with_core();
+    let out = s.eval(": poly LET (x) -> (y) = x * x + 2 * x + 1 END ;\n3.0 poly f.\nbye\n").unwrap();
+    // 9 + 6 + 1 = 16
+    assert!(out.contains("16."), "got {out:?}");
+}
+
+#[test]
+fn let_dsl_unary_minus() {
+    let mut s = sess_with_core();
+    let out = s.eval(": negsq LET (x) -> (y) = -(x * x) END ;\n5.0 negsq f.\nbye\n").unwrap();
+    assert!(out.contains("-25."), "got {out:?}");
+}
+
+#[test]
+fn let_dsl_where_bindings_topo_sort() {
+    let mut s = sess_with_core();
+    // WHERE clauses out-of-order: rmag depends on re/im which depend on inputs.
+    // Topo sort must place re/im before rmag.
+    let out = s.eval(
+        ": sq2 LET (a, b) -> (r) = rmag WHERE rmag = re + im WHERE re = a*a WHERE im = b*b END ;\n\
+         3.0 4.0 sq2 f.\nbye\n"
+    ).unwrap();
+    assert!(out.contains("25."), "got {out:?}");
+}
+
+#[test]
+fn let_dsl_compile_only_outside_colon() {
+    let mut s = sess_with_core();
+    // LET in interpret state runs `comp_only_word` → THROW -14.
+    let err = s.eval("LET (x) -> (y) = x END\nbye\n").unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-14") || msg.contains("THROW"),
+        "expected -14 throw, got: {msg}");
+}
+
 #[test]
 fn eval_if_else_then_and_minus_if_work() {
     let mut s = sess();
