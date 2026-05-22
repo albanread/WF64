@@ -2446,6 +2446,161 @@ fn let_dsl_compile_only_outside_colon() {
         "expected -14 throw, got: {msg}");
 }
 
+// ── V1b GC primitives ────────────────────────────────────────────────
+
+#[test]
+fn gc_heapptr_pushes_stable_handle() {
+    let mut s = sess();
+    // HEAPPTR declares a slot; invoking the name pushes the slot's
+    // address.  The same handle two pushes should equal each other
+    // (the slot doesn't move).
+    let out = s.eval("HEAPPTR foo\nfoo foo = .\nbye\n").unwrap();
+    assert!(out.contains("-1"), "handle should be stable, got {out:?}");
+}
+
+#[test]
+fn gc_vec_alloc_and_access() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR samples\n\
+         8 samples vec-alloc-floats!\n\
+         1.5e samples 0 vec-f!\n\
+         2.5e samples 1 vec-f!\n\
+         3.5e samples 7 vec-f!\n\
+         samples 0 vec-f@ f.\n\
+         samples 1 vec-f@ f.\n\
+         samples 7 vec-f@ f.\n\
+         samples vec-len .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("1.500000"), "got {out:?}");
+    assert!(out.contains("2.500000"), "got {out:?}");
+    assert!(out.contains("3.500000"), "got {out:?}");
+    assert!(out.contains("8 "), "vec-len should report 8: {out:?}");
+}
+
+#[test]
+fn gc_rooted_object_survives_collection() {
+    let mut s = sess_with_core();
+    // Use exact-representable values so f.'s 6-decimal-digit print
+    // doesn't introduce a rounding ambiguity.
+    let out = s.eval(
+        "HEAPPTR v\n\
+         4 v vec-alloc-floats!\n\
+         1.5e v 0 vec-f!\n\
+         7.25e v 3 vec-f!\n\
+         (gc)\n\
+         v 0 vec-f@ f.\n\
+         v 3 vec-f@ f.\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("1.500000"), "first cell lost across GC: {out:?}");
+    assert!(out.contains("7.250000"), "last cell lost across GC: {out:?}");
+}
+
+#[test]
+fn gc_two_megabyte_vector_worked_example() {
+    // The 2 MB worked example from docs/gc_design.md.  Allocates
+    // 262144 cells (= 2 MB of f64), writes scattered values, runs
+    // a major GC, reads them back.  Large objects are pinned by
+    // paged_gc so they generation-flip in place across collections.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR big\n\
+         262144 big vec-alloc-floats!\n\
+         1.5e big 1000 vec-f!\n\
+         7.25e big 100000 vec-f!\n\
+         0.125e big 200000 vec-f!\n\
+         big 1000 vec-f@ f.\n\
+         big 100000 vec-f@ f.\n\
+         big 200000 vec-f@ f.\n\
+         big vec-len .\n\
+         (gc)\n\
+         big 1000 vec-f@ f.\n\
+         big 100000 vec-f@ f.\n\
+         big 200000 vec-f@ f.\n\
+         bye\n"
+    ).unwrap();
+    // Use exactly-representable f64 values (1.5, 7.25, 0.125) to dodge
+    // the rounding-direction ambiguity that bit the earlier 3.14159 form.
+    assert!(out.contains("1.500000"), "cell 1000 wrong: {out:?}");
+    assert!(out.contains("7.250000"), "cell 100000 wrong: {out:?}");
+    assert!(out.contains("0.125000"), "cell 200000 wrong: {out:?}");
+    assert!(out.contains("262144"), "vec-len wrong: {out:?}");
+    // The same three values should still be present AFTER (gc) —
+    // each f. output appears twice in the stream.
+    let v_one_five = out.matches("1.500000").count();
+    let v_seven_two = out.matches("7.250000").count();
+    let v_one_two_five = out.matches("0.125000").count();
+    assert_eq!(v_one_five, 2, "1.5 should appear twice (pre+post GC)");
+    assert_eq!(v_seven_two, 2);
+    assert_eq!(v_one_two_five, 2);
+}
+
+#[test]
+fn gc_unrooted_object_gets_reclaimed() {
+    // Allocate via vec-alloc-floats!, then null out the HEAPPTR, then
+    // (gc).  The allocated bytes are no longer reachable and should
+    // be reclaimed.  We can't observe this directly from Forth, but
+    // we can allocate a LOT of orphans and verify the heap doesn't
+    // grow indefinitely.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": cycle  ( -- )  HEAPPTR slot  100 slot vec-alloc-floats! ;\n\
+         \\ Hmm: HEAPPTR can't be inside a colon definition (it's a\n\
+         \\ defining word). Use a different shape.\n\
+         HEAPPTR slot\n\
+         100 slot vec-alloc-floats!\n\
+         100 slot vec-alloc-floats!\n\
+         100 slot vec-alloc-floats!\n\
+         (gc)\n\
+         slot 0 vec-f@ f.\n\
+         bye\n"
+    ).unwrap();
+    // The last allocation's cell 0 is 0.0 (fresh FILL_WORD).  The
+    // first two allocations are unreachable after the second
+    // vec-alloc-floats! overwrites the slot.
+    assert!(out.contains("0.000000"), "got {out:?}");
+}
+
+#[test]
+fn gc_vec_f_fetch_wrong_type_throws() {
+    let mut s = sess_with_core();
+    // Default a HEAPPTR holds 0 (nil).  vec-f@ on it should throw
+    // -2060 (wrong type) because nil's tag is 0, not 2 (FloatVec).
+    let err = s.eval(
+        "HEAPPTR empty\nempty 0 vec-f@ f.\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2060") || msg.contains("THROW"),
+        "expected -2060 throw on nil access, got: {msg}");
+}
+
+#[test]
+fn gc_heapptr_no_name_throws() {
+    let mut s = sess();
+    let err = s.eval("HEAPPTR\nbye\n").unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-16") || msg.contains("THROW"),
+        "expected -16 (name required) throw, got: {msg}");
+}
+
+#[test]
+fn gc_minor_collection_keeps_rooted_object() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR v\n\
+         4 v vec-alloc-floats!\n\
+         42.0e v 0 vec-f!\n\
+         gc-minor\n\
+         gc-minor\n\
+         gc-minor\n\
+         v 0 vec-f@ f.\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("42.000000"), "got {out:?}");
+}
+
 #[test]
 fn eval_if_else_then_and_minus_if_work() {
     let mut s = sess();

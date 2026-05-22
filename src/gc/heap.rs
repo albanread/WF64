@@ -14,8 +14,26 @@
 use std::cell::RefCell;
 
 use newgc_core::{Generation, PageHeap};
+use newgc_core::page_heap::PAGE_SIZE_CELLS;
 
 use super::layout::{HeapType, Wf64Layout, make_header, tag_pointer};
+
+/// Allocate `n_cells` (header + payload) in `gen`, routing to the
+/// small-object path or the large-object path as appropriate.
+/// paged_gc's `try_alloc_boxed_in` caps at one page (8192 cells);
+/// anything larger needs `try_alloc_large` which finds a run of
+/// contiguous free pages.
+fn try_alloc_in(
+    heap: &mut PageHeap<Wf64Layout>,
+    gen: Generation,
+    n_cells: usize,
+) -> Option<std::ptr::NonNull<u64>> {
+    if n_cells <= PAGE_SIZE_CELLS {
+        heap.try_alloc_boxed_in(gen, n_cells)
+    } else {
+        heap.try_alloc_large(n_cells, gen)
+    }
+}
 
 /// Default heap reservation: 64 MB.  paged_gc reserves address
 /// space lazily via VirtualAlloc; the physical pages don't get
@@ -60,7 +78,7 @@ pub fn with_wf_heap<R>(f: impl FnOnce(&mut PageHeap<Wf64Layout>) -> R) -> R {
 pub fn alloc_floatvec(n_cells: u32) -> Option<u64> {
     with_wf_heap(|heap| {
         let total = 1 + n_cells as usize;
-        let ptr = heap.try_alloc_boxed_in(Generation::G0, total)?;
+        let ptr = try_alloc_in(heap, Generation::G0, total)?;
         unsafe {
             *ptr.as_ptr() = make_header(HeapType::FloatVec, n_cells);
             // Payload cells already zero (FILL_WORD).
@@ -74,7 +92,7 @@ pub fn alloc_floatvec(n_cells: u32) -> Option<u64> {
 pub fn alloc_refvec(n_cells: u32) -> Option<u64> {
     with_wf_heap(|heap| {
         let total = 1 + n_cells as usize;
-        let ptr = heap.try_alloc_boxed_in(Generation::G0, total)?;
+        let ptr = try_alloc_in(heap, Generation::G0, total)?;
         unsafe {
             *ptr.as_ptr() = make_header(HeapType::RefVec, n_cells);
         }
@@ -89,7 +107,7 @@ pub fn alloc_string(n_bytes: u32) -> Option<u64> {
     with_wf_heap(|heap| {
         let payload_cells = ((n_bytes as usize) + 7) / 8;
         let total = 1 + payload_cells;
-        let ptr = heap.try_alloc_boxed_in(Generation::G0, total)?;
+        let ptr = try_alloc_in(heap, Generation::G0, total)?;
         unsafe {
             *ptr.as_ptr() = make_header(HeapType::String, n_bytes);
         }
