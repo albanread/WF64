@@ -95,9 +95,34 @@ proc(compile_comma)
     mov     dword ptr [r8 + 1], eax
     add     r8, 5
     mov     [UP + user_HERE], r8
+    mov     [UP + user_TAIL_CALL], r8        ; remember the position right
+                                              ; after the CALL for ; / EXIT
+                                              ; tail-call optimisation
     ; Drop xt.
     mov     TOS, [DSP]
     stk(1, 0)                                ; add rbp, 8
+    next()
+endp()
+
+; xt-call,-no-tco  ( xt -- )
+;     Identical to compile, except it does NOT mark the emitted CALL as a
+;     tail-call candidate.  Used as the dh_comp helper for primitives that
+;     pop / juggle the return address themselves (rdrop, 2rdrop, n>r,
+;     nr>) — patching those CALLs into JMPs would feed the callee a
+;     stale rstack and crash.  Also clears any pending TAIL_CALL set by
+;     an earlier compile, so the next ; / EXIT doesn't wrongly tail-call
+;     a previously-emitted safe CALL across this unsafe one.
+proc(compile_comma_no_tco)
+    mov     r8, [UP + user_HERE]
+    mov     byte ptr [r8], 0xE8
+    sub     TOS, r8
+    sub     TOS, 5
+    mov     dword ptr [r8 + 1], eax
+    add     r8, 5
+    mov     [UP + user_HERE], r8
+    mov     qword ptr [UP + user_TAIL_CALL], 0
+    mov     TOS, [DSP]
+    stk(1, 0)
     next()
 endp()
 
@@ -142,6 +167,7 @@ proc(inline_comma_word)
     mov     dword ptr [r10 + 1], eax
     add     r10, 5
     mov     [UP + user_HERE], r10
+    mov     [UP + user_TAIL_CALL], r10
     mov     TOS, [DSP]
     stk(1, 0)
     next()
@@ -1549,10 +1575,11 @@ proc(colon)
     call    create
     mov     r8, [UP + user_LATEST]
     mov     byte ptr [r8 + dh_tfa], tfa_tcol
-    ; Enter compile mode. Clear any stale locals state in case a prior
-    ; compile aborted mid-definition.
+    ; Enter compile mode. Clear any stale locals state and tail-call
+    ; tracking in case a prior compile aborted mid-definition.
     mov     qword ptr [UP + user_STATE], 1
     mov     qword ptr [UP + user_LOCALS_COUNT], 0
+    mov     qword ptr [UP + user_TAIL_CALL], 0
     next()
 endp()
 
@@ -1591,17 +1618,32 @@ proc(semicolon)
 .in_compile:
     call    emit_locals_release
     mov     r8, [UP + user_HERE]
+    ; Tail-call optimisation: if the most recent CALL is immediately
+    ; before the RET we're about to emit, patch its 0xE8 opcode to
+    ; 0xE9 (JMP).  The rel32 byte layout is identical, so the callee
+    ; still receives control at the same offset -- but no return
+    ; address is pushed, and its own RET pops our caller's return
+    ; address directly.  emit_locals_release advances HERE past the
+    ; tail-call slot when a locals frame is present, so this only
+    ; fires for leaf-frame words.
+    cmp     r8, [UP + user_TAIL_CALL]
+    jne     .no_tco
+    mov     byte ptr [r8 - 5], 0xE9
+.no_tco:
     mov     byte ptr [r8], 0xC3              ; RET
     inc     r8
     mov     [UP + user_HERE], r8
     mov     qword ptr [UP + user_STATE], 0
-    mov     qword ptr [UP + user_LOCALS_COUNT], 0   ; reset for next definition
+    mov     qword ptr [UP + user_LOCALS_COUNT], 0
+    mov     qword ptr [UP + user_TAIL_CALL], 0      ; clear for next definition
     next()
 endp()
 
 ; exit  ( -- )                                        IMMEDIATE
 ;     Compile an early return from the current definition. If the
-;     definition has a locals frame, release it first.
+;     definition has a locals frame, release it first.  Same tail-call
+;     optimisation as ; (patches a preceding CALL into a JMP when the
+;     RET is the only thing emitted after it).
 proc(exit_word)
     cmp     qword ptr [UP + user_STATE], 0
     jne     .in_compile
@@ -1612,7 +1654,11 @@ proc(exit_word)
 .in_compile:
     call    emit_locals_release
     mov     r8, [UP + user_HERE]
-    mov     byte ptr [r8], 0xC3              ; RET
+    cmp     r8, [UP + user_TAIL_CALL]
+    jne     .no_tco
+    mov     byte ptr [r8 - 5], 0xE9
+.no_tco:
+    mov     byte ptr [r8], 0xC3
     inc     r8
     mov     [UP + user_HERE], r8
     next()

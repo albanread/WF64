@@ -11,3 +11,4 @@ desktop.ini
 Thumbs.db
 LLVM-C.dll
 *.out
+!tests/data/**/*.out

@@ -455,6 +455,7 @@ pub const KERNEL_HELPERS: &[&str] = &[
     "do_clit",
     "compile_word",
     "compile_comma",
+    "compile_comma_no_tco",
     "inline_dup_comp",
     "inline_drop_comp",
     "inline_swap_comp",
@@ -1158,6 +1159,13 @@ impl Wf64Session {
             "plus_loop_word" => Some("inline_plus_loop_comp"),
             "minus_loop_word" => Some("inline_minus_loop_comp"),
             "unloop_word" => Some("inline_unloop_comp"),
+            // TCO-unsafe primitives: they pop / juggle the return address
+            // themselves, so the tail-call-opt `; / EXIT` patch (CALL→JMP)
+            // would feed them a wrong rstack and crash.
+            "rdrop"       => Some("compile_comma_no_tco"),
+            "two_rdrop"   => Some("compile_comma_no_tco"),
+            "n_to_r"      => Some("compile_comma_no_tco"),
+            "nr_from"     => Some("compile_comma_no_tco"),
             _ => None,
         };
         helper

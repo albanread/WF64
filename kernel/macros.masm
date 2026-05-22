@@ -94,6 +94,9 @@
                                       ;   [+24..31]: padding
 @assign user_TOOLS_WID   = 0x17C8    ; wid of the TOOLS wordlist (set at boot)
 @assign user_PRIVATE_WID = 0x17D0    ; wid of the PRIVATE wordlist (set at boot)
+@assign user_TAIL_CALL   = 0x17D8    ; HERE just after the most recently emitted CALL
+                                      ;   (0 if not preceded by a fresh CALL).  Used by
+                                      ;   ; and EXIT for tail-call optimisation.
 
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier
