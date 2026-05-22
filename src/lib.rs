@@ -456,6 +456,13 @@ pub const KERNEL_HELPERS: &[&str] = &[
     "compile_word",
     "compile_comma",
     "compile_comma_no_tco",
+    "try_fold_literal",
+    "fold_plus_comp",
+    "fold_minus_comp",
+    "fold_times_comp",
+    "fold_and_comp",
+    "fold_or_comp",
+    "fold_xor_comp",
     "inline_dup_comp",
     "inline_drop_comp",
     "inline_swap_comp",
@@ -1166,6 +1173,15 @@ impl Wf64Session {
             "two_rdrop"   => Some("compile_comma_no_tco"),
             "n_to_r"      => Some("compile_comma_no_tco"),
             "nr_from"     => Some("compile_comma_no_tco"),
+            // Literal-folding binops: emit an immediate-form instruction
+            // when the preceding bytes are `call do_lit ; .quad N`.
+            // Falls back to a normal CALL on any non-match.
+            "plus"        => Some("fold_plus_comp"),
+            "minus"       => Some("fold_minus_comp"),
+            "times"       => Some("fold_times_comp"),
+            "and_"        => Some("fold_and_comp"),
+            "or_"         => Some("fold_or_comp"),
+            "xor_"        => Some("fold_xor_comp"),
             _ => None,
         };
         helper

@@ -1976,6 +1976,107 @@ fn compiled_raw_branch_emitters_have_expected_bytes() {
 }
 
 #[test]
+fn literal_fold_imm8_emits_immediate_form_instruction() {
+    // `5 +` should fold to `add rax, 5` (4 bytes) followed by RET — no
+    // 13-byte literal emission, no CALL to plus.
+    let mut s = sess();
+    let out = s.eval(": addfive 5 + ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 5) };
+    assert_eq!(bytes, &[0x48, 0x83, 0xC0, 0x05, 0xC3],
+        "expected `add rax, 5; ret`, got {:02X?}", bytes);
+
+    // Same definition runs correctly.
+    let out = s.eval("1 addfive .\nbye\n").unwrap();
+    assert_eq!(out, "6  ok\n");
+}
+
+#[test]
+fn literal_fold_imm32_emits_accumulator_form() {
+    // 1000 = 0x3E8 doesn't fit in signed imm8 but does in imm32, so
+    // we expect the 6-byte accumulator form `48 05 E8 03 00 00`.
+    let mut s = sess();
+    let out = s.eval(": addbig 1000 + ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 7) };
+    assert_eq!(bytes, &[0x48, 0x05, 0xE8, 0x03, 0x00, 0x00, 0xC3],
+        "expected `add rax, 1000; ret`, got {:02X?}", bytes);
+
+    let out = s.eval("5 addbig .\nbye\n").unwrap();
+    assert_eq!(out, "1005  ok\n");
+}
+
+#[test]
+fn literal_fold_all_binops_emit_their_immediate_form() {
+    // One canonical imm8 fold per op, checking the opcode/modrm bytes.
+    let cases: &[(&str, &str, u8, u8)] = &[
+        // (Forth source, name, opcode-byte, modrm-byte)
+        (": fadd  3 + ;",   "fadd",  0x83, 0xC0),  // ADD /0
+        (": fsub  3 - ;",   "fsub",  0x83, 0xE8),  // SUB /5
+        (": fmul  3 * ;",   "fmul",  0x6B, 0xC0),  // IMUL rax,rax,imm8
+        (": fand  3 and ;", "fand",  0x83, 0xE0),  // AND /4
+        (": for   3 or ;",  "for",   0x83, 0xC8),  // OR  /1
+        (": fxor  3 xor ;", "fxor",  0x83, 0xF0),  // XOR /6
+    ];
+    let mut s = sess();
+    for &(src, _name, opcode, modrm) in cases {
+        s.eval(&format!("{src}\nbye\n")).unwrap();
+        s.call("latestxt").unwrap();
+        let xt = s.pop() as u64;
+        let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 5) };
+        assert_eq!(bytes, &[0x48, opcode, modrm, 0x03, 0xC3],
+            "fold mismatch for `{src}` — got {:02X?}", bytes);
+    }
+}
+
+#[test]
+fn literal_fold_skipped_when_no_preceding_literal() {
+    // `+` with no preceding literal must fall back to a plain CALL
+    // (no fold).  Phase A2's tail-call optimisation then patches the
+    // CALL into a JMP because `+` is the last word before `;`, so
+    // the final bytes are `JMP plus; RET` (the RET is dead code).
+    let mut s = sess();
+    let out = s.eval(": twoadd + ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 6) };
+    assert_eq!(bytes[0], 0xE9,
+        "expected JMP opcode (CALL → JMP via TCO), got {:02X}", bytes[0]);
+    assert_eq!(bytes[5], 0xC3, "expected trailing RET, got {:02X}", bytes[5]);
+
+    // Behaviour: 3 4 twoadd → 7
+    let out = s.eval("3 4 twoadd .\nbye\n").unwrap();
+    assert_eq!(out, "7  ok\n");
+}
+
+#[test]
+fn literal_fold_chains_through_consecutive_lit_op_pairs() {
+    // `1 + 2 * 3 -` should fold to three immediate-form instructions
+    // back to back: add rax,1 ; imul rax,rax,2 ; sub rax,3 ; ret.
+    let mut s = sess();
+    let out = s.eval(": chain 1 + 2 * 3 - ;\nbye\n").unwrap();
+    assert_eq!(out, " ok\n");
+    s.call("latestxt").unwrap();
+    let xt = s.pop() as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(xt as *const u8, 13) };
+    assert_eq!(bytes, &[
+        0x48, 0x83, 0xC0, 0x01,           // add  rax, 1
+        0x48, 0x6B, 0xC0, 0x02,           // imul rax, rax, 2
+        0x48, 0x83, 0xE8, 0x03,           // sub  rax, 3
+        0xC3,                              // ret
+    ], "got {:02X?}", bytes);
+
+    // (x + 1) * 2 - 3 → at x=5 → 6*2-3 = 9
+    let out = s.eval("5 chain .\nbye\n").unwrap();
+    assert_eq!(out, "9  ok\n");
+}
+
+#[test]
 fn eval_raw_branch_placeholders_preserve_stack_effects() {
     let mut s = sess();
     let out = s.eval(
