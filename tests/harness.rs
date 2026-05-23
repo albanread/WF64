@@ -3953,8 +3953,6 @@ fn str_split_empty_haystack_yields_one_empty_piece() {
 }
 
 #[test]
-
-#[test]
 fn str_split_empty_sep_throws() {
     let mut s = sess_with_core();
     let err = s.eval(
@@ -3977,6 +3975,253 @@ fn str_d_wrong_types_throw() {
     ).unwrap_err();
     let msg = format!("{err:?}");
     assert!(msg.contains("-2060"), "got {msg}");
+}
+
+// ── V2s stage E — UTF-8, floats, char$, $words ────────────────────
+
+#[test]
+fn str_clen_ascii_equals_byte_length() {
+    let mut s = sess_with_core();
+    let out = s.eval("s\" hello\" >$ $clen .\nbye\n").unwrap();
+    assert!(out.contains("5  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_clen_utf8_counts_codepoints_not_bytes() {
+    // U+00E9 'é' is 2 bytes, U+20AC '€' is 3 bytes — so "é€" is
+    // 5 bytes but only 2 codepoints.  Build via char$ + $+ so we
+    // don't have to embed multi-byte literals in the Rust source.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "233 char$ 8364 char$ $+\n\
+         dup $len .\n\
+         $clen .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![5, 2], "expected (5 bytes, 2 chars); got {nums:?}");
+}
+
+#[test]
+fn str_c_at_returns_codepoint() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" abc\" >$\n\
+         dup 0 $c@ .                 \\ 'a' = 97\n\
+         dup 1 $c@ .                 \\ 'b' = 98\n\
+         dup 2 $c@ .                 \\ 'c' = 99\n\
+         drop\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![97, 98, 99], "got {nums:?}");
+}
+
+#[test]
+fn str_c_at_handles_multibyte_codepoints() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "233 char$ 8364 char$ $+\n\
+         dup 0 $c@ .                 \\ 'é' = 233\n\
+         dup 1 $c@ .                 \\ '€' = 8364\n\
+         drop\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![233, 8364], "got {nums:?}");
+}
+
+#[test]
+fn str_c_at_out_of_bounds_throws() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "s\" abc\" >$ 10 $c@ .\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2058"),
+        "out-of-bounds $c@ should throw -2058; got {msg}");
+}
+
+#[test]
+fn str_valid_true_for_ascii() {
+    let mut s = sess_with_core();
+    let out = s.eval("s\" hello\" >$ $valid? .\nbye\n").unwrap();
+    assert!(out.contains("-1  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_valid_true_for_well_formed_utf8() {
+    let mut s = sess_with_core();
+    let out = s.eval("233 char$ $valid? .\nbye\n").unwrap();
+    assert!(out.contains("-1  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_validate_passes_for_ascii_drops_the_handle() {
+    let mut s = sess_with_core();
+    let out = s.eval("s\" hello\" >$ $validate 42 .\nbye\n").unwrap();
+    assert!(out.contains("42  ok"),
+        "stack should be just 42 after $validate; got {out:?}");
+}
+
+#[test]
+fn str_char_dollar_round_trip_via_c_at() {
+    let mut s = sess_with_core();
+    let out = s.eval("65 char$ 0 $c@ .\nbye\n").unwrap();
+    assert!(out.contains("65  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_char_dollar_surrogate_throws() {
+    let mut s = sess_with_core();
+    // 0xD800 is the start of the UTF-16 surrogate range — invalid
+    // as a standalone Unicode codepoint.
+    let err = s.eval("55296 char$ drop\nbye\n").unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2063"),
+        "surrogate codepoint should throw -2063; got {msg}");
+}
+
+#[test]
+fn str_upper_ascii() {
+    let mut s = sess_with_core();
+    let out = s.eval("s\" hello\" >$ $upper $>addr type cr\nbye\n").unwrap();
+    assert!(out.contains("HELLO"), "got {out:?}");
+}
+
+#[test]
+fn str_lower_ascii() {
+    let mut s = sess_with_core();
+    let out = s.eval("s\" HELLO\" >$ $lower $>addr type cr\nbye\n").unwrap();
+    assert!(out.contains("hello"), "got {out:?}");
+}
+
+#[test]
+fn str_upper_unicode_lengthens_for_german_ess() {
+    // ß (U+00DF, 2 bytes UTF-8) uppercases to "SS" (2 bytes ASCII).
+    // Same byte count by accident — pick a clearer one:
+    // ﬁ (U+FB01, 3 bytes, "fi" ligature) uppercases to "FI" (2 bytes).
+    // Hmm, output is shorter.  Just check that the bytes change
+    // sensibly via byte content.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "223 char$               \\ ß = U+00DF\n\
+         $upper $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    // Should print "SS".
+    assert!(out.contains("SS"), "got {out:?}");
+}
+
+#[test]
+fn str_to_float_parses_simple() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" 1.5\" >$ $>f . f.\n\
+         s\" -3.25\" >$ $>f . f.\n\
+         bye\n"
+    ).unwrap();
+    // Each round produces -1 (true) on the data stack and the float
+    // on the FP stack.  `. f.` prints true then the float.
+    assert!(out.contains("1.500000"), "1.5 parse fail; got {out:?}");
+    assert!(out.contains("-3.250000"), "-3.25 parse fail; got {out:?}");
+    let signs: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .filter(|&n| n == -1 || n == 0)
+        .collect();
+    assert_eq!(signs.len(), 2, "should have 2 true flags; got {signs:?} in {out:?}");
+}
+
+#[test]
+fn str_to_float_failure_returns_false() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" not a float\" >$ $>f .\n\
+         bye\n"
+    ).unwrap();
+    // On failure: only 0 pushed, no FP push.
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![0], "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_float_to_string_round_trip() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "1.5e f>$ $>addr type cr\n\
+         -3.25e f>$ $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("1.5"), "got {out:?}");
+    assert!(out.contains("-3.25"), "got {out:?}");
+}
+
+#[test]
+fn str_sb_append_float() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR b\n\
+         32 sb-new b !\n\
+         1.5e b @ sb-append-f\n\
+         s\" , \" >$ b @ sb-append$\n\
+         -3.25e b @ sb-append-f\n\
+         b @ sb>string $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("1.5, -3.25"), "got {out:?}");
+}
+
+#[test]
+fn str_words_basic_three_tokens() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" foo bar baz\" >$ $words .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("3  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_words_consume_pieces_in_reverse() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" alpha beta gamma\" >$ $words\n\
+         drop\n\
+         $>addr type cr             \\ gamma\n\
+         $>addr type cr             \\ beta\n\
+         $>addr type cr             \\ alpha\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("gamma"), "got {out:?}");
+    assert!(out.contains("beta"),  "got {out:?}");
+    assert!(out.contains("alpha"), "got {out:?}");
+}
+
+#[test]
+fn str_words_collapses_repeated_and_skips_edge_whitespace() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\"   foo   bar   \" >$ $words .\n\
+         bye\n"
+    ).unwrap();
+    // s" eats one leading space.  Even so, runs of internal/edge
+    // whitespace should yield exactly 2 tokens.
+    assert!(out.contains("2  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_words_empty_haystack_zero_tokens() {
+    let mut s = sess_with_core();
+    let out = s.eval("empty$ $words .\nbye\n").unwrap();
+    assert!(out.contains("0  ok"), "got {out:?}");
 }
 
 #[test]

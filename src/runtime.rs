@@ -1130,6 +1130,189 @@ pub extern "C" fn rt_int_to_string(up: u64, n: u64) -> u64 {
     rt_string_from_bytes(up, s.as_ptr() as u64, s.len() as u64)
 }
 
+// ── V2s stage E — UTF-8-aware ops, floats, char$, $words ────────────
+
+/// Codepoint count: number of Unicode scalar values in `tagged`.
+/// Walks the UTF-8 payload counting non-continuation bytes (bytes
+/// whose top two bits are NOT `10`).  Returns `u64::MAX` on
+/// malformed UTF-8.
+#[no_mangle]
+pub extern "C" fn rt_string_clen(tagged: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return u64::MAX;
+    };
+    s.chars().count() as u64
+}
+
+/// Read the codepoint at character index `char_idx`.  Returns the
+/// codepoint as u32 (in u64) on success, or `u64::MAX` if the
+/// index is out of range OR the payload is malformed UTF-8.
+#[no_mangle]
+pub extern "C" fn rt_string_cat(tagged: u64, char_idx: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return u64::MAX;
+    };
+    match s.chars().nth(char_idx as usize) {
+        Some(c) => c as u64,
+        None => u64::MAX,
+    }
+}
+
+/// True (returns -1) iff the payload is well-formed UTF-8.
+/// Cheap predicate; no allocation.
+#[no_mangle]
+pub extern "C" fn rt_string_valid(tagged: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    if std::str::from_utf8(bytes).is_ok() { u64::MAX } else { 0 }
+}
+
+/// Allocate a single-codepoint `String` containing the UTF-8
+/// encoding of `codepoint`.  Returns `u64::MAX` for invalid
+/// codepoints (surrogates or > U+10FFFF).
+#[no_mangle]
+pub extern "C" fn rt_char_to_string(up: u64, codepoint: u64) -> u64 {
+    let Some(c) = char::from_u32(codepoint as u32) else {
+        eprintln!("char$: invalid codepoint {codepoint:#x}");
+        return u64::MAX;
+    };
+    let mut buf = [0u8; 4];
+    let encoded = c.encode_utf8(&mut buf);
+    rt_string_from_bytes(up, encoded.as_ptr() as u64, encoded.len() as u64)
+}
+
+/// Unicode-aware uppercase conversion.  Allocates a fresh String;
+/// the result's byte length may differ from the input's (e.g.
+/// German ß uppercases to "SS").  Returns `u64::MAX` on alloc
+/// failure or malformed UTF-8 in the input.
+#[no_mangle]
+pub extern "C" fn rt_string_upper(up: u64, tagged: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        eprintln!("$upper: input is not valid UTF-8");
+        return u64::MAX;
+    };
+    let upper: String = s.to_uppercase();
+    rt_string_from_bytes(up, upper.as_ptr() as u64, upper.len() as u64)
+}
+
+/// Unicode-aware lowercase conversion.  Same shape as `rt_string_upper`.
+#[no_mangle]
+pub extern "C" fn rt_string_lower(up: u64, tagged: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        eprintln!("$lower: input is not valid UTF-8");
+        return u64::MAX;
+    };
+    let lower: String = s.to_lowercase();
+    rt_string_from_bytes(up, lower.as_ptr() as u64, lower.len() as u64)
+}
+
+/// Parse `tagged` as an f64.  On success writes the bits to
+/// `*out_bits` and returns `u64::MAX` (Forth true).  On failure
+/// returns 0 (Forth false) and `*out_bits` is unchanged.
+/// Trims surrounding ASCII whitespace before parsing.
+#[no_mangle]
+pub extern "C" fn rt_string_to_float(tagged: u64, out_bits: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    let trimmed = text.trim();
+    // Accept Forth-style trailing 'e' / 'e+' / 'e-' (just like
+    // normalize_float_token does for the legacy `>float`).
+    let mut owned: String;
+    let candidate = if let Some(s) = normalize_float_token(trimmed) {
+        owned = s;
+        owned.as_str()
+    } else {
+        trimmed
+    };
+    match candidate.parse::<f64>() {
+        Ok(v) => {
+            unsafe { *(out_bits as *mut u64) = v.to_bits(); }
+            u64::MAX
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Format an f64 (passed as raw bits) as a `String`.  Uses Rust's
+/// default Display for f64 — `{}` formatting — which produces
+/// shortest-round-trip output.  Some output examples: 1, 1.5,
+/// -3.14159, inf, NaN.
+#[no_mangle]
+pub extern "C" fn rt_float_to_string(up: u64, bits: u64) -> u64 {
+    let v = f64::from_bits(bits);
+    let s = format!("{v}");
+    rt_string_from_bytes(up, s.as_ptr() as u64, s.len() as u64)
+}
+
+/// Append the formatted-float representation of `bits` to the
+/// builder.  Returns 0 on success, `u64::MAX` on capacity overflow.
+#[no_mangle]
+pub extern "C" fn rt_sb_append_float(builder_tagged: u64, bits: u64) -> u64 {
+    let v = f64::from_bits(bits);
+    let s = format!("{v}");
+    rt_sb_append_bytes(builder_tagged, s.as_ptr() as u64, s.len() as u64)
+}
+
+/// Whitespace-tokenise `haystack`: split on runs of ASCII
+/// whitespace, dropping empty pieces (so leading/trailing/repeated
+/// whitespace doesn't produce zero-length tokens).  Same writes-to-
+/// caller-buffer protocol as `rt_string_split_into`.
+///
+/// `_up` is accepted for signature symmetry but unused — pieces
+/// allocate via the no-retry path so a mid-loop collect_full
+/// can't move earlier pieces.
+#[no_mangle]
+pub extern "C" fn rt_string_words_into(
+    _up: u64,
+    haystack: u64,
+    out_addr: u64,
+    max_parts: u64,
+) -> u64 {
+    let (h_ptr, h_len) = unsafe { string_payload(haystack) };
+    let h = unsafe { std::slice::from_raw_parts(h_ptr, h_len) };
+    let out = out_addr as *mut u64;
+    let mut written: u64 = 0;
+    let mut i = 0usize;
+    while i < h_len {
+        // Skip whitespace.
+        while i < h_len && h[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= h_len { break; }
+        // Mark token start; advance over non-whitespace.
+        let start = i;
+        while i < h_len && !h[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if written >= max_parts {
+            eprintln!("$words: too many tokens (max {max_parts})");
+            return u64::MAX;
+        }
+        let piece = alloc_string_copy_no_retry(
+            unsafe { h_ptr.add(start) },
+            i - start,
+        );
+        if piece == u64::MAX {
+            eprintln!("$words: out of GC heap mid-tokenise");
+            return u64::MAX;
+        }
+        unsafe { *out.add(written as usize) = piece; }
+        written += 1;
+    }
+    written
+}
+
 /// True iff `needle` occurs anywhere in `haystack` (byte search).
 /// Empty needle is always considered contained.
 #[no_mangle]

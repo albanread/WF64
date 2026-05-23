@@ -20,6 +20,8 @@
 ;   -2060  type mismatch (slot held something that wasn't a String)
 ;   -2061  nil dereference
 ;   -2062  builder capacity exceeded (V2s stage C1)
+;   -2063  invalid UTF-8 (V2s stage E — $validate, $upper/$lower
+;          on malformed input, char$ on a surrogate codepoint)
 ; ─────────────────────────────────────────────────────────────────────
 
 
@@ -1437,6 +1439,407 @@ proc(string_split_word)
     mov     [DSP - cell], TOS
     mov     TOS, -2061
     stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; ── V2s stage E — UTF-8, floats, char$, $words ──────────────────────
+
+
+; $clen  ( $h -- chars )
+;     Codepoint count.  O(n) scan of the UTF-8 payload.  Throws
+;     -2063 on malformed UTF-8.  New throw code: -2063 = invalid
+;     UTF-8 (see throw-codes section at top of file).
+proc(string_clen_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r9
+    win64_call(rt_string_clen)
+    cmp     rax, -1
+    je      .invalid
+    mov     TOS, rax
+    next()
+.invalid:
+    mov     TOS, -2063
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; $c@  ( $h char-idx -- codepoint )
+;     Codepoint at character index.  Throws -2058 on out-of-bounds,
+;     -2063 on malformed UTF-8.
+proc(string_cat_word)
+    ; Stack: char-idx in TOS, $h at [DSP].
+    mov     r9, [DSP]
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r9
+    mov     rdx, TOS
+    win64_call(rt_string_cat)
+    cmp     rax, -1
+    je      .bounds
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.bounds:
+    ; Drop both, push -2058.  (Either OOB or malformed UTF-8 — the
+    ; Rust side prints a more specific stderr message either way.)
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2058
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $valid?  ( $h -- f )
+;     True iff the payload bytes are well-formed UTF-8.  Cheap
+;     predicate.
+proc(string_valid_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r9
+    win64_call(rt_string_valid)
+    mov     TOS, rax
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; $validate  ( $h -- )
+;     Throws -2063 if $h is not valid UTF-8, otherwise drops it.
+;     Use to convert "untrusted bytes" into "guaranteed-valid
+;     String" at a defensible boundary.
+proc(string_validate_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r9
+    win64_call(rt_string_valid)
+    test    rax, rax
+    jz      .invalid
+    ; Drop $h.
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.invalid:
+    mov     TOS, -2063
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; char$  ( codepoint -- $ )
+;     Single-codepoint String.  ASCII codepoints (< 128) yield a
+;     1-byte payload; larger codepoints up to 4 bytes per UTF-8.
+;     Surrogates and codepoints > U+10FFFF throw -2063.
+proc(char_to_string_word)
+    mov     rcx, UP
+    mov     rdx, TOS
+    win64_call(rt_char_to_string)
+    cmp     rax, -1
+    je      .err
+    mov     TOS, rax
+    next()
+.err:
+    mov     TOS, -2063
+    call    throw_word
+    next()
+endp()
+
+
+; $upper  ( $h -- $s )
+;     Unicode-aware uppercase.  Allocates a fresh String; byte
+;     length may differ from input (e.g. ß → "SS").  Throws -2063
+;     on malformed UTF-8.
+proc(string_upper_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, UP
+    mov     rdx, r9
+    win64_call(rt_string_upper)
+    cmp     rax, -1
+    je      .err
+    mov     TOS, rax
+    next()
+.err:
+    mov     TOS, -2063
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; $lower  ( $h -- $s )
+proc(string_lower_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, UP
+    mov     rdx, r9
+    win64_call(rt_string_lower)
+    cmp     rax, -1
+    je      .err
+    mov     TOS, rax
+    next()
+.err:
+    mov     TOS, -2063
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; $>f  ( $h -- ) ( F: -- r true | false )
+;     Parse $h as a decimal float.  On success pushes r onto the FP
+;     stack and -1 onto the data stack.  On failure pushes only 0
+;     onto the data stack and leaves the FP stack alone.  Trims
+;     surrounding ASCII whitespace before parsing.
+proc(string_to_float_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    ; Use PAD as the out-bits scratch slot.
+    lea     r10, [UP + user_PAD]
+    mov     rcx, r9
+    mov     rdx, r10
+    win64_call(rt_string_to_float)
+    test    rax, rax
+    jz      .parse_fail
+    ; Success: push the parsed f64 onto FP stack.
+    mov     r11, [UP + user_PAD]                    ; raw bits
+    mov     r10, [UP + user_FSP]
+    sub     r10, cell
+    mov     [UP + user_FSP], r10
+    mov     [r10], r11
+    ; Replace TOS with -1 (true).
+    mov     TOS, -1
+    next()
+.parse_fail:
+    mov     TOS, 0
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; f>$  ( -- $ ) ( F: r -- )
+;     Format the top of the FP stack as a decimal String and push
+;     onto the data stack.  Rust's f64-Display formatting:
+;     shortest-round-trip output (e.g. 1.5, -3.14, 1e-9, inf, NaN).
+proc(float_to_string_word)
+    ; Pop f64 from FP stack into rdx.
+    mov     r10, [UP + user_FSP]
+    mov     rdx, [r10]
+    add     r10, cell
+    mov     [UP + user_FSP], r10
+    mov     rcx, UP
+    pushd_call_or(rt_float_to_string, .err)
+    next()
+.err:
+    mov     TOS, -2059
+    call    throw_word
+    next()
+endp()
+
+
+; sb-append-f  ( sb -- ) ( F: r -- )
+;     Append the formatted-decimal representation of r to the
+;     builder.  Throws -2062 on capacity overflow.
+proc(sb_append_float_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 5                                  ; TAG_BUILDER
+    jne     .wrong
+    ; Pop f64 from FP stack.
+    mov     r10, [UP + user_FSP]
+    mov     rdx, [r10]
+    add     r10, cell
+    mov     [UP + user_FSP], r10
+    mov     rcx, r9                                 ; builder
+    win64_call(rt_sb_append_float)
+    cmp     rax, -1
+    je      .overflow
+    ; Drop sb.
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.overflow:
+    mov     TOS, -2062
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; $words  ( $h -- $1 $2 ... $n n )
+;     Whitespace-tokenise: split on runs of ASCII whitespace,
+;     drop empty pieces.  `s" foo   bar baz" $words` yields three
+;     tokens.  Same 32-piece cap as $split.
+proc(string_words_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    ; Auto-step before the loop so piece allocations don't trip
+    ; the fragmentation-retry path mid-tokenise (same hazard as
+    ; $split).
+    mov     r14, r9
+    mov     rcx, UP
+    win64_call(rt_gc_auto_step)
+    ; Call rt_string_words_into(UP, haystack, PAD, 32).
+    mov     rcx, UP
+    mov     rdx, r14
+    lea     r8,  [UP + user_PAD]
+    mov     r9,  32
+    win64_call(rt_string_words_into)
+    cmp     rax, -1
+    je      .err
+    ; rax = piece count.  Mirror $split's push-loop.
+    ; Stack effect: ( $h -- $1 $2 ... $n n ).  We consumed $h via
+    ; rcx; the cached TOS is now stale (rax has the count).
+    mov     r14, rax
+    test    r14, r14
+    jnz     .push_first
+    ; Zero pieces: just replace TOS (was $h) with 0.
+    mov     TOS, 0
+    next()
+.push_first:
+    lea     r11, [UP + user_PAD]
+    mov     TOS, [r11]
+    xor     r13, r13
+    inc     r13
+    cmp     r13, r14
+    jge     .push_count
+.push_piece:
+    mov     [DSP - cell], TOS
+    mov     TOS, [r11 + r13 * cell]
+    sub     DSP, cell
+    inc     r13
+    cmp     r13, r14
+    jl      .push_piece
+.push_count:
+    mov     [DSP - cell], TOS
+    mov     TOS, r14
+    sub     DSP, cell
+    next()
+.err:
+    mov     TOS, -2058
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
     call    throw_word
     next()
 endp()

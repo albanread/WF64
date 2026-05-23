@@ -56,3 +56,13 @@
 @extern rt_string_repeat(3)     ; (UP, tagged, n) -> tagged String (or -1)
 @extern rt_string_replace(4)    ; (UP, needle, repl, haystack) -> tagged String (or -1)
 @extern rt_string_split_into(5) ; (UP, sep, haystack, out_addr, max_parts) -> n parts (or -1)
+@extern rt_string_clen(1)       ; (tagged) -> codepoint count (or -1 if malformed UTF-8)
+@extern rt_string_cat(2)        ; (tagged, char_idx) -> codepoint (or -1)
+@extern rt_string_valid(1)      ; (tagged) -> -1 if valid UTF-8, else 0
+@extern rt_char_to_string(2)    ; (UP, codepoint) -> tagged String (or -1)
+@extern rt_string_upper(2)      ; (UP, tagged) -> tagged String (or -1)
+@extern rt_string_lower(2)      ; (UP, tagged) -> tagged String (or -1)
+@extern rt_string_to_float(2)   ; (tagged, out_bits_addr) -> -1 if parsed, 0 if not
+@extern rt_float_to_string(2)   ; (UP, f64_bits) -> tagged String (or -1)
+@extern rt_sb_append_float(2)   ; (builder_tagged, f64_bits) -> 0 or -1
+@extern rt_string_words_into(4) ; (UP, haystack, out_addr, max_parts) -> n tokens (or -1)
