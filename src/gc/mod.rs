@@ -16,7 +16,7 @@ pub mod heap;
 
 pub use heap::{
     reset_wf_heap, with_wf_heap,
-    alloc_floatvec, alloc_refvec, alloc_string,
+    alloc_floatvec, alloc_refvec, alloc_string, alloc_builder,
     collect_major, collect_minor, collect_auto, collect_full,
     gc_cycle_count, should_collect,
     set_gc_budget_min_bytes,
@@ -25,7 +25,7 @@ pub use heap::{
 pub use layout::{
     HeapType, Wf64Layout,
     TAG_BITS, TAG_MASK, PAYLOAD_MASK,
-    TAG_FIXNUM, TAG_CONS, TAG_FLOATVEC, TAG_REFVEC, TAG_STRING,
+    TAG_FIXNUM, TAG_CONS, TAG_FLOATVEC, TAG_REFVEC, TAG_STRING, TAG_BUILDER,
     TAG_IMMEDIATE, TAG_FORWARD,
     TYPE_SHIFT, TYPE_BITS, TYPE_MASK,
     LEN_SHIFT, LEN_BITS, LEN_MASK,

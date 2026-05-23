@@ -120,6 +120,15 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("!$",                 "store_string_word",        0),
     // V2s stage B: compile-time literal form.
     ("S$\"",               "s_dollar_quote_word",      1),  // IMMEDIATE
+    // V2s stage C1: MutStringBuilder.
+    ("sb-new",             "sb_new_word",              0),
+    ("sb-len",             "sb_len_word",              0),
+    ("sb-capacity",        "sb_capacity_word",         0),
+    ("sb-clear",           "sb_clear_word",            0),
+    ("sb-append$",         "sb_append_string_word",    0),
+    ("sb-append-c",        "sb_append_codepoint_word", 0),
+    ("sb-append-n",        "sb_append_int_word",       0),
+    ("sb>string",          "sb_to_string_word",        0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -963,6 +972,11 @@ impl Wf64Session {
                 "rt_string_from_bytes"  => Some(runtime::rt_string_from_bytes  as *mut c_void),
                 "rt_string_bytes_equal" => Some(runtime::rt_string_bytes_equal as *mut c_void),
                 "rt_s_literal_compile_at_here" => Some(runtime::rt_s_literal_compile_at_here as *mut c_void),
+                "rt_sb_new"             => Some(runtime::rt_sb_new             as *mut c_void),
+                "rt_sb_append_bytes"    => Some(runtime::rt_sb_append_bytes    as *mut c_void),
+                "rt_sb_append_codepoint"=> Some(runtime::rt_sb_append_codepoint as *mut c_void),
+                "rt_sb_append_int"      => Some(runtime::rt_sb_append_int      as *mut c_void),
+                "rt_sb_to_string"       => Some(runtime::rt_sb_to_string       as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;

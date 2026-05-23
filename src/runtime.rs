@@ -748,6 +748,150 @@ pub extern "C" fn rt_string_from_bytes(up: u64, src_addr: u64, len: u64) -> u64 
     tagged
 }
 
+// ── MutStringBuilder runtime (V2s stage C1) ──────────────────────────
+
+/// Read (length, capacity) from a builder's 2-cell header.
+/// Caller MUST have verified the tag.
+#[inline]
+unsafe fn builder_header(base: u64) -> (u32, u32) {
+    let hdr = unsafe { *(base as *const u64) };
+    let cap = unsafe { *((base + 8) as *const u64) };
+    let length = ((hdr >> 5) & 0xFF_FFFF) as u32;
+    (length, cap as u32)
+}
+
+/// Write a new length into a builder's header word, preserving the
+/// type and GC bits.
+#[inline]
+unsafe fn builder_set_length(base: u64, new_length: u32) {
+    let p = base as *mut u64;
+    let hdr = unsafe { *p };
+    // Clear bits 5..29 (length field), OR in the new length.
+    let cleared = hdr & !(0xFF_FFFF << 5);
+    let new_hdr = cleared | ((new_length as u64 & 0xFF_FFFF) << 5);
+    unsafe { *p = new_hdr; }
+}
+
+/// Allocate a fresh `MutStringBuilder` with the given capacity in
+/// bytes.  Returns the tagged pointer, or `u64::MAX` on failure.
+/// Auto-trigger + fragmentation-retry mirror the other allocators.
+#[no_mangle]
+pub extern "C" fn rt_sb_new(up: u64, capacity_bytes: u64) -> u64 {
+    if capacity_bytes > u32::MAX as u64 {
+        eprintln!("sb-new: capacity {capacity_bytes} exceeds u32::MAX");
+        return u64::MAX;
+    }
+    let cap = capacity_bytes as u32;
+    let tagged = match gc::alloc_builder(cap) {
+        Some(t) => t,
+        None => {
+            // Builder body cells = 2 + ceil(cap/8). Threshold against
+            // PAGE_SIZE_CELLS for the fragmentation-retry decision.
+            let payload_cells = ((capacity_bytes + 7) / 8) as u64;
+            let total_cells = 2 + payload_cells;
+            if total_cells > PAGE_SIZE_CELLS {
+                let regions = gc_root_regions(up);
+                unsafe { gc::collect_full(&regions); }
+                match gc::alloc_builder(cap) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("sb-new: out of GC heap (cap={capacity_bytes}, post-compaction retry failed)");
+                        return u64::MAX;
+                    }
+                }
+            } else {
+                eprintln!("sb-new: out of GC heap (cap={capacity_bytes})");
+                return u64::MAX;
+            }
+        }
+    };
+    tagged
+}
+
+/// Append `len` bytes from `src_addr` to the builder identified by
+/// `builder_tagged`.  Caller MUST have verified the tag is
+/// `TAG_BUILDER`.  Returns 0 on success or `u64::MAX` if the
+/// append would overflow capacity (used as the -2062 throw signal
+/// in the kernel-side wrapper).
+#[no_mangle]
+pub extern "C" fn rt_sb_append_bytes(
+    builder_tagged: u64,
+    src_addr: u64,
+    len: u64,
+) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let base = builder_tagged & !7;
+    let (length, capacity) = unsafe { builder_header(base) };
+    let new_length = length as u64 + len;
+    if new_length > capacity as u64 {
+        eprintln!("sb-append: would overflow capacity \
+                   ({length} + {len} > {capacity})");
+        return u64::MAX;
+    }
+    let dst = (base + 16 + length as u64) as *mut u8;
+    unsafe {
+        std::ptr::copy_nonoverlapping(src_addr as *const u8, dst, len as usize);
+        builder_set_length(base, new_length as u32);
+    }
+    0
+}
+
+/// Append the UTF-8 encoding of `codepoint` to the builder.  Returns
+/// 0 on success, `u64::MAX` on capacity overflow or an invalid
+/// codepoint (surrogate or > U+10FFFF).
+#[no_mangle]
+pub extern "C" fn rt_sb_append_codepoint(
+    builder_tagged: u64,
+    codepoint: u64,
+) -> u64 {
+    let cp = match char::from_u32(codepoint as u32) {
+        Some(c) => c,
+        None => {
+            eprintln!("sb-append-c: invalid codepoint {codepoint:#x}");
+            return u64::MAX;
+        }
+    };
+    let mut buf = [0u8; 4];
+    let encoded = cp.encode_utf8(&mut buf);
+    rt_sb_append_bytes(
+        builder_tagged,
+        encoded.as_ptr() as u64,
+        encoded.len() as u64,
+    )
+}
+
+/// Append the decimal representation of a signed integer `n` to
+/// the builder.  Returns 0 on success, `u64::MAX` on overflow.
+#[no_mangle]
+pub extern "C" fn rt_sb_append_int(builder_tagged: u64, n: u64) -> u64 {
+    let s = (n as i64).to_string();
+    rt_sb_append_bytes(
+        builder_tagged,
+        s.as_ptr() as u64,
+        s.len() as u64,
+    )
+}
+
+/// Finalise the builder to a fresh immutable `String`.  Allocates
+/// a new String of `builder.length` bytes, copies the payload,
+/// then resets `builder.length` to 0 (capacity retained) per the
+/// V2s design — the builder remains usable.  Returns the tagged
+/// String pointer, or `u64::MAX` on allocation failure.
+#[no_mangle]
+pub extern "C" fn rt_sb_to_string(up: u64, builder_tagged: u64) -> u64 {
+    let base = builder_tagged & !7;
+    let (length, _capacity) = unsafe { builder_header(base) };
+    let payload_addr = base + 16;
+    let tagged = rt_string_from_bytes(up, payload_addr, length as u64);
+    if tagged == u64::MAX {
+        return u64::MAX;
+    }
+    unsafe { builder_set_length(base, 0); }
+    tagged
+}
+
 /// Compile-mode helper for `S$"`.  Allocates a LITERAL slot,
 /// allocates a fresh `String` GC object copying `len` bytes from
 /// `src_addr`, stores the tagged pointer into the literal slot,

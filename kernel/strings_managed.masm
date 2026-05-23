@@ -19,6 +19,7 @@
 ;   -2059  GC out of memory
 ;   -2060  type mismatch (slot held something that wasn't a String)
 ;   -2061  nil dereference
+;   -2062  builder capacity exceeded (V2s stage C1)
 ; ─────────────────────────────────────────────────────────────────────
 
 
@@ -274,6 +275,330 @@ proc(s_dollar_quote_word)
     mov     [DSP - cell], TOS
     mov     TOS, -2058
     stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; ── Builder primitives (V2s stage C1) ───────────────────────────────
+;
+; Builders are mutable byte buffers used for incremental construction.
+; Tag = 0b101 (TAG_BUILDER).  Header is 2 cells:
+;   cell 0: standard type/length/GC word (type=5, length=bytes used)
+;   cell 1: capacity in bytes
+; Payload begins at base+16.  The GC walks total_cells = 2 +
+; ceil(capacity/8) — capacity, not length — so the full allocated
+; extent is always scanned regardless of how much the user has
+; appended.
+;
+; All builder primitives below type-check tag = 4 (Builder) and
+; throw -2060 on the wrong type, -2061 on nil.  The "would-exceed-
+; capacity" overflow throws -2062.
+
+
+; sb-new  ( capacity -- sb )
+;     Allocate a new builder with `capacity` bytes of usable
+;     payload.  Length starts at 0.  Throws -2059 on alloc failure.
+proc(sb_new_word)
+    ; Stack: capacity in TOS.
+    mov     rcx, UP                                 ; arg1: UP
+    mov     rdx, TOS                                ; arg2: capacity
+    win64_call(rt_sb_new)
+    cmp     rax, -1
+    je      .err
+    mov     TOS, rax                                ; replace capacity with tagged sb
+    next()
+.err:
+    mov     TOS, -2059
+    call    throw_word
+    next()
+endp()
+
+
+; sb-len  ( sb -- bytes )
+;     Currently-used byte count from the builder's header word.
+proc(sb_len_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 5                                  ; TAG_BUILDER
+    jne     .wrong_type
+    and     r9, -8                                  ; strip tag → base
+    mov     r10, [r9]                               ; header word
+    shr     r10, 5
+    mov     r11, 0xFFFFFF
+    and     r10, r11
+    mov     TOS, r10
+    next()
+.wrong_type:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil_deref:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; sb-capacity  ( sb -- bytes )
+;     Total allocated capacity (independent of how much is used).
+;     Useful for predicting whether further appends will fit.
+proc(sb_capacity_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 5
+    jne     .wrong_type
+    and     r9, -8
+    mov     r10, [r9 + 8]                           ; capacity word (cell 1)
+    mov     TOS, r10
+    next()
+.wrong_type:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil_deref:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; sb-clear  ( sb -- )
+;     Reset length to 0; capacity retained.  Doesn't zero the
+;     payload bytes — they're left as-is since the length field is
+;     authoritative.
+proc(sb_clear_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 5
+    jne     .wrong_type
+    and     r9, -8
+    ; Load header, clear bits 5..29 (length field), store back.
+    mov     r10, [r9]
+    mov     r11, 0xFFFFFF
+    shl     r11, 5
+    not     r11
+    and     r10, r11                                ; length := 0
+    mov     [r9], r10
+    ; Drop TOS.
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+.wrong_type:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil_deref:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; sb-append$  ( $s sb -- )
+;     Append the contents of String $s to builder sb.  Throws
+;     -2060 on wrong types, -2061 on nil, -2062 on capacity
+;     overflow.
+proc(sb_append_string_word)
+    ; Stack: sb in TOS, $s at [DSP].
+    ; Check sb.
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 5
+    jne     .wrong_type
+    ; Check $s.
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil_deref
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4                                  ; TAG_STRING
+    jne     .wrong_type
+    ; Get source (string payload addr, length).
+    mov     r10, r11
+    and     r10, -8                                 ; string base
+    mov     r12, [r10]                              ; header
+    shr     r12, 5
+    mov     r13, 0xFFFFFF
+    and     r12, r13                                ; r12 = byte length
+    lea     r10, [r10 + 8]                          ; r10 = payload addr
+    ; Call rt_sb_append_bytes(sb_tagged, src_addr, len).
+    mov     rcx, r9                                 ; arg1: builder tagged
+    mov     rdx, r10                                ; arg2: src addr
+    mov     r8,  r12                                ; arg3: len
+    win64_call(rt_sb_append_bytes)
+    cmp     rax, -1
+    je      .overflow
+    ; Drop both args.
+    mov     TOS, [DSP + cell]
+    stk(2, 0)
+    next()
+.overflow:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2062
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong_type:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil_deref:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; sb-append-c  ( codepoint sb -- )
+;     Append the UTF-8 encoding of a single codepoint to the
+;     builder.  ASCII codepoints (< 128) take one byte; larger
+;     codepoints take up to 4 bytes.  Surrogates (0xD800..0xDFFF)
+;     and values > 0x10FFFF throw -2062.
+proc(sb_append_codepoint_word)
+    ; Stack: sb in TOS, codepoint at [DSP].
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 5
+    jne     .wrong_type
+    mov     r11, [DSP]                              ; codepoint
+    mov     rcx, r9
+    mov     rdx, r11
+    win64_call(rt_sb_append_codepoint)
+    cmp     rax, -1
+    je      .overflow
+    mov     TOS, [DSP + cell]
+    stk(2, 0)
+    next()
+.overflow:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2062
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong_type:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil_deref:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; sb-append-n  ( n sb -- )
+;     Append the signed-decimal representation of n to the builder.
+proc(sb_append_int_word)
+    ; Stack: sb in TOS, n at [DSP].
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 5
+    jne     .wrong_type
+    mov     r11, [DSP]                              ; n (signed)
+    mov     rcx, r9
+    mov     rdx, r11
+    win64_call(rt_sb_append_int)
+    cmp     rax, -1
+    je      .overflow
+    mov     TOS, [DSP + cell]
+    stk(2, 0)
+    next()
+.overflow:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2062
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong_type:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil_deref:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; sb>string  ( sb -- $ )
+;     Finalise the builder: allocate a fresh immutable String of
+;     exactly the current length and copy the payload.  The
+;     builder's length is reset to 0 (capacity retained) so it can
+;     be reused.  Throws -2059 if the String allocation fails.
+proc(sb_to_string_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 5
+    jne     .wrong_type
+    mov     rcx, UP
+    mov     rdx, r9
+    win64_call(rt_sb_to_string)
+    cmp     rax, -1
+    je      .err
+    mov     TOS, rax                                ; replace sb with tagged $
+    next()
+.err:
+    mov     TOS, -2059
+    call    throw_word
+    next()
+.wrong_type:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil_deref:
+    mov     TOS, -2061
     call    throw_word
     next()
 endp()

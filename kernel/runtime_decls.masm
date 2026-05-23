@@ -33,3 +33,8 @@
 @extern rt_string_from_bytes(3) ; (UP, src_addr, len) -> tagged String ptr (or u64::MAX)
 @extern rt_string_bytes_equal(2); (tagged_a, tagged_b) -> -1 if bytes match, 0 if not
 @extern rt_s_literal_compile_at_here(3) ; (UP, src_addr, len) -> 0 or u64::MAX
+@extern rt_sb_new(2)            ; (UP, capacity) -> tagged builder (or u64::MAX)
+@extern rt_sb_append_bytes(3)   ; (builder_tagged, src_addr, len) -> 0 or u64::MAX
+@extern rt_sb_append_codepoint(2); (builder_tagged, codepoint) -> 0 or u64::MAX
+@extern rt_sb_append_int(2)     ; (builder_tagged, n) -> 0 or u64::MAX
+@extern rt_sb_to_string(2)      ; (UP, builder_tagged) -> tagged String (or u64::MAX)

@@ -3330,6 +3330,217 @@ fn str_s_dollar_quote_inside_colon_def_with_other_code() {
         "mixed colon-def output wrong; got {out:?}");
 }
 
+// ── V2s stage C1 — MutStringBuilder ───────────────────────────────
+
+#[test]
+fn sb_new_starts_empty_with_requested_capacity() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "64 sb-new\n\
+         dup sb-len .\n\
+         sb-capacity .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![0, 64],
+        "fresh builder: len=0, cap=64; got {nums:?} from {out:?}");
+}
+
+#[test]
+fn sb_append_string_grows_length() {
+    // Hold the builder via a HEAPPTR so any allocation triggered
+    // inside `>$` (auto-GC) doesn't strand a stale tagged-ptr copy
+    // on the data stack.  This is the design's official idiom.
+    //
+    // Note: every `s"` here keeps a space after the closing quote
+    // *to keep the tokenizer happy* — `s"," ...` would be read as
+    // one whitespace-delimited token `s",`.  Standard `s" ... "`
+    // requires a leading space; we double-space the trailing one
+    // for symmetry.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR b\n\
+         32 sb-new b !\n\
+         s\" hello\" >$ b @ sb-append$\n\
+         s\" , \" >$ b @ sb-append$\n\
+         s\" world\" >$ b @ sb-append$\n\
+         b @ sb-len .\n\
+         b @ sb>string $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("12  ok"),
+        "post-append length should be 12; got {out:?}");
+    assert!(out.contains("hello, world"),
+        "sb>string should produce the concatenated bytes; got {out:?}");
+}
+
+#[test]
+fn sb_to_string_resets_length() {
+    // Per design: sb>string produces a fresh String and resets the
+    // builder's length to 0 (capacity retained) — the builder can
+    // be reused.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "16 sb-new                  ( sb )\n\
+         s\" abc\" >$ over sb-append$\n\
+         dup sb>string drop         ( sb )\n\
+         dup sb-len .               \\ should be 0\n\
+         sb-capacity .              \\ should still be 16\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![0, 16],
+        "after sb>string: len=0, cap=16; got {nums:?} from {out:?}");
+}
+
+#[test]
+fn sb_clear_resets_length_only() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "16 sb-new\n\
+         s\" abc\" >$ over sb-append$\n\
+         dup sb-len .               \\ 3\n\
+         dup sb-clear\n\
+         dup sb-len .               \\ 0\n\
+         sb-capacity .              \\ still 16\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![3, 0, 16],
+        "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn sb_append_n_formats_decimal() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "32 sb-new\n\
+         42 over sb-append-n\n\
+         -7 over sb-append-n\n\
+         0 over sb-append-n\n\
+         sb>string $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    // Should print "42-70" concatenated.
+    assert!(out.contains("42-70"),
+        "decimal appends should concatenate; got {out:?}");
+}
+
+#[test]
+fn sb_append_c_ascii_one_byte() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "8 sb-new\n\
+         65 over sb-append-c             \\ 'A'\n\
+         66 over sb-append-c             \\ 'B'\n\
+         67 over sb-append-c             \\ 'C'\n\
+         dup sb-len .\n\
+         sb>string $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("3  ok"),
+        "3 ASCII chars → 3 bytes; got {out:?}");
+    assert!(out.contains("ABC"),
+        "should print ABC; got {out:?}");
+}
+
+#[test]
+fn sb_append_c_utf8_multibyte() {
+    // U+00E9 'é' (decimal 233) is 2 bytes in UTF-8 (0xC3 0xA9).
+    // U+20AC '€' (decimal 8364) is 3 bytes (0xE2 0x82 0xAC).
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR b\n\
+         16 sb-new b !\n\
+         233 b @ sb-append-c\n\
+         8364 b @ sb-append-c\n\
+         b @ sb-len .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("5  ok"),
+        "é (2 bytes) + € (3 bytes) = 5; got {out:?}");
+}
+
+#[test]
+fn sb_append_overflow_throws_minus_2062() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "4 sb-new\n\
+         s\" hello\" >$ over sb-append$    \\ 5 bytes into 4-byte cap\n\
+         bye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2062"),
+        "expected -2062 (capacity overflow); got {msg}");
+}
+
+#[test]
+fn sb_wrong_type_throws_minus_2060() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR v\n\
+         4 v vec-alloc-floats!\n\
+         v @ sb-len .\n\
+         bye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2060"),
+        "sb-len on FloatVec should throw -2060; got {msg}");
+}
+
+#[test]
+fn sb_nil_throws_minus_2061() {
+    let mut s = sess_with_core();
+    let err = s.eval("0 sb-len .\nbye\n").unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2061"),
+        "sb-len on nil should throw -2061; got {msg}");
+}
+
+#[test]
+fn sb_survives_collection() {
+    // Stash a builder via a HEAPPTR, force a (gc), then continue
+    // appending — payload must survive even if the underlying
+    // builder object got relocated.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR b\n\
+         128 sb-new b !\n\
+         s\" pre-\" >$ b @ sb-append$\n\
+         (gc)\n\
+         s\" post\" >$ b @ sb-append$\n\
+         b @ sb>string $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("pre-post"),
+        "builder payload lost across (gc); got {out:?}");
+}
+
+#[test]
+fn sb_round_trip_through_to_string() {
+    // Build a string with sb-append-n / sb-append$ / sb-append-c,
+    // finalise, compare to the expected.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "64 sb-new\n\
+         S$\" page \" over sb-append$\n\
+         3 over sb-append-n\n\
+         32 over sb-append-c             \\ space\n\
+         S$\" of \" over sb-append$\n\
+         10 over sb-append-n\n\
+         sb>string $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("page 3 of 10"),
+        "concatenated output wrong; got {out:?}");
+}
+
 #[test]
 fn gc_vec_f_fetch_wrong_type_still_throws_minus_2060() {
     // Make sure -2060 still fires when the slot holds something with

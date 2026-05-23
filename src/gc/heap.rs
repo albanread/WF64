@@ -144,6 +144,23 @@ pub fn alloc_string(n_bytes: u32) -> Option<u64> {
     })
 }
 
+/// Allocate a `MutStringBuilder` with `capacity_bytes` of usable
+/// payload, length initialised to 0.  See `docs/strings_design.md`:
+/// 2-cell header (type/length, capacity), payload is
+/// `ceil(capacity/8)` cells.
+pub fn alloc_builder(capacity_bytes: u32) -> Option<u64> {
+    with_wf_heap(|heap| {
+        let payload_cells = ((capacity_bytes as usize) + 7) / 8;
+        let total = 2 + payload_cells;
+        let ptr = try_alloc_in(heap, Generation::G0, total)?;
+        unsafe {
+            *ptr.as_ptr() = make_header(HeapType::MutStringBuilder, 0); // length=0
+            *ptr.as_ptr().add(1) = capacity_bytes as u64;
+        }
+        Some(tag_pointer(ptr.as_ptr() as *const u8, HeapType::MutStringBuilder))
+    })
+}
+
 /// Run a major GC, walking each `[base, next)` region in `regions`
 /// as a root set.  Each cell gets `evac.visit_cell`'d precisely.
 ///

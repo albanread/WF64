@@ -8,7 +8,7 @@
 //! 010  FloatVecPtr  → PointerHeader  — raw f64 payload
 //! 011  RefVecPtr    → PointerHeader  — payload cells are GC pointers
 //! 100  StringPtr    → PointerHeader  — raw UTF-8 bytes
-//! 101  (reserved)
+//! 101  BuilderPtr   → PointerHeader  — MutStringBuilder, 2-cell header
 //! 110  Immediate    → Immediate   (reserved for future non-pointer values)
 //! 111  Forward      → Forwarded   (GC-internal, written by evacuator)
 //! ```
@@ -57,7 +57,7 @@ pub const TAG_CONS:      u64 = 0b001;
 pub const TAG_FLOATVEC:  u64 = 0b010;
 pub const TAG_REFVEC:    u64 = 0b011;
 pub const TAG_STRING:    u64 = 0b100;
-// 101 reserved
+pub const TAG_BUILDER:   u64 = 0b101;
 pub const TAG_IMMEDIATE: u64 = 0b110;
 pub const TAG_FORWARD:   u64 = 0b111;
 
@@ -99,6 +99,15 @@ pub enum HeapType {
     /// Raw UTF-8 bytes.  Payload is `ceil(byte_length/8)` cells.
     /// Length in the header is BYTES, not cells.
     String = 4,
+    /// Mutable string builder (V2s).  Header is **2 cells**: cell 0
+    /// is the standard type/length/GC word (length = currently-used
+    /// bytes), cell 1 is the capacity in bytes.  Payload is
+    /// `ceil(capacity/8)` cells; only the first `length` bytes are
+    /// meaningful, the rest is uninitialised.  GC walks
+    /// `total_cells = 2 + ceil(capacity/8)` — uses capacity, not
+    /// length, so the GC knows the full allocated extent regardless
+    /// of how much the user has appended.
+    MutStringBuilder = 5,
 }
 
 impl HeapType {
@@ -107,6 +116,7 @@ impl HeapType {
             2 => Some(HeapType::FloatVec),
             3 => Some(HeapType::RefVec),
             4 => Some(HeapType::String),
+            5 => Some(HeapType::MutStringBuilder),
             _ => None,
         }
     }
@@ -114,9 +124,10 @@ impl HeapType {
     /// The tag bits for a pointer to this type of object.
     pub fn pointer_tag(self) -> u64 {
         match self {
-            HeapType::FloatVec => TAG_FLOATVEC,
-            HeapType::RefVec   => TAG_REFVEC,
-            HeapType::String   => TAG_STRING,
+            HeapType::FloatVec         => TAG_FLOATVEC,
+            HeapType::RefVec           => TAG_REFVEC,
+            HeapType::String           => TAG_STRING,
+            HeapType::MutStringBuilder => TAG_BUILDER,
         }
     }
 }
@@ -174,12 +185,13 @@ impl HeapLayout for Wf64Layout {
         match raw & TAG_MASK {
             TAG_FIXNUM | TAG_IMMEDIATE => WordKind::Immediate,
             TAG_CONS => WordKind::PointerCons(addr),
-            TAG_FLOATVEC | TAG_REFVEC | TAG_STRING => WordKind::PointerHeader(addr),
+            TAG_FLOATVEC | TAG_REFVEC | TAG_STRING | TAG_BUILDER =>
+                WordKind::PointerHeader(addr),
             TAG_FORWARD => WordKind::Forwarded(addr),
-            // 101 reserved — treat as immediate so a stray write here
-            // doesn't trick the GC into following a non-pointer.  This
-            // is also what classify must return for the "I don't
-            // recognise this" case to be safe.
+            // Everything else is treated as immediate so a stray
+            // write here doesn't trick the GC into following a
+            // non-pointer.  Safe default for the "I don't recognise
+            // this" case.
             _ => WordKind::Immediate,
         }
     }
@@ -234,6 +246,18 @@ impl HeapLayout for Wf64Layout {
                 let payload_cells = (length + 7) / 8;
                 ObjectLayout {
                     total_cells: 1 + payload_cells,
+                    pointer_cells_start: 0,
+                    pointer_cells_end: 0,        // opaque UTF-8 bytes
+                }
+            }
+            Some(HeapType::MutStringBuilder) => {
+                // 2-cell header: standard word, then capacity-in-bytes
+                // as a raw u64.  Payload extent is governed by
+                // capacity (not the current length).
+                let capacity_bytes = unsafe { *header_cell.add(1) } as usize;
+                let payload_cells = (capacity_bytes + 7) / 8;
+                ObjectLayout {
+                    total_cells: 2 + payload_cells,
                     pointer_cells_start: 0,
                     pointer_cells_end: 0,        // opaque UTF-8 bytes
                 }
@@ -334,13 +358,14 @@ mod tests {
     }
 
     #[test]
-    fn classify_reserved_tag_is_immediate() {
-        // Tag 0b101 (5) is reserved.  It must classify as Immediate
-        // so a stray write doesn't trick the GC.
-        assert!(matches!(
-            Wf64Layout::classify(0x1000_0000_0000_0005),
-            WordKind::Immediate
-        ));
+    fn classify_builder_tag_is_pointer_header() {
+        // Tag 0b101 (5) is TAG_BUILDER — must classify as a pointer
+        // so the GC follows it into the 2-cell-header MutStringBuilder.
+        // (Was Immediate while 101 was reserved; flipped in V2s C1.)
+        match Wf64Layout::classify(0x1000_0000_0000_0005) {
+            WordKind::PointerHeader(_) => (),
+            other => panic!("TAG_BUILDER should classify as PointerHeader, got {other:?}"),
+        }
     }
 
     #[test]
@@ -394,7 +419,7 @@ mod tests {
     fn rewrite_preserves_each_pointer_tag() {
         let old_addr = fake_addr(8);
         let new_addr = fake_addr(9);
-        for tag in [TAG_CONS, TAG_FLOATVEC, TAG_REFVEC, TAG_STRING] {
+        for tag in [TAG_CONS, TAG_FLOATVEC, TAG_REFVEC, TAG_STRING, TAG_BUILDER] {
             let old_raw = (old_addr as u64) | tag;
             let new_raw = Wf64Layout::rewrite_pointer_addr(old_raw, new_addr);
             assert_eq!(new_raw & TAG_MASK, tag,
@@ -512,21 +537,37 @@ mod tests {
     #[test]
     fn pointer_tag_matches_heap_type() {
         // By convention the pointer tag and the header type field share
-        // bit patterns for the three V1a types.  Verify so a future
-        // refactor doesn't quietly break the invariant.
-        assert_eq!(HeapType::FloatVec.pointer_tag(), TAG_FLOATVEC);
-        assert_eq!(HeapType::RefVec.pointer_tag(),   TAG_REFVEC);
-        assert_eq!(HeapType::String.pointer_tag(),   TAG_STRING);
-        assert_eq!(HeapType::FloatVec as u64, TAG_FLOATVEC);
-        assert_eq!(HeapType::RefVec   as u64, TAG_REFVEC);
-        assert_eq!(HeapType::String   as u64, TAG_STRING);
+        // bit patterns for the four V1a/V2s heap types.  Verify so a
+        // future refactor doesn't quietly break the invariant.
+        assert_eq!(HeapType::FloatVec.pointer_tag(),         TAG_FLOATVEC);
+        assert_eq!(HeapType::RefVec.pointer_tag(),           TAG_REFVEC);
+        assert_eq!(HeapType::String.pointer_tag(),           TAG_STRING);
+        assert_eq!(HeapType::MutStringBuilder.pointer_tag(), TAG_BUILDER);
+        assert_eq!(HeapType::FloatVec         as u64, TAG_FLOATVEC);
+        assert_eq!(HeapType::RefVec           as u64, TAG_REFVEC);
+        assert_eq!(HeapType::String           as u64, TAG_STRING);
+        assert_eq!(HeapType::MutStringBuilder as u64, TAG_BUILDER);
+    }
+
+    #[test]
+    fn header_layout_builder_two_cell() {
+        // 2-cell header: word 0 = type/length, word 1 = capacity.
+        // total_cells uses capacity, not length.
+        let header_word = make_header(HeapType::MutStringBuilder, 5); // length=5
+        let layout_buf: [u64; 2] = [header_word, 17];                 // capacity=17
+        let cell = &layout_buf[0] as *const u64;
+        let layout = unsafe { Wf64Layout::header_layout(cell) };
+        // capacity 17 bytes → ceil(17/8) = 3 payload cells.
+        // total = 2 (header) + 3 = 5.
+        assert_eq!(layout.total_cells, 5);
+        assert_eq!(layout.pointer_cell_count(), 0);
     }
 
     #[test]
     fn all_tag_values_distinct() {
         let tags = [
             TAG_FIXNUM, TAG_CONS, TAG_FLOATVEC, TAG_REFVEC,
-            TAG_STRING, TAG_IMMEDIATE, TAG_FORWARD,
+            TAG_STRING, TAG_BUILDER, TAG_IMMEDIATE, TAG_FORWARD,
         ];
         for (i, &a) in tags.iter().enumerate() {
             for &b in &tags[i + 1..] {
