@@ -604,6 +604,83 @@ pub extern "C" fn rt_gc_cycle_count() -> u64 {
     gc::gc_cycle_count()
 }
 
+// ── Managed strings (V2s) ────────────────────────────────────────────
+//
+// See docs/strings_design.md for the full surface.  Stage A: allocate
+// a String from arbitrary bytes, byte-equality.  The other operations
+// (`$len`, `$>addr`, `@$`, `!$`) are pure assembly — see
+// kernel/strings.masm.
+
+/// Allocate a new `String` GC object and copy `len` bytes from
+/// `src_addr` into its payload.  `src_addr` may point anywhere in
+/// readable memory (PAD, dictionary heap, slurped-file buffer); the
+/// copy is independent of the source after this call returns.
+///
+/// Returns the tagged pointer (low 3 bits = `TAG_STRING`) on
+/// success, `u64::MAX` on allocation failure or oversized input.
+///
+/// # Safety
+/// `src_addr..src_addr+len` must be readable.  Kernel-side `>$`
+/// guarantees this — it gets the (c-addr, u) pair directly from
+/// the Forth data stack.
+#[no_mangle]
+pub extern "C" fn rt_string_from_bytes(src_addr: u64, len: u64) -> u64 {
+    if len > u32::MAX as u64 {
+        eprintln!(">$: requested length {len} exceeds u32::MAX");
+        return u64::MAX;
+    }
+    let Some(tagged) = gc::alloc_string(len as u32) else {
+        eprintln!(">$: out of GC heap (requested {len} bytes)");
+        return u64::MAX;
+    };
+    if len > 0 {
+        // Payload lives at base + 8 (one header cell).  Strip tag
+        // to get the base.
+        let base = tagged & !7;
+        let dst = (base + 8) as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_addr as *const u8, dst, len as usize);
+        }
+    }
+    tagged
+}
+
+/// Byte-compare two `String` payloads.  Returns `u64::MAX` (-1, i.e.
+/// Forth true) if the bytes match exactly, `0` otherwise.
+///
+/// The kernel-side `$=` is responsible for tag-checking both inputs
+/// before calling — this function trusts that both pointers carry
+/// `TAG_STRING` and that the headers' length fields are
+/// authoritative.
+///
+/// # Safety
+/// Both `tagged_a` and `tagged_b` must be valid `String` tagged
+/// pointers.  Nil or wrong-typed inputs will deref invalid memory.
+#[no_mangle]
+pub extern "C" fn rt_string_bytes_equal(tagged_a: u64, tagged_b: u64) -> u64 {
+    // Fast path: same object.
+    if tagged_a == tagged_b {
+        return u64::MAX;
+    }
+    let base_a = (tagged_a & !7) as *const u64;
+    let base_b = (tagged_b & !7) as *const u64;
+    // Header layout: bits[0..5]=type, [5..29]=length, [29..]=GC.
+    // Compare lengths first.
+    let len_a = unsafe { (*base_a >> 5) & 0xFF_FFFF };
+    let len_b = unsafe { (*base_b >> 5) & 0xFF_FFFF };
+    if len_a != len_b {
+        return 0;
+    }
+    if len_a == 0 {
+        return u64::MAX;
+    }
+    let payload_a = unsafe { (base_a as *const u8).add(8) };
+    let payload_b = unsafe { (base_b as *const u8).add(8) };
+    let slice_a = unsafe { std::slice::from_raw_parts(payload_a, len_a as usize) };
+    let slice_b = unsafe { std::slice::from_raw_parts(payload_b, len_a as usize) };
+    if slice_a == slice_b { u64::MAX } else { 0 }
+}
+
 // ── LET DSL compilation ──────────────────────────────────────────────
 //
 // `rt_let_compile(up)` is called by the kernel's immediate `LET` word.

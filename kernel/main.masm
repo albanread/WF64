@@ -48,6 +48,7 @@
 @include "execute.masm"
 @include "compile.masm"
 @include "gc.masm"
+@include "strings_managed.masm"
 @include "interp.masm"
 
 ; forth_main(target_xt, logical_dsp_in, rsp_top, user_base)

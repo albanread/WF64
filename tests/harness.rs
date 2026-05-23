@@ -2980,6 +2980,222 @@ fn gc_many_rooted_vectors_all_survive() {
     }
 }
 
+// ── V2s stage A — managed strings ─────────────────────────────────
+
+#[test]
+fn str_to_string_round_trips_bytes() {
+    // S" pushes (c-addr u); >$ allocates a managed String and
+    // returns a tagged ptr.  $>addr exposes the payload addr/len
+    // for one-shot interop with TYPE.
+    let mut s = sess_with_core();
+    let out = s.eval("s\" hello, world\" >$ $>addr type cr\nbye\n").unwrap();
+    assert!(out.contains("hello, world"),
+        "round-trip via >$ / $>addr / TYPE failed; got {out:?}");
+}
+
+#[test]
+fn str_len_returns_byte_count() {
+    let mut s = sess_with_core();
+    let out = s.eval("s\" abcdefghij\" >$ $len .\nbye\n").unwrap();
+    assert!(out.contains("10  ok"),
+        "$len of 10-byte string should be 10; got {out:?}");
+}
+
+#[test]
+fn str_len_of_empty_is_zero() {
+    let mut s = sess_with_core();
+    let out = s.eval("s\" \" >$ $len .\nbye\n").unwrap();
+    assert!(out.contains("0  ok"),
+        "$len of empty string should be 0; got {out:?}");
+}
+
+#[test]
+fn str_equal_compares_bytes() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" hello\" >$ s\" hello\" >$ $= .\n\
+         s\" hello\" >$ s\" world\" >$ $= .\n\
+         s\" hello\" >$ s\" hell\" >$ $= .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![-1, 0, 0],
+        "expected (true, false, false) for hello/hello, hello/world, hello/hell; got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_equal_same_object_is_true() {
+    // Same tagged pointer twice on the stack ought to compare equal
+    // (covers the fast-path identity check in rt_string_bytes_equal).
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR a\n\
+         s\" foo\" >$ a !$\n\
+         a @$ a @$ $= .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("-1  ok"),
+        "same-object $= should be true; got {out:?}");
+}
+
+#[test]
+fn str_store_and_fetch_via_heapptr() {
+    // !$ stores a tagged String into a HEAPPTR slot; @$ fetches.
+    // Both type-check.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR greet\n\
+         s\" hi there\" >$ greet !$\n\
+         greet @$ $>addr type cr\n\
+         greet @$ $len .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("hi there"), "got {out:?}");
+    assert!(out.contains("8  ok"), "$len should be 8; got {out:?}");
+}
+
+#[test]
+fn str_fetch_from_unbound_slot_returns_nil() {
+    // @$ on a never-bound HEAPPTR returns 0 (nil) — *not* a throw.
+    // This is the V2s "the empty answer" convention from
+    // docs/strings_design.md.
+    let mut s = sess_with_core();
+    let out = s.eval("HEAPPTR empty\nempty @$ .\nbye\n").unwrap();
+    assert!(out.contains("0  ok"),
+        "@$ on nil slot should return 0; got {out:?}");
+}
+
+#[test]
+fn str_store_nil_is_allowed() {
+    // !$ accepts 0 (nil) to let a slot be cleared explicitly.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR x\n\
+         s\" before\" >$ x !$\n\
+         x @$ $len .\n\
+         0 x !$\n\
+         x @$ .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![6, 0],
+        "expected (6, 0) — len then nil; got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_store_wrong_type_throws() {
+    // !$ rejects a non-String tagged value (e.g., a FloatVec).
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR x\n\
+         HEAPPTR v\n\
+         4 v vec-alloc-floats!\n\
+         v @ x !$\n\
+         bye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2060"),
+        "storing FloatVec via !$ should throw -2060; got {msg}");
+}
+
+#[test]
+fn str_fetch_wrong_type_throws() {
+    // @$ rejects a slot that holds a non-String tagged value.
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR x\n\
+         4 x vec-alloc-floats!\n\
+         x @$ .\n\
+         bye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2060"),
+        "@$ on FloatVec slot should throw -2060; got {msg}");
+}
+
+#[test]
+fn str_len_on_nil_throws() {
+    let mut s = sess_with_core();
+    let err = s.eval("0 $len .\nbye\n").unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2061"),
+        "$len on 0 should throw -2061; got {msg}");
+}
+
+#[test]
+fn str_len_on_wrong_type_throws() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR v\n\
+         4 v vec-alloc-floats!\n\
+         v @ $len .\n\
+         bye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2060"),
+        "$len on FloatVec should throw -2060; got {msg}");
+}
+
+#[test]
+fn str_survives_collection() {
+    // A managed String rooted via @$ should survive (gc).  Verify
+    // by reading the bytes back through TYPE after the collection.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR msg\n\
+         s\" survive me\" >$ msg !$\n\
+         (gc)\n\
+         msg @$ $>addr type cr\n\
+         msg @$ $len .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("survive me"),
+        "string bytes lost across (gc); got {out:?}");
+    assert!(out.contains("10  ok"),
+        "length wrong after (gc); got {out:?}");
+}
+
+#[test]
+fn str_many_strings_all_survive_collection() {
+    // Allocate a bunch of distinct managed strings rooted via
+    // separate HEAPPTRs.  Run minor GCs.  All should still be
+    // intact and distinguishable via $=.
+    let mut s = sess_with_core();
+    let mut script = String::new();
+    for i in 0..8 {
+        script.push_str(&format!("HEAPPTR s{i}\n"));
+    }
+    for i in 0..8 {
+        // Each gets a distinct payload like "msg-0", "msg-1", ...
+        script.push_str(&format!("s\" msg-{i}\" >$ s{i} !$\n"));
+    }
+    for _ in 0..5 {
+        script.push_str("gc-minor\n");
+    }
+    for i in 0..8 {
+        script.push_str(&format!("s{i} @$ $>addr type cr\n"));
+    }
+    script.push_str("bye\n");
+    let out = s.eval(&script).unwrap();
+    for i in 0..8 {
+        let expected = format!("msg-{i}");
+        assert!(out.contains(&expected),
+            "string {expected} lost after minor cycles; got {out:?}");
+    }
+}
+
+#[test]
+fn str_empty_strings_compare_equal() {
+    let mut s = sess_with_core();
+    let out = s.eval("s\" \" >$ s\" \" >$ $= .\nbye\n").unwrap();
+    assert!(out.contains("-1  ok"),
+        "two empty strings should compare equal; got {out:?}");
+}
+
 #[test]
 fn gc_vec_f_fetch_wrong_type_still_throws_minus_2060() {
     // Make sure -2060 still fires when the slot holds something with

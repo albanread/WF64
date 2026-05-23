@@ -28,3 +28,5 @@
 @extern rt_gc_collect_minor(1)  ; (UP) -> err — minor collection
 @extern rt_gc_should_collect(0) ; () -> 1 if heap wants a collection, else 0
 @extern rt_gc_cycle_count(0)    ; () -> monotonically-increasing collection counter
+@extern rt_string_from_bytes(2) ; (src_addr, len) -> tagged String ptr (or u64::MAX)
+@extern rt_string_bytes_equal(2); (tagged_a, tagged_b) -> -1 if bytes match, 0 if not

@@ -111,6 +111,13 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("vec-f@",             "vec_f_fetch",              0),
     ("vec-f!",             "vec_f_store",              0),
     ("vec-len",            "vec_len",                  0),
+    // Managed strings (V2s stage A).  See docs/strings_design.md.
+    (">$",                 "to_string_word",           0),
+    ("$len",               "string_len_word",          0),
+    ("$>addr",             "string_to_addr_word",      0),
+    ("$=",                 "string_equal_word",        0),
+    ("@$",                 "fetch_string_word",        0),
+    ("!$",                 "store_string_word",        0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -946,6 +953,8 @@ impl Wf64Session {
                 "rt_gc_collect_minor" => Some(runtime::rt_gc_collect_minor as *mut c_void),
                 "rt_gc_should_collect" => Some(runtime::rt_gc_should_collect as *mut c_void),
                 "rt_gc_cycle_count"   => Some(runtime::rt_gc_cycle_count   as *mut c_void),
+                "rt_string_from_bytes"  => Some(runtime::rt_string_from_bytes  as *mut c_void),
+                "rt_string_bytes_equal" => Some(runtime::rt_string_bytes_equal as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;

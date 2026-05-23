@@ -1,0 +1,264 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — managed-string primitives (V2s).
+;
+; The handle-first, GC-backed string library specified in
+; docs/strings_design.md.  Stage A: enough to allocate, measure,
+; expose for legacy interop, compare for equality, and store
+; through HEAPPTR slots.  The S$" literal form and the LITERAL
+; region come in stage B; the operations library ($+, $slice, …)
+; comes in stage C.
+;
+; Tag for String values is 100 (= 4).  Header word layout
+; (see src/gc/layout.rs):
+;   bits  0..4   type tag (HeapType, 5 bits)
+;   bits  5..28  length in bytes (24 bits)
+;   bits 29..63  GC bookkeeping
+;
+; Throw codes (shared with vec-*):
+;   -2058  generic GC error
+;   -2059  GC out of memory
+;   -2060  type mismatch (slot held something that wasn't a String)
+;   -2061  nil dereference
+; ─────────────────────────────────────────────────────────────────────
+
+
+; >$  ( c-addr u -- $ )
+;     Allocate a managed String of u bytes and copy [c-addr, c-addr+u)
+;     into the payload.  Returns a tagged String pointer.  Auto-GC
+;     triggers on `should_collect` before allocating, same as
+;     vec-alloc-*; the source bytes live outside the GC heap so the
+;     collection can't move them.
+proc(to_string_word)
+    ; Stack: u in TOS, c-addr at [DSP].
+    ; Stash both in callee-saved regs (r13, r14) so they survive
+    ; rt_gc_should_collect and rt_gc_collect_minor.
+    mov     r14, TOS                                ; u (length)
+    mov     r13, [DSP]                              ; c-addr (source)
+    win64_call(rt_gc_should_collect)
+    test    rax, rax
+    jz      .alloc
+    mov     rcx, UP
+    win64_call(rt_gc_collect_minor)
+.alloc:
+    mov     rcx, r13                                ; arg1: src_addr
+    mov     rdx, r14                                ; arg2: len
+    win64_call(rt_string_from_bytes)
+    cmp     rax, -1
+    je      .err
+    ; Success: ( c-addr u -- $ ) means 2 in, 1 out.  Replace TOS
+    ; with the tagged ptr; drop one cell from memory.
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.err:
+    ; Drop both operands, push throw code.
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2059
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $len  ( $ -- u )
+;     Byte length of a managed String.  Throws -2060 on a non-String
+;     handle, -2061 on nil.
+proc(string_len_word)
+    mov     r9, TOS                                 ; tagged
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4                                  ; TAG_STRING
+    jne     .wrong_type
+    and     r9, -8                                  ; strip tag
+    mov     r10, [r9]                               ; header word
+    shr     r10, 5                                  ; remove 5-bit type
+    mov     r11, 0xFFFFFF
+    and     r10, r11                                ; 24-bit length
+    mov     TOS, r10
+    next()
+
+.wrong_type:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+
+.nil_deref:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; $>addr  ( $ -- c-addr u )
+;     Expose the payload of a managed String as a legacy
+;     (address, length) pair for one-shot interop with TYPE / etc.
+;
+;     LIFETIME CONTRACT: the c-addr is valid only until the next
+;     allocation OR garbage collection.  Same rule as @heapptr.
+;     The intent is `my-msg @$ $>addr type` — never hold the addr
+;     across allocating code.
+proc(string_to_addr_word)
+    mov     r9, TOS                                 ; tagged
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong_type
+    and     r9, -8                                  ; strip tag → base
+    ; Extract length.
+    mov     r10, [r9]
+    shr     r10, 5
+    mov     r11, 0xFFFFFF
+    and     r10, r11                                ; r10 = byte length
+    ; Payload addr = base + 8 (skip the 1-cell header).
+    add     r9, 8                                   ; r9 = c-addr
+    ; Stack effect: 1 in, 2 out — push the addr as new NOS, length
+    ; replaces TOS.
+    mov     [DSP - cell], r9                        ; save c-addr at new NOS slot
+    mov     TOS, r10                                ; length in TOS
+    stk(0, 1)                                       ; sub DSP, cell
+    next()
+
+.wrong_type:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+
+.nil_deref:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; $=  ( $a $b -- f )
+;     Byte-exact equality of two managed Strings.  Returns -1
+;     (Forth true) if the bytes match, 0 otherwise.  Throws -2060
+;     on a non-String operand and -2061 on nil.
+;
+;     Heavy lifting is in rt_string_bytes_equal; the kernel side
+;     just type-checks both operands so wrong-type/nil throws
+;     surface through the same machinery as everywhere else.
+proc(string_equal_word)
+    ; Stack: $b in TOS, $a at [DSP].
+    ; Check $b.
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong_type
+    ; Check $a.
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil_deref
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong_type
+    ; Both are valid Strings.  Call the comparison helper.
+    mov     rcx, r11                                ; arg1: tagged_a
+    mov     rdx, r9                                 ; arg2: tagged_b
+    win64_call(rt_string_bytes_equal)
+    ; rax = -1 (true) or 0 (false).  Replace stack: ( $a $b -- f )
+    ; means 2 in, 1 out.
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+
+.wrong_type:
+    ; Drop both, throw -2060.
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+
+.nil_deref:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; @$  ( handle -- $ )
+;     Fetch a managed String from a HEAPPTR slot.  Type-checks the
+;     slot's contents: passes nil through untouched (so callers can
+;     detect "never bound"), but throws -2060 if the slot holds
+;     something that isn't a String.
+;
+;     The "nil passes through" choice deliberately differs from
+;     vec-f@'s nil-deref-throws: a String handle that's never been
+;     assigned is a perfectly normal state ("the empty answer"),
+;     whereas calling vec-f@ on a nil slot is always a programming
+;     error.  Callers test with `dup 0=` if they care.
+proc(fetch_string_word)
+    mov     r9, TOS                                 ; handle (slot addr)
+    mov     r9, [r9]                                ; load tagged value
+    test    r9, r9
+    jz      .pass_nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong_type
+    mov     TOS, r9                                 ; replace handle with tagged $
+    next()
+.pass_nil:
+    mov     TOS, 0
+    next()
+.wrong_type:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+endp()
+
+
+; !$  ( $ handle -- )
+;     Store a managed String pointer into a HEAPPTR slot.
+;     Accepts nil ($ = 0) to allow clearing a slot; otherwise the
+;     value must carry TAG_STRING.  Throws -2060 on a non-String
+;     non-nil value.
+;
+;     This is `!heapptr` with an added type check — the broader
+;     `!heapptr` accepts any tagged value, while `!$` enforces the
+;     "String-typed slot" discipline that lets `@$` skip its own
+;     type check at fetch time.  (We still type-check in @$ today
+;     to defend against direct `!`s; that becomes redundant once
+;     the convention is consistently used.)
+proc(store_string_word)
+    ; Stack: handle in TOS, $ at [DSP].
+    mov     r9, [DSP]                               ; the $ value
+    test    r9, r9
+    jz      .store                                  ; nil is always OK
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong_type
+.store:
+    mov     qword ptr [TOS], r9                     ; *handle = $
+    ; Drop both args.
+    mov     TOS, [DSP + cell]
+    stk(2, 0)
+    next()
+
+.wrong_type:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
