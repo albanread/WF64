@@ -42,6 +42,9 @@ pub const FORTH_RESTART_CMD_ID: u16 = 0x3200;
 pub const DEMO_CMD_BASE: u16 = 0x4000;
 pub const DEMO_CMD_END:  u16 = 0x4FFF;
 
+/// Help → Documentation: spawn doc-crate.exe against the bundled docs/.
+pub const HELP_CMD_DOCS: u16 = 0x5000;
+
 // ─── Menu builders ────────────────────────────────────────────────────
 
 /// Append items to a popup.  `id = 0` with label `"SEP"` inserts a
@@ -166,9 +169,21 @@ pub fn append_forth_menu(bar: HMENU) {
     append_popup(bar, "forth-menu", "Fo&rth", popup);
 }
 
+/// Help menu — Documentation (opens doc-crate.exe against docs/).
+pub fn append_help_menu(bar: HMENU) {
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
+        eprintln!("[help-menu] CreatePopupMenu failed");
+        return;
+    };
+    append_items(popup, "help-menu", &[
+        (HELP_CMD_DOCS, "&Documentation\tF1"),
+    ]);
+    append_popup(bar, "help-menu", "&Help", popup);
+}
+
 /// Build the default frame menu bar: File, Edit, View, Forth,
-/// [Demos].  `demos` carries `(id, display_name)` pairs from the
-/// frame's demo-discovery pass; pass an empty slice for no Demos
+/// [Demos], Help.  `demos` carries `(id, display_name)` pairs from
+/// the frame's demo-discovery pass; pass an empty slice for no Demos
 /// menu.
 pub fn build_default_menu_bar(demos: &[(u16, String)]) -> Option<HMENU> {
     let bar = unsafe { CreateMenu() }.ok()?;
@@ -177,6 +192,7 @@ pub fn build_default_menu_bar(demos: &[(u16, String)]) -> Option<HMENU> {
     append_view_menu(bar);
     append_forth_menu(bar);
     append_demos_menu(bar, demos);
+    append_help_menu(bar);
     Some(bar)
 }
 
@@ -200,6 +216,8 @@ pub fn build_accelerator_table() -> Option<HACCEL> {
         // Forth
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: VK_F5.0,     cmd: FORTH_RESTART_CMD_ID },
         ACCEL { fVirt: FVIRTKEY,                     key: VK_F5.0,     cmd: fedit::EDIT_CMD_RUN_BUFFER },
+        // Help
+        ACCEL { fVirt: FVIRTKEY,                     key: 0x70_u16,    cmd: HELP_CMD_DOCS },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }
         .ok()
