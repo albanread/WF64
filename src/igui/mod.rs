@@ -43,6 +43,7 @@ pub mod lisp_shims;
 pub mod log_view;
 pub mod fconsole;
 pub mod crash_view;
+pub mod crash_handler;
 mod menu;
 pub(crate) mod fedit;
 pub(crate) mod rope_buffer;

@@ -51,3 +51,16 @@ proc(bug_rust_panic_word)
     win64_call(rt_bug_rust_panic)
     next()
 endp()
+
+
+; bug-seh-av  ( -- )
+;     Trigger a real Windows ACCESS_VIOLATION (NULL pointer read)
+;     from inside the worker thread.  For verifying Phase 3b's
+;     VEH-based SEH recovery — the worker thread should be
+;     terminated and respawned by the supervisor, with the
+;     captured register state shown in the crash dump window.
+;     Process stays alive.  Never call from production code.
+proc(bug_seh_av_word)
+    win64_call(rt_bug_seh_av)
+    next()
+endp()

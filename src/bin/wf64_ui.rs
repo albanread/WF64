@@ -19,15 +19,79 @@
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Worker thread: owns the Forth session, drains EvalBuffer
-    // events, writes captured output to the log overlay.
+    // Phase 3b: install the SEH crash handler BEFORE spawning
+    // anything that could trigger it.  Worker thread spawning
+    // happens inside igui::run; the supervisor below registers
+    // itself with the handler before doing any Forth work.
+    wf64::igui::crash_handler::install();
+
     let worker = || {
         wait_for_frame();
         auto_open_console();
-        run_forth_worker();
+        run_supervisor();
     };
     let exit_code = wf64::igui::run(Some(worker))?;
     std::process::exit(exit_code);
+}
+
+/// Supervisor — wraps the actual Forth worker so that SEH-caught
+/// crashes (which exit the worker thread cleanly via our
+/// VEH-redirect-to-ExitThread thunk) get detected, reported, and
+/// recovered from by spawning a fresh worker thread.
+///
+/// Three exit paths from the worker thread:
+///   - Clean return (FrameClose): `take_dump` is None, supervisor
+///     also returns and the iGui shuts down.
+///   - Rust panic: caught inside the worker by `catch_unwind`,
+///     reported via `crash_view::push`, session rebooted within
+///     the same thread — supervisor sees nothing.
+///   - SEH exception: VEH rewrites RIP to ExitThread, thread
+///     dies, supervisor's join returns Ok(()), `take_dump`
+///     yields the captured state, we report and respawn.
+#[cfg(windows)]
+fn run_supervisor() {
+    use wf64::igui::{crash_handler, crash_view};
+
+    loop {
+        let join = std::thread::Builder::new()
+            .name("wf64-worker".into())
+            .spawn(|| {
+                crash_handler::register_worker_thread();
+                run_forth_worker();
+                crash_handler::unregister_worker_thread();
+            });
+        let join = match join {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("[supervisor] could not spawn worker: {e}");
+                return;
+            }
+        };
+        // join.join() blocks until the worker thread exits.  WHEN
+        // our VEH catches an SEH and redirects RIP → ExitThread,
+        // the worker exits "abnormally" from Rust's POV: std's
+        // thread-lifecycle bookkeeping then panics from INSIDE
+        // join() with "threads should not terminate unexpectedly".
+        // That panic unwinds OUT of join, bypassing `let _`, so
+        // we wrap the join itself in catch_unwind to swallow it
+        // and continue to the dump-check / respawn step.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = join.join();
+        }));
+        match crash_handler::take_dump() {
+            Some(dump) => {
+                let text = crash_handler::format_dump(&dump);
+                crash_view::push(text);
+                wf64::igui::fconsole::append("∴ Forth thread crashed (SEH) — rebooting.");
+                wf64::igui::fconsole::append("");
+                // loop: respawn the worker
+            }
+            None => {
+                // Clean exit — no dump pending, nothing to report.
+                return;
+            }
+        }
+    }
 }
 
 /// Block until the frame HWND is published.  The frame is created

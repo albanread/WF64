@@ -1666,6 +1666,21 @@ pub extern "C" fn rt_bug_rust_panic() -> u64 {
     0
 }
 
+/// Deliberately read from a NULL pointer to trigger a real
+/// Windows ACCESS_VIOLATION inside the worker thread.  Exists
+/// purely to test the Phase 3b SEH-recovery path.  The VEH in
+/// `crash_handler.rs` should catch it, capture register state,
+/// rewrite RIP to the thunk, and the supervisor should respawn
+/// the worker.  Never call from production code.
+///
+/// Implemented in Rust (not in Forth code calling `0 @`) so the
+/// AV happens at a known RIP we can recognise in the dump.
+#[no_mangle]
+pub extern "C" fn rt_bug_seh_av() -> u64 {
+    let p: *const u64 = std::ptr::null();
+    unsafe { std::ptr::read_volatile(p) }
+}
+
 /// Record a cursor position for the next emit.  V1 limitation
 /// (see the at-xy doc in `kernel/igui.masm`): not yet routed
 /// through emit's write path.  Lands in `IGUI_PENDING_AT_XY` so
