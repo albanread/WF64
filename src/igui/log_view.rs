@@ -72,8 +72,8 @@ const LOG_LINE_MAX: usize = 256;
 /// 0x3000.
 pub const MENU_CMD_ID: u16 = 0x3001;
 
-const LOG_CLASS: PCWSTR = w!("NewCL.iGui.Log");
-const LOG_TITLE: PCWSTR = w!("Log");
+const LOG_CLASS: PCWSTR = w!("WF64.iGui.Log");
+const LOG_TITLE: PCWSTR = w!("\u{2234} log");
 
 /// HWND of the singleton log MDI child, when one is open.
 static LOG_HWND: Mutex<Option<isize>> = Mutex::new(None);

@@ -1634,6 +1634,43 @@ pub extern "C" fn rt_string_to_int(tagged: u64, out_value: u64) -> u64 {
     }
 }
 
+// ── iGui bridge (used by wf64-ui; no-op headless) ────────────────────
+
+/// Clear the wf64-ui console scrollback.  No-op in the headless
+/// `wf64` binary (where the fconsole module isn't compiled in)
+/// and on non-Windows.
+#[no_mangle]
+pub extern "C" fn rt_igui_page() -> u64 {
+    #[cfg(windows)]
+    {
+        crate::igui::fconsole::clear_screen();
+    }
+    0
+}
+
+/// Record a cursor position for the next emit.  V1 limitation
+/// (see the at-xy doc in `kernel/igui.masm`): not yet routed
+/// through emit's write path.  Lands in `IGUI_PENDING_AT_XY` so
+/// future streaming-IO work can pick it up.
+#[no_mangle]
+pub extern "C" fn rt_igui_at_xy(col: u64, row: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        IGUI_PENDING_AT_XY.with(|c| c.set(Some((col as usize, row as usize))));
+    }
+    let _ = (col, row);
+    0
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// Last-requested cursor position from `AT-XY`.  Read by the
+    /// future streaming-emit path (not yet wired); cleared after
+    /// each consumption.
+    pub(crate) static IGUI_PENDING_AT_XY:
+        std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Compile-mode helper for `S$"`.  Allocates a LITERAL slot,
 /// allocates a fresh `String` GC object copying `len` bytes from
 /// `src_addr`, stores the tagged pointer into the literal slot,

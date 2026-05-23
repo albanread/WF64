@@ -130,6 +130,13 @@ pub enum IGuiEvent {
     EvalBuffer {
         source: String,
     },
+    /// "Cold-restart the language session."  Fired from the
+    /// Forth menu (Forth → Restart).  The worker drops its
+    /// current `Wf64Session`, allocates a fresh one, reloads
+    /// `lib/core.f`, and continues draining events as before.
+    /// Any user-defined words from the previous session are
+    /// gone; the GC heap is re-initialised.
+    ForthRestart,
 }
 
 struct Mailbox {
@@ -233,7 +240,7 @@ pub fn discard_stashed_events() {
 /// when the filter is non-empty.
 fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
     match ev {
-        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } => true,
+        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } | IGuiEvent::ForthRestart => true,
         IGuiEvent::Menu { .. } => true,
         IGuiEvent::Key { child_id, .. }
         | IGuiEvent::Char { child_id, .. }
@@ -251,7 +258,7 @@ fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
 /// events (FrameClose, ThemeChange, Menu) match every target.
 fn matches_target(ev: &IGuiEvent, target: i64) -> bool {
     match ev {
-        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } => true,
+        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } | IGuiEvent::ForthRestart => true,
         IGuiEvent::Menu { .. } => true,
         IGuiEvent::Key { child_id, .. }
         | IGuiEvent::Char { child_id, .. }

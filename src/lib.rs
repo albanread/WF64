@@ -170,6 +170,10 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("f>$",                "float_to_string_word",     0),
     ("sb-append-f",        "sb_append_float_word",     0),
     ("$words",             "string_words_word",        0),
+    // iGui bridge — Forth-side hooks into the wf64-ui front-end.
+    // Both are no-ops when running headless.  See kernel/igui.masm.
+    ("page",               "page_word",                0),
+    ("at-xy",              "at_xy_word",               0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -1046,6 +1050,8 @@ impl Wf64Session {
                 "rt_float_to_string"    => Some(runtime::rt_float_to_string    as *mut c_void),
                 "rt_sb_append_float"    => Some(runtime::rt_sb_append_float    as *mut c_void),
                 "rt_string_words_into"  => Some(runtime::rt_string_words_into  as *mut c_void),
+                "rt_igui_page"          => Some(runtime::rt_igui_page          as *mut c_void),
+                "rt_igui_at_xy"         => Some(runtime::rt_igui_at_xy         as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;

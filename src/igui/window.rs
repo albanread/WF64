@@ -54,7 +54,7 @@ use super::renderer;
 use super::IGuiError;
 
 const FRAME_CHILD_ID: i64 = 1;
-const FRAME_CLASS: PCWSTR = w!("NewCL.iGui.Frame");
+const FRAME_CLASS: PCWSTR = w!("WF64.iGui.Frame");
 
 // Private messages used to marshal language-thread calls onto the GUI
 // thread. lparam is the address of the corresponding *Request struct,
@@ -77,6 +77,12 @@ const WM_IGUI_OPEN_TEXT: u32 = WM_USER + 7;
 /// as an opaque token. Posted (not sent) so a tight write loop
 /// doesn't block on the GUI thread.
 const WM_IGUI_TEXT_FLUSH: u32 = WM_USER + 8;
+/// Drain the pending-line queue for the singleton fconsole pane
+/// onto the applied scrollback, then invalidate.  wparam/lparam
+/// unused (fconsole is a singleton; no child_id needed).  Same
+/// rationale as WM_IGUI_TEXT_FLUSH: keep all state mutation on
+/// the GUI thread so the worker side never holds a lock long.
+pub(crate) const WM_IGUI_FCONSOLE_FLUSH: u32 = WM_USER + 9;
 /// Sent from the language thread to a render-host HWND to install
 /// or clear a Win32 timer driving `EvTick` events.
 /// `wparam` carries the interval in ms (0 = clear), `lparam` is unused.
@@ -263,7 +269,7 @@ where
         CreateWindowExW(
             WS_EX_APPWINDOW,
             FRAME_CLASS,
-            w!("NewCL"),
+            w!("\u{2234} WF64 \u{2014} Forth IDE"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -413,6 +419,10 @@ unsafe extern "system" fn frame_wnd_proc(
             super::text_view::flush_on_gui_thread(child_id);
             LRESULT(0)
         }
+        WM_IGUI_FCONSOLE_FLUSH => {
+            super::fconsole::flush_on_gui_thread();
+            LRESULT(0)
+        }
         WM_IGUI_CLOSE_CHILD => {
             let req_ptr = lparam.0 as *mut CloseChildRequest;
             if !req_ptr.is_null() {
@@ -476,6 +486,18 @@ unsafe extern "system" fn frame_wnd_proc(
                 if mdi.0 as isize != 0 {
                     super::log_view::open(hwnd, mdi);
                 }
+                return LRESULT(0);
+            }
+            if cmd_id == super::fconsole::MENU_CMD_ID {
+                if mdi.0 as isize != 0 {
+                    super::fconsole::open(hwnd, mdi);
+                }
+                return LRESULT(0);
+            }
+            if cmd_id == super::tools_menu::FORTH_RESTART_CMD_ID {
+                // Pipe into the same mailbox the worker drains; it
+                // tears down the session and brings up a fresh one.
+                super::channels::push(super::channels::IGuiEvent::ForthRestart);
                 return LRESULT(0);
             }
             // Edit-menu commands: forward to the active MDI child.
@@ -923,6 +945,24 @@ pub(crate) fn post_text_flush(child_id: i64) {
             Some(frame),
             WM_IGUI_TEXT_FLUSH,
             WPARAM(child_id as usize),
+            LPARAM(0),
+        )
+    };
+}
+
+/// Counterpart to `post_text_flush` for the singleton fconsole
+/// pane.  Posted (not sent) so a tight worker write loop doesn't
+/// block on the GUI thread.
+pub(crate) fn post_fconsole_flush() {
+    let Some(frame_raw) = FRAME_HWND.get() else {
+        return;
+    };
+    let frame = HWND(*frame_raw as *mut _);
+    let _ = unsafe {
+        PostMessageW(
+            Some(frame),
+            WM_IGUI_FCONSOLE_FLUSH,
+            WPARAM(0),
             LPARAM(0),
         )
     };

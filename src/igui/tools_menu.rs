@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::log_view;
 use super::fedit;
+use super::fconsole;
 use windows::Win32::UI::WindowsAndMessaging::MF_SEPARATOR;
 
 /// Append an `Edit` submenu to `bar`.  Routed to the active MDI
@@ -113,6 +114,18 @@ pub fn append_tools_menu(bar: HMENU) {
         eprintln!("[tools-menu] append log: {e}");
     }
 
+    let console_item: Vec<u16> = "Console\tCtrl+Shift+R\0".encode_utf16().collect();
+    if let Err(e) = unsafe {
+        AppendMenuW(
+            popup,
+            MF_STRING,
+            fconsole::MENU_CMD_ID as usize,
+            PCWSTR(console_item.as_ptr()),
+        )
+    } {
+        eprintln!("[tools-menu] append console: {e}");
+    }
+
     let title: Vec<u16> = "&Tools\0".encode_utf16().collect();
     if let Err(e) = unsafe {
         AppendMenuW(
@@ -126,12 +139,49 @@ pub fn append_tools_menu(bar: HMENU) {
     }
 }
 
-/// Build a stand-alone menu bar containing the Edit and Tools
-/// submenus. Used at frame startup when no language-thread menu has
-/// been set.
+/// Frame-level WM_COMMAND id for the Forth-Restart menu item.
+/// Living in tools_menu so all menu IDs sit together.
+pub const FORTH_RESTART_CMD_ID: u16 = 0x3200;
+
+/// Append a `Forth` submenu to `bar` carrying the language-thread
+/// lifecycle commands.  Currently just Restart; Reload-core and
+/// Trace toggles will join later.
+pub fn append_forth_menu(bar: HMENU) {
+    let popup = match unsafe { CreatePopupMenu() } {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[forth-menu] CreatePopupMenu failed: {e}");
+            return;
+        }
+    };
+
+    let restart_item: Vec<u16> = "&Restart\tCtrl+Shift+F5\0".encode_utf16().collect();
+    if let Err(e) = unsafe {
+        AppendMenuW(
+            popup,
+            MF_STRING,
+            FORTH_RESTART_CMD_ID as usize,
+            PCWSTR(restart_item.as_ptr()),
+        )
+    } {
+        eprintln!("[forth-menu] append restart: {e}");
+    }
+
+    let title: Vec<u16> = "&Forth\0".encode_utf16().collect();
+    if let Err(e) = unsafe {
+        AppendMenuW(bar, MF_POPUP, popup.0 as usize, PCWSTR(title.as_ptr()))
+    } {
+        eprintln!("[forth-menu] append popup: {e}");
+    }
+}
+
+/// Build a stand-alone menu bar containing the Edit, Forth, and
+/// Tools submenus.  Used at frame startup when no language-thread
+/// menu has been set.
 pub fn build_default_menu_bar() -> Option<HMENU> {
     let bar = unsafe { CreateMenu() }.ok()?;
     append_edit_menu(bar);
+    append_forth_menu(bar);
     append_tools_menu(bar);
     Some(bar)
 }
@@ -142,6 +192,7 @@ pub fn build_default_menu_bar() -> Option<HMENU> {
 /// Both dispatch via `WM_COMMAND` to their respective MENU_CMD_IDs,
 /// which the frame WndProc routes to the right `open` function.
 pub fn build_accelerator_table() -> Option<HACCEL> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_F5;
     let entries = [
         ACCEL {
             fVirt: FCONTROL | FSHIFT | FVIRTKEY,
@@ -152,6 +203,16 @@ pub fn build_accelerator_table() -> Option<HACCEL> {
             fVirt: FCONTROL | FSHIFT | FVIRTKEY,
             key: b'L' as u16,
             cmd: log_view::MENU_CMD_ID,
+        },
+        ACCEL {
+            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
+            key: b'R' as u16,
+            cmd: fconsole::MENU_CMD_ID,
+        },
+        ACCEL {
+            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
+            key: VK_F5.0,
+            cmd: FORTH_RESTART_CMD_ID,
         },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }

@@ -1,0 +1,42 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — iGui bridge primitives.
+;
+; Forth-side wrappers for calls into the wf64-ui front-end.  None of
+; this is wired up in the headless `wf64` binary — only `wf64-ui`
+; spawns the iGui frame and its worker thread.  When the iGui
+; substrate isn't present the Rust runtime fns are no-ops, so
+; calling these from headless Forth costs nothing but the indirect
+; jump.
+;
+; Throw codes: none specific.  These primitives never fail —
+; they're side-effect-only.
+; ─────────────────────────────────────────────────────────────────────
+
+
+; page  ( -- )
+;     Clear the console scrollback.  Equivalent to a terminal's
+;     "clear screen."  Cursor returns implicitly to the top-left
+;     of the now-empty screen on the next emit.
+proc(page_word)
+    win64_call(rt_igui_page)
+    next()
+endp()
+
+
+; at-xy  ( col row -- )
+;     Reposition the cursor for the next emit.  V1 limitation: the
+;     subsequent text emits don't yet route through the position
+;     hook (the IO buffer is batch-flushed at end-of-eval).  This
+;     primitive records the requested position so PAGE+AT-XY-aware
+;     programs don't throw; full streaming-emit support comes in
+;     a follow-up to the IO subsystem.
+proc(at_xy_word)
+    ; Stack: row in TOS, col at [DSP].
+    mov     rcx, [DSP]                              ; col
+    mov     rdx, TOS                                ; row
+    win64_call(rt_igui_at_xy)
+    ; Drop both args.
+    mov     TOS, [DSP + cell]
+    stk(2, 0)
+    next()
+endp()

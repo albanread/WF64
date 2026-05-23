@@ -1257,6 +1257,12 @@ fn write_event(
             // see only the kind tag.
             k = kind::EVAL_BUFFER;
         }
+        IGuiEvent::ForthRestart => {
+            // Reuse the EVAL_BUFFER tag for C-ABI consumers — the
+            // language thread will read this via the Rust path
+            // (wf64-ui's worker drains the typed variant directly).
+            k = kind::EVAL_BUFFER;
+        }
     }
 
     unsafe {

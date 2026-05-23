@@ -41,6 +41,7 @@ mod executor;
 mod font_metrics;
 pub mod lisp_shims;
 pub mod log_view;
+pub mod fconsole;
 mod menu;
 pub(crate) mod fedit;
 pub(crate) mod rope_buffer;
@@ -78,7 +79,8 @@ impl std::fmt::Display for IGuiError {
 
 impl std::error::Error for IGuiError {}
 
-/// Phase 1 paints this slate gray into the MDI client area so we can see
-/// the renderer is actually running. Will be replaced once the surface
-/// executor lands and children own their own colors.
-pub(crate) const PHASE1_BACKGROUND: [f32; 4] = [0.18, 0.20, 0.23, 1.0];
+/// Background colour painted into the MDI client area between
+/// children.  Deep navy with a slight blue tint — leaves room for
+/// future amber/orange accent brushes (the vintage Forth terminal
+/// vibe) without competing with them.
+pub(crate) const PHASE1_BACKGROUND: [f32; 4] = [0.06, 0.08, 0.12, 1.0];

@@ -134,7 +134,7 @@ pub const EDIT_CMD_PREV_WORD: u16 = 0x3121;
 pub const EDIT_CMD_RUN_BUFFER: u16 = 0x3140;
 
 const FEDIT_CLASS: PCWSTR = w!("WF64.iGui.Fedit");
-const TITLE_NEW: PCWSTR = w!("fedit — untitled");
+const TITLE_NEW: PCWSTR = w!("\u{2234} fedit \u{2014} untitled");
 
 /// HWND of the singleton ledit MDI child, if one exists. Used to
 /// activate the existing instance instead of creating a second one.
@@ -2326,6 +2326,7 @@ fn handle_char(state: &mut FeditState, c: char) {
 /// into "All files" for everything else.
 fn forth_filter() -> Vec<u16> {
     let raw = "Forth source (*.f;*.fs;*.4th;*.fth)\0*.f;*.fs;*.4th;*.fth\0\
+               JASM assembly (*.masm)\0*.masm\0\
                Text files (*.txt)\0*.txt\0\
                All files (*.*)\0*.*\0\0";
     raw.encode_utf16().collect()
