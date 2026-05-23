@@ -3799,6 +3799,186 @@ fn str_ops_compose() {
         "expected $= true after compose; got {out:?}");
 }
 
+// ── V2s stage D — extended operations ────────────────────────────
+
+#[test]
+fn str_contains_true_and_false() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" world\" >$ s\" hello world\" >$ $contains? .\n\
+         s\" xyz\"   >$ s\" hello world\" >$ $contains? .\n\
+         empty$ s\" hello\" >$ $contains? .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![-1, 0, -1], "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_rfind_last_occurrence() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" ab\" >$ s\" abcab\" >$ $rfind .\n\
+         s\" xy\" >$ s\" abcab\" >$ $rfind .\n\
+         empty$  s\" hello\" >$ $rfind .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    // First: "ab" appears at 0 and 3 — last is 3.
+    // Second: not found → -1.
+    // Third: empty needle → haystack length = 5.
+    assert_eq!(nums, vec![3, -1, 5], "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_repeat_basic() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" ab\" >$ 3 $repeat $>addr type cr\n\
+         s\" x\"  >$ 0 $repeat $len .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("ababab"), "got {out:?}");
+    assert!(out.contains("0  ok"), "0-repeat should yield empty string; got {out:?}");
+}
+
+#[test]
+fn str_replace_simple() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" world\" >$ s\" Forth\" >$ s\" hello world!\" >$ $replace $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("hello Forth!"), "got {out:?}");
+}
+
+#[test]
+fn str_replace_multiple_matches() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" o\" >$ s\" 0\" >$ s\" foo bar boo\" >$ $replace $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("f00 bar b00"), "got {out:?}");
+}
+
+#[test]
+fn str_replace_no_match_returns_copy() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" xyz\" >$ s\" QQ\" >$ s\" hello\" >$ $replace $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("hello"), "got {out:?}");
+}
+
+#[test]
+fn str_replace_repl_longer_than_needle() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" a\" >$ s\" ZZZ\" >$ s\" abab\" >$ $replace $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("ZZZbZZZb"), "got {out:?}");
+}
+
+#[test]
+fn str_replace_repl_shorter_than_needle() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" abc\" >$ s\" X\" >$ s\" abcabcabc\" >$ $replace $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("XXX"), "got {out:?}");
+}
+
+#[test]
+fn str_split_basic() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" ,\" >$ s\" a,b,c\" >$ $split .\n\
+         bye\n"
+    ).unwrap();
+    // $split pushes ( $1 $2 $3 3 ).  Print the count.
+    assert!(out.contains("3  ok"),
+        "should split into 3 parts; got {out:?}");
+}
+
+#[test]
+fn str_split_consume_pieces() {
+    // Verify each piece is readable.  Count is on top; iterate down.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" ,\" >$ s\" alpha,beta,gamma\" >$ $split\n\
+         \\ Stack now: ( $a $b $c 3 ).  drop count, type each in reverse.\n\
+         drop\n\
+         $>addr type cr            \\ gamma\n\
+         $>addr type cr            \\ beta\n\
+         $>addr type cr            \\ alpha\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("gamma"), "got {out:?}");
+    assert!(out.contains("beta"),  "got {out:?}");
+    assert!(out.contains("alpha"), "got {out:?}");
+}
+
+#[test]
+fn str_split_no_separator_yields_one_piece() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" ,\" >$ s\" nosep\" >$ $split .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("1  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_split_empty_haystack_yields_one_empty_piece() {
+    let mut s = sess_with_core();
+    // $split of empty yields ($empty 1).
+    // `.` prints 1 (count, top of stack), leaving ($empty).
+    // `$len .` prints 0 (length of the piece).
+    let out = s.eval(
+        "s\" ,\" >$ empty$ $split . $len .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![1, 0], "got {nums:?} from {out:?}");
+}
+
+#[test]
+
+#[test]
+fn str_split_empty_sep_throws() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "empty$ s\" hello\" >$ $split drop\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2058"),
+        "empty separator should throw -2058; got {msg}");
+}
+
+#[test]
+fn str_d_wrong_types_throw() {
+    // Smoke test that every new V2s-D op rejects FloatVec inputs
+    // with -2060.  One per op family.
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR v\n\
+         4 v vec-alloc-floats!\n\
+         s\" hi\" >$ v @ $contains? drop\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2060"), "got {msg}");
+}
+
 #[test]
 fn gc_vec_f_fetch_wrong_type_still_throws_minus_2060() {
     // Make sure -2060 still fires when the slot holds something with

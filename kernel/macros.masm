@@ -232,6 +232,48 @@
     mov     rsp, r12
 @endmacro
 
+; ── pushd_call / pushd_call_or ───────────────────────────────────────
+; Push the return value of a Win64-ABI call onto the Forth data
+; stack, dodging the RAX/TOS clobber hazard.
+;
+; The hazard, in brief: TOS lives in RAX, and Win64 returns its
+; integer result in RAX.  Any callout effectively destroys the cached
+; TOS.  When the call's return value IS what we want to push, the
+; correct sequence is:
+;
+;   1. Spill the old cached TOS to the slot that will become the new
+;      NOS — *before* the call.
+;   2. Call (RAX is now the return value).
+;   3. Move RAX into TOS and bump DSP down by one cell.
+;
+; Caller sets up call args (RCX, RDX, R8, R9, etc.) *before* invoking
+; either macro.  These macros only touch RAX/RSP/R12 and the cell
+; immediately below DSP.
+;
+; `pushd_call(target)` commits the push unconditionally.  Use when
+; the target can't fail or when the caller doesn't care to check.
+;
+; `pushd_call_or(target, err_label)` checks RAX against -1 (u64::MAX,
+; our standard runtime-failure sentinel) and jumps to `err_label`
+; without modifying the stack on failure.  On success the push is
+; committed exactly as in pushd_call.
+
+@macro pushd_call(target)
+    mov  [DSP - cell], TOS
+    win64_call(&target)
+    mov  TOS, rax
+    sub  DSP, cell
+@endmacro
+
+@macro pushd_call_or(target, err_label)
+    mov  [DSP - cell], TOS
+    win64_call(&target)
+    cmp  rax, -1
+    je   &err_label
+    mov  TOS, rax
+    sub  DSP, cell
+@endmacro
+
 ; ── brk ──────────────────────────────────────────────────────────────
 ; Non-fatal breakpoint. The SEH handler catches `int 3`, dumps state
 ; (all GPRs + 32 qwords of stack with symbolic resolution), advances

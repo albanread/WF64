@@ -144,6 +144,12 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("n>$",                "int_to_string_word",       0),
     ("$>n",                "string_to_int_word",       0),
     ("empty$",             "empty_string_word",        0),
+    // V2s stage D: extended operations.
+    ("$contains?",         "string_contains_word",     0),
+    ("$rfind",             "string_rfind_word",        0),
+    ("$repeat",            "string_repeat_word",       0),
+    ("$replace",           "string_replace_word",      0),
+    ("$split",             "string_split_word",        0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -1005,6 +1011,11 @@ impl Wf64Session {
                 "rt_string_rtrim"       => Some(runtime::rt_string_rtrim       as *mut c_void),
                 "rt_int_to_string"      => Some(runtime::rt_int_to_string      as *mut c_void),
                 "rt_string_to_int"      => Some(runtime::rt_string_to_int      as *mut c_void),
+                "rt_string_contains"    => Some(runtime::rt_string_contains    as *mut c_void),
+                "rt_string_rfind"       => Some(runtime::rt_string_rfind       as *mut c_void),
+                "rt_string_repeat"      => Some(runtime::rt_string_repeat      as *mut c_void),
+                "rt_string_replace"     => Some(runtime::rt_string_replace     as *mut c_void),
+                "rt_string_split_into"  => Some(runtime::rt_string_split_into  as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;

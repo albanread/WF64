@@ -51,3 +51,8 @@
 @extern rt_string_rtrim(2)      ; (UP, tagged) -> tagged String
 @extern rt_int_to_string(2)     ; (UP, n) -> tagged String
 @extern rt_string_to_int(2)     ; (tagged, out_value_addr) -> -1 if parsed, 0 if not
+@extern rt_string_contains(2)   ; (needle, haystack) -> -1 if found, 0 if not
+@extern rt_string_rfind(2)      ; (needle, haystack) -> last byte idx (or -1)
+@extern rt_string_repeat(3)     ; (UP, tagged, n) -> tagged String (or -1)
+@extern rt_string_replace(4)    ; (UP, needle, repl, haystack) -> tagged String (or -1)
+@extern rt_string_split_into(5) ; (UP, sep, haystack, out_addr, max_parts) -> n parts (or -1)

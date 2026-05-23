@@ -1130,6 +1130,301 @@ pub extern "C" fn rt_int_to_string(up: u64, n: u64) -> u64 {
     rt_string_from_bytes(up, s.as_ptr() as u64, s.len() as u64)
 }
 
+/// True iff `needle` occurs anywhere in `haystack` (byte search).
+/// Empty needle is always considered contained.
+#[no_mangle]
+pub extern "C" fn rt_string_contains(needle: u64, haystack: u64) -> u64 {
+    let (n_ptr, n_len) = unsafe { string_payload(needle) };
+    let (h_ptr, h_len) = unsafe { string_payload(haystack) };
+    if n_len == 0 {
+        return u64::MAX;
+    }
+    if n_len > h_len {
+        return 0;
+    }
+    let n = unsafe { std::slice::from_raw_parts(n_ptr, n_len) };
+    let h = unsafe { std::slice::from_raw_parts(h_ptr, h_len) };
+    for i in 0..=(h_len - n_len) {
+        if &h[i..i + n_len] == n {
+            return u64::MAX;
+        }
+    }
+    0
+}
+
+/// Find the LAST occurrence of `needle` in `haystack`.  Empty
+/// needle returns `haystack.len`.  Returns `u64::MAX` (-1) if no
+/// match.
+#[no_mangle]
+pub extern "C" fn rt_string_rfind(needle: u64, haystack: u64) -> u64 {
+    let (n_ptr, n_len) = unsafe { string_payload(needle) };
+    let (h_ptr, h_len) = unsafe { string_payload(haystack) };
+    if n_len == 0 {
+        return h_len as u64;
+    }
+    if n_len > h_len {
+        return u64::MAX;
+    }
+    let n = unsafe { std::slice::from_raw_parts(n_ptr, n_len) };
+    let h = unsafe { std::slice::from_raw_parts(h_ptr, h_len) };
+    // Scan backwards from the last possible start position.
+    let mut i = h_len - n_len;
+    loop {
+        if &h[i..i + n_len] == n {
+            return i as u64;
+        }
+        if i == 0 { break; }
+        i -= 1;
+    }
+    u64::MAX
+}
+
+/// Return a fresh String containing `tagged` repeated `n` times.
+/// `n == 0` returns an empty String; very large `n` may overflow
+/// u32 length and is rejected.
+#[no_mangle]
+pub extern "C" fn rt_string_repeat(up: u64, tagged: u64, n: u64) -> u64 {
+    let (src_ptr, src_len) = unsafe { string_payload(tagged) };
+    let Some(total) = (src_len as u64).checked_mul(n) else {
+        eprintln!("$repeat: overflow ({src_len} × {n})");
+        return u64::MAX;
+    };
+    if total > u32::MAX as u64 {
+        eprintln!("$repeat: result {total} exceeds u32::MAX");
+        return u64::MAX;
+    }
+    let total = total as usize;
+    let tagged_out = match gc::alloc_string(total as u32) {
+        Some(t) => t,
+        None => {
+            let payload_cells = ((total + 7) / 8) as u64;
+            if payload_cells > PAGE_SIZE_CELLS {
+                let regions = gc_root_regions(up);
+                unsafe { gc::collect_full(&regions); }
+                match gc::alloc_string(total as u32) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("$repeat: out of GC heap (len {total}, post-compaction retry failed)");
+                        return u64::MAX;
+                    }
+                }
+            } else {
+                eprintln!("$repeat: out of GC heap (len {total})");
+                return u64::MAX;
+            }
+        }
+    };
+    if total > 0 && src_len > 0 {
+        let base = tagged_out & !7;
+        let dst = (base + 8) as *mut u8;
+        unsafe {
+            for i in 0..(n as usize) {
+                std::ptr::copy_nonoverlapping(src_ptr, dst.add(i * src_len), src_len);
+            }
+        }
+    }
+    tagged_out
+}
+
+/// Replace every occurrence of `needle` in `haystack` with `repl`,
+/// returning a fresh String.  Empty needle returns `haystack`
+/// untouched (we don't loop forever on the zero-length match).
+#[no_mangle]
+pub extern "C" fn rt_string_replace(
+    up: u64,
+    needle: u64,
+    repl: u64,
+    haystack: u64,
+) -> u64 {
+    let (n_ptr, n_len) = unsafe { string_payload(needle) };
+    let (r_ptr, r_len) = unsafe { string_payload(repl) };
+    let (h_ptr, h_len) = unsafe { string_payload(haystack) };
+
+    if n_len == 0 {
+        // Defensive: return a fresh copy of haystack.  Could return
+        // haystack itself but the design is "operations return fresh
+        // Strings."
+        return rt_string_from_bytes(up, h_ptr as u64, h_len as u64);
+    }
+
+    let n = unsafe { std::slice::from_raw_parts(n_ptr, n_len) };
+    let h = unsafe { std::slice::from_raw_parts(h_ptr, h_len) };
+    let r = unsafe { std::slice::from_raw_parts(r_ptr, r_len) };
+
+    // First pass: count matches to size the output exactly.
+    let mut count: usize = 0;
+    if n_len <= h_len {
+        let mut i = 0;
+        while i + n_len <= h_len {
+            if &h[i..i + n_len] == n {
+                count += 1;
+                i += n_len;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    if count == 0 {
+        return rt_string_from_bytes(up, h_ptr as u64, h_len as u64);
+    }
+
+    // Output size = h_len + count * (r_len - n_len).  Avoid signed
+    // arithmetic by adding contribution-per-match carefully.
+    let removed = count * n_len;
+    let added   = count * r_len;
+    let new_len = h_len - removed + added;
+    if new_len > u32::MAX as usize {
+        eprintln!("$replace: result {new_len} exceeds u32::MAX");
+        return u64::MAX;
+    }
+
+    let tagged_out = match gc::alloc_string(new_len as u32) {
+        Some(t) => t,
+        None => {
+            let payload_cells = ((new_len + 7) / 8) as u64;
+            if payload_cells > PAGE_SIZE_CELLS {
+                let regions = gc_root_regions(up);
+                unsafe { gc::collect_full(&regions); }
+                match gc::alloc_string(new_len as u32) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("$replace: out of GC heap (len {new_len}, post-compaction retry failed)");
+                        return u64::MAX;
+                    }
+                }
+            } else {
+                eprintln!("$replace: out of GC heap (len {new_len})");
+                return u64::MAX;
+            }
+        }
+    };
+
+    // Second pass: copy with substitutions.
+    let base = tagged_out & !7;
+    let dst = (base + 8) as *mut u8;
+    let mut di = 0usize;
+    let mut i = 0usize;
+    while i + n_len <= h_len {
+        if &h[i..i + n_len] == n {
+            unsafe {
+                if r_len > 0 {
+                    std::ptr::copy_nonoverlapping(r_ptr, dst.add(di), r_len);
+                }
+            }
+            di += r_len;
+            i += n_len;
+        } else {
+            unsafe { *dst.add(di) = h[i]; }
+            di += 1;
+            i += 1;
+        }
+    }
+    // Trailing bytes after the last possible match start.
+    while i < h_len {
+        unsafe { *dst.add(di) = h[i]; }
+        di += 1;
+        i += 1;
+    }
+    debug_assert_eq!(di, new_len);
+    tagged_out
+}
+
+/// Allocate a fresh `String` and copy bytes into it.  Direct
+/// shortcut for code paths that must NOT trigger
+/// fragmentation-retry / collect_full mid-loop (which would
+/// invalidate previously-emitted pointers held outside any GC
+/// root region).  Returns `u64::MAX` on alloc failure, leaving
+/// retry / GC decisions to the caller.
+fn alloc_string_copy_no_retry(src: *const u8, len: usize) -> u64 {
+    if len > u32::MAX as usize {
+        return u64::MAX;
+    }
+    let Some(tagged) = gc::alloc_string(len as u32) else {
+        return u64::MAX;
+    };
+    if len > 0 {
+        let base = tagged & !7;
+        let dst = (base + 8) as *mut u8;
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len); }
+    }
+    tagged
+}
+
+/// Split `haystack` on every occurrence of `sep`, writing the
+/// resulting String tagged pointers into the cells starting at
+/// `out_addr`.  Returns the number of parts written.  Empty `sep`
+/// is rejected (would yield infinite parts) — returns `u64::MAX`.
+///
+/// Caller must ensure `out_addr` has room for at least `max_parts`
+/// cells; the kernel-side wrapper enforces this against a fixed
+/// buffer.  If more parts would be produced than fit, returns
+/// `u64::MAX` (the caller must surface as -2058 / overflow).
+///
+/// `_up` is accepted for signature consistency with the other
+/// allocators but not used — see `alloc_string_copy_no_retry`:
+/// each piece allocation skips the fragmentation-retry path so a
+/// mid-loop collect_full can't move earlier pieces out from under
+/// the destination slots (which aren't a GC root region).
+#[no_mangle]
+pub extern "C" fn rt_string_split_into(
+    _up: u64,
+    sep: u64,
+    haystack: u64,
+    out_addr: u64,
+    max_parts: u64,
+) -> u64 {
+    let (s_ptr, s_len) = unsafe { string_payload(sep) };
+    let (h_ptr, h_len) = unsafe { string_payload(haystack) };
+    if s_len == 0 {
+        eprintln!("$split: empty separator");
+        return u64::MAX;
+    }
+    let s = unsafe { std::slice::from_raw_parts(s_ptr, s_len) };
+    let h = unsafe { std::slice::from_raw_parts(h_ptr, h_len) };
+    let out = out_addr as *mut u64;
+    let mut written: u64 = 0;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + s_len <= h_len {
+        if &h[i..i + s_len] == s {
+            if written >= max_parts {
+                eprintln!("$split: too many parts (max {max_parts})");
+                return u64::MAX;
+            }
+            let piece = alloc_string_copy_no_retry(
+                unsafe { h_ptr.add(start) },
+                i - start,
+            );
+            if piece == u64::MAX {
+                eprintln!("$split: out of GC heap mid-split");
+                return u64::MAX;
+            }
+            unsafe { *out.add(written as usize) = piece; }
+            written += 1;
+            start = i + s_len;
+            i = start;
+        } else {
+            i += 1;
+        }
+    }
+    if written >= max_parts {
+        eprintln!("$split: too many parts (max {max_parts})");
+        return u64::MAX;
+    }
+    let piece = alloc_string_copy_no_retry(
+        unsafe { h_ptr.add(start) },
+        h_len - start,
+    );
+    if piece == u64::MAX {
+        eprintln!("$split: out of GC heap on final piece");
+        return u64::MAX;
+    }
+    unsafe { *out.add(written as usize) = piece; }
+    written += 1;
+    written
+}
+
 /// Parse `tagged` as a signed decimal integer.  Returns
 /// `(value, true)` on the data stack — wait, we can't return two
 /// values from a single C function easily.  Use a different shape:

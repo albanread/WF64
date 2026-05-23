@@ -1107,26 +1107,336 @@ endp()
 
 ; empty$  ( -- $ )
 ;     Push a fresh zero-length String.  Mostly useful as the
-;     starting value before a concatenation loop.
-;
-;     NOTE on push-pattern: spill old TOS to memory BEFORE the
-;     Win64 call.  rt_string_from_bytes returns its result in rax
-;     (= our cached TOS), so any post-call attempt to spill the
-;     OLD TOS would actually spill the NEW value — silently
-;     corrupting the caller's stack.  Same hazard as gc-cycle.
+;     starting value before a concatenation loop.  Uses
+;     pushd_call_or to dodge the TOS/RAX clobber documented on the
+;     macro.
 proc(empty_string_word)
-    mov     [DSP - cell], TOS                       ; spill old TOS first
     mov     rcx, UP
     xor     rdx, rdx                                ; src=0 (ignored when len=0)
     xor     r8,  r8                                 ; len=0
-    win64_call(rt_string_from_bytes)
-    cmp     rax, -1
-    je      .err
-    mov     TOS, rax
-    stk(0, 1)
+    pushd_call_or(rt_string_from_bytes, .err)
     next()
 .err:
     mov     TOS, -2059
+    call    throw_word
+    next()
+endp()
+
+
+; ── V2s stage D — extended operations ───────────────────────────────
+
+
+; $contains?  ( $needle $h -- f )
+;     True iff needle occurs anywhere in haystack (byte search).
+proc(string_contains_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r11
+    mov     rdx, r9
+    win64_call(rt_string_contains)
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $rfind  ( $needle $h -- idx | -1 )
+;     Index of LAST occurrence of needle in haystack.  Empty
+;     needle returns haystack length.
+proc(string_rfind_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r11
+    mov     rdx, r9
+    win64_call(rt_string_rfind)
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $repeat  ( $h n -- $s )
+;     Fresh String containing $h concatenated n times.  n=0 yields
+;     an empty String.  Throws -2058 if result would overflow
+;     u32::MAX bytes.
+proc(string_repeat_word)
+    ; Stack: n in TOS, $h at [DSP].
+    mov     r9, [DSP]
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    ; Build args: rcx=UP, rdx=$h, r8=n
+    mov     rcx, UP
+    mov     rdx, r9
+    mov     r8,  TOS
+    win64_call(rt_string_repeat)
+    cmp     rax, -1
+    je      .err
+    ; ( $h n -- $s ): 2 in, 1 out.
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.err:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2058
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $replace  ( $needle $repl $h -- $s )
+;     Substitute every occurrence of needle in h with repl.
+;     Empty needle returns h untouched (as a fresh copy).
+proc(string_replace_word)
+    ; Stack: $h in TOS, $repl at [DSP], $needle at [DSP+cell].
+    ; Type-check all three.
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r13, [DSP + cell]
+    test    r13, r13
+    jz      .nil
+    mov     r10, r13
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    ; Call rt_string_replace(UP, needle, repl, haystack).
+    mov     rcx, UP
+    mov     rdx, r13                                ; $needle
+    mov     r8,  r11                                ; $repl
+    mov     r9,  TOS                                ; $h
+    win64_call(rt_string_replace)
+    cmp     rax, -1
+    je      .err
+    ; ( $needle $repl $h -- $s ): 3 in, 1 out.
+    mov     TOS, rax
+    stk(2, 0)
+    next()
+.err:
+    ; Drop 3, push -2059.
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2059
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $split  ( $sep $h -- $1 $2 ... $n n )
+;     Split haystack on every occurrence of sep, push each piece
+;     followed by the count.  Stack-shaped; appropriate for small
+;     splits (cap 32 pieces).  Throws -2058 if the split would
+;     exceed 32 parts, -2060 on wrong type, -2061 on nil, -2059
+;     on heap exhaustion during piece allocation.
+;
+;     Pre-trigger an auto-step before calling so the loop's piece
+;     allocations are unlikely to trip the fragmentation-retry
+;     path (which could move earlier pieces — see the no-retry
+;     note on rt_string_split_into).
+proc(string_split_word)
+    ; Stack: $h in TOS, $sep at [DSP].
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    ; Stash inputs (r13 = sep, r14 = haystack) and auto-step.
+    mov     r13, r11
+    mov     r14, r9
+    mov     rcx, UP
+    win64_call(rt_gc_auto_step)
+    ; Call rt_string_split_into(UP, sep, haystack, PAD, 32).
+    mov     rcx, UP
+    mov     rdx, r13
+    mov     r8,  r14
+    lea     r9,  [UP + user_PAD]
+    ; rt_string_split_into has 5 args.  Win64 passes 1-4 in
+    ; rcx/rdx/r8/r9; arg 5 (max_parts) goes on the stack at
+    ; [rsp+32] (above the 32-byte shadow).  win64_call macro only
+    ; handles the 4-arg case, so do the alignment dance manually.
+    mov     r12, rsp
+    and     rsp, -16
+    sub     rsp, 48                                 ; 32 shadow + 16 for arg5
+    mov     qword ptr [rsp + 32], 32                ; arg5: max_parts
+    call    rt_string_split_into
+    mov     rsp, r12
+    cmp     rax, -1
+    je      .err
+    ; rax = count of pieces emitted into PAD.
+    ; Now push pieces onto data stack (in order), followed by count.
+    ; Stack effect before:  TOS=$h, [DSP]=$sep.  We drop these two
+    ; and then push N + 1 cells.
+    ;
+    ; Drop the inputs first.  After this DSP points at the original
+    ; NNOS.
+    add     DSP, cell                               ; drop one cell ($sep slot)
+    ; TOS now temporarily invalid (we'll fix when committing).
+    ; Stash count in r14.
+    mov     r14, rax
+    ; Loop: push each piece from PAD onto stack.
+    xor     r13, r13                                ; index i = 0
+    test    r14, r14
+    jz      .push_count                             ; zero pieces — just push 0
+    ; Push first piece into TOS (consumes the slot we just dropped).
+    lea     r11, [UP + user_PAD]
+    mov     TOS, [r11]
+    inc     r13
+    cmp     r13, r14
+    jge     .push_count
+.push_piece:
+    ; Push subsequent pieces via standard pattern.
+    mov     [DSP - cell], TOS
+    mov     TOS, [r11 + r13 * cell]
+    sub     DSP, cell
+    inc     r13
+    cmp     r13, r14
+    jl      .push_piece
+.push_count:
+    ; Final: push the count.
+    mov     [DSP - cell], TOS
+    mov     TOS, r14
+    sub     DSP, cell
+    next()
+.err:
+    ; Drop ($sep $h), throw -2058 / -2059 (we use 2058 for both;
+    ; the kernel can't easily distinguish here without an out-param).
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2058
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
     call    throw_word
     next()
 endp()

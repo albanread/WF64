@@ -244,13 +244,7 @@ endp()
 ;     used to be safe pre-V2.  Snapshot this counter, compare after
 ;     each allocation, refresh from @heapptr if it changed.
 proc(gc_cycle_word)
-    ; Save caller's TOS into the next-down memory slot BEFORE the
-    ; Win64 call (rt_gc_cycle_count returns its result in rax, which
-    ; IS TOS — so we have to spill first).
-    mov     [DSP - cell], TOS
-    win64_call(rt_gc_cycle_count)
-    mov     TOS, rax
-    stk(0, 1)
+    pushd_call(rt_gc_cycle_count)
     next()
 endp()
 
