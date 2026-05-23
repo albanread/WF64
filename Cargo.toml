@@ -10,6 +10,8 @@ description = "A 64-bit STC Forth, JIT-compiled via the JASM assembler"
 wfasm = { path = "../JASM/rust" }
 newgc-core = { path = "../NewGC/crates/newgc-core" }
 anyhow = "1"
+# libloading — runtime DLL loading for factor.dll (NewFactor IDE).
+libloading = "0.8"
 
 # iGui — Windows MDI front-end, ported from NewCormanLisp's iGui
 # (which in turn borrows the renderer architecture from NewCP).
@@ -63,6 +65,10 @@ path = "src/bin/wf64_ui.rs"
 [[bin]]
 name = "port-wf32"
 path = "src/bin/port_wf32.rs"
+
+[[bin]]
+name = "newfactor-ui"
+path = "src/bin/newfactor_ui.rs"
 
 [profile.dev]
 debug = 1

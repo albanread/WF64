@@ -103,12 +103,52 @@ fn with_current_io<R>(f: impl FnOnce(&mut Io) -> R) -> R {
     })
 }
 
-/// Print a signed cell in decimal followed by a single space, no newline.
+/// Print a signed cell in the current BASE, followed by a single
+/// space, no newline.  `base` is read by the kernel from
+/// `UP + user_BASE` and passed in as arg 2 — keeps this function
+/// stateless and dodges the need for the runtime to know the UP
+/// layout.  Falls back to decimal (base 10) if the kernel passes
+/// an out-of-range value (< 2 or > 36).
 #[no_mangle]
-pub extern "C" fn rt_print_int(n: u64) -> u64 {
+pub extern "C" fn rt_print_int(n: u64, base: u64) -> u64 {
     let s = n as i64;
-    let bytes = format!("{s} ").into_bytes();
-    write_bytes(&bytes);
+    let b = if (2..=36).contains(&base) { base as u32 } else { 10 };
+    let mut buf = String::with_capacity(24);
+    if b == 10 {
+        // Hot path: signed-decimal via the std formatter is faster
+        // than the manual radix-conversion loop below, and matches
+        // what callers used to see exactly.
+        use std::fmt::Write;
+        let _ = write!(&mut buf, "{s} ");
+    } else {
+        // Generic signed radix conversion.  Negative numbers print
+        // as `-MAGNITUDE` in the chosen base; matches the high-level
+        // `.` in core.f which does the same via `<# … sign #>`.
+        let (sign, mag) = if s < 0 {
+            ('-', (s as i128).unsigned_abs())
+        } else {
+            (' ', s as u128)
+        };
+        let mut digits: Vec<u8> = Vec::with_capacity(24);
+        let mut v = mag;
+        if v == 0 {
+            digits.push(b'0');
+        } else {
+            while v > 0 {
+                let d = (v % b as u128) as u8;
+                digits.push(if d < 10 { b'0' + d } else { b'A' + (d - 10) });
+                v /= b as u128;
+            }
+        }
+        if sign == '-' {
+            buf.push('-');
+        }
+        for &d in digits.iter().rev() {
+            buf.push(d as char);
+        }
+        buf.push(' ');
+    }
+    write_bytes(buf.as_bytes());
     0
 }
 
@@ -1888,6 +1928,138 @@ pub extern "C" fn rt_gpane_fill_circle(
     }
     let _ = (cx, cy, r, rgb);
     0
+}
+
+// ─── Forth-side event API ────────────────────────────────────────────
+//
+// `gpane-next-event ( child_id timeout-ms -- p4 p3 p2 p1 kind )`
+//
+// Pulls the next event matching `child_id` (or a global, e.g.
+// FrameClose) from the iGui mailbox.  Non-matching events stash in
+// EVENT_STASH and are picked up by the worker's normal drain loop
+// when this returns, so infrastructure events (EvalBuffer,
+// ReplSubmit, etc.) survive even while Forth is in its event loop.
+//
+// `timeout-ms < 0` blocks indefinitely.  On timeout / no event the
+// kind is `EV_NONE = 0` and all params are 0 — same shape as a real
+// event so Forth's stack effect stays predictable.
+//
+// Event-kind tags (mirror IGuiEvent variants); the Forth-side
+// constants in `lib/core.f` use these values.
+pub const EV_NONE:        i64 = 0;
+pub const EV_KEY:         i64 = 1;
+pub const EV_CHAR:        i64 = 2;
+pub const EV_MOUSE:       i64 = 3;
+pub const EV_FOCUS:       i64 = 4;
+pub const EV_RESIZE:      i64 = 5;
+pub const EV_CLOSE:       i64 = 6;
+pub const EV_FRAME_CLOSE: i64 = 7;
+pub const EV_TICK:        i64 = 13;
+
+/// Decode an `IGuiEvent` into (kind, p1, p2, p3, p4).  Mirrors the
+/// CP `write_event` packing in `cp_exports::write_event`.  Returns
+/// `EV_NONE` for variants Forth doesn't care about (e.g.
+/// `ForthRestart`).
+#[cfg(windows)]
+fn decode_event(
+    ev: &crate::igui::channels::IGuiEvent,
+) -> (i64, i64, i64, i64, i64) {
+    use crate::igui::channels::IGuiEvent;
+    match ev {
+        IGuiEvent::Key { vkey, mods, repeat, down, .. } => (
+            EV_KEY,
+            *vkey,
+            *mods,
+            if *down { 1 } else { 0 },
+            *repeat,
+        ),
+        IGuiEvent::Char { codepoint, mods, .. } => (EV_CHAR, *codepoint, *mods, 0, 0),
+        IGuiEvent::Mouse { x, y, op, button, mods, .. } => (
+            EV_MOUSE,
+            *x,
+            *y,
+            *op,
+            *mods | (*button << 8),
+        ),
+        IGuiEvent::Focus { gained, .. } => {
+            (EV_FOCUS, if *gained { 1 } else { 0 }, 0, 0, 0)
+        }
+        IGuiEvent::Resize { width, height, .. } => (EV_RESIZE, *width, *height, 0, 0),
+        IGuiEvent::Close { .. } => (EV_CLOSE, 0, 0, 0, 0),
+        IGuiEvent::FrameClose => (EV_FRAME_CLOSE, 0, 0, 0, 0),
+        IGuiEvent::Tick { time_ms, .. } => (EV_TICK, *time_ms, 0, 0, 0),
+        // Infrastructure events Forth never receives via this path.
+        IGuiEvent::DpiChange { .. }
+        | IGuiEvent::ThemeChange
+        | IGuiEvent::Menu { .. }
+        | IGuiEvent::EvalBuffer { .. }
+        | IGuiEvent::ForthRestart
+        | IGuiEvent::ReplSubmit { .. } => (EV_NONE, 0, 0, 0, 0),
+    }
+}
+
+/// Block up to `timeout_ms` for the next event whose `child_id`
+/// equals `child_id` (or which is a global like FrameClose).
+/// Writes the decoded event into the five `out_*` slots.  Returns 1
+/// if an event was returned, 0 on timeout.
+///
+/// On 0 return the slots are zeroed so Forth's stack effect stays
+/// predictable: callers always pop the same five cells.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn rt_gpane_next_event_for(
+    child_id: u64,
+    timeout_ms: u64,
+    out_kind: *mut i64,
+    out_p1: *mut i64,
+    out_p2: *mut i64,
+    out_p3: *mut i64,
+    out_p4: *mut i64,
+) -> u64 {
+    // Zero outputs up front so the timeout path doesn't need to.
+    unsafe {
+        if !out_kind.is_null() { *out_kind = 0; }
+        if !out_p1.is_null()   { *out_p1   = 0; }
+        if !out_p2.is_null()   { *out_p2   = 0; }
+        if !out_p3.is_null()   { *out_p3   = 0; }
+        if !out_p4.is_null()   { *out_p4   = 0; }
+    }
+
+    #[cfg(windows)]
+    {
+        let id = child_id as i64;
+        let timeout = timeout_ms as i64;
+        // Loop on EV_NONE: an event variant we don't surface to
+        // Forth (e.g. DpiChange) gets stashed back for the main
+        // drain, then we retry — instead of collapsing the
+        // caller's timeout to 0 by returning prematurely.  With a
+        // finite timeout this can extend the total wait slightly
+        // if many infrastructure events arrive in a burst; that's
+        // acceptable and rare in practice.
+        loop {
+            let Some(ev) = crate::igui::channels::next_event_for(id, timeout) else {
+                return 0;
+            };
+            let (kind, p1, p2, p3, p4) = decode_event(&ev);
+            if kind == EV_NONE {
+                crate::igui::channels::stash_event(ev);
+                continue;
+            }
+            unsafe {
+                if !out_kind.is_null() { *out_kind = kind; }
+                if !out_p1.is_null()   { *out_p1   = p1;   }
+                if !out_p2.is_null()   { *out_p2   = p2;   }
+                if !out_p3.is_null()   { *out_p3   = p3;   }
+                if !out_p4.is_null()   { *out_p4   = p4;   }
+            }
+            return 1;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child_id, timeout_ms, out_kind, out_p1, out_p2, out_p3, out_p4);
+        0
+    }
 }
 
 /// Compile-mode helper for `S$"`.  Allocates a LITERAL slot,

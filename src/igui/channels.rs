@@ -262,21 +262,52 @@ fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
 }
 
 /// Does `ev` belong to the consumer that asked for `target`?
-/// Per-window events match when their `child_id` == `target`. Global
-/// events (FrameClose, ThemeChange, Menu) match every target.
+/// Pane-targeted consumers (`Forth gpane-next-event`, NCL
+/// `event-loop-for`) get only:
+///   - `FrameClose` — so the consumer can exit cleanly when
+///     the whole IDE shuts down;
+///   - per-window events whose `child_id` matches `target`.
+///
+/// Everything else (`EvalBuffer`, `ForthRestart`, `ReplSubmit`,
+/// `Menu`, `ThemeChange`, plus per-window events for *other*
+/// windows) stays in the stash, so the worker's main drain loop
+/// can pick them up later.  This prevents a Forth event loop
+/// from accidentally swallowing menu clicks or restart requests.
 fn matches_target(ev: &IGuiEvent, target: i64) -> bool {
     match ev {
-        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } | IGuiEvent::ForthRestart => true,
-        IGuiEvent::Menu { .. } => true,
+        // Only true frame-close matches every consumer — that's
+        // the universal "we're shutting down" signal.
+        IGuiEvent::FrameClose => true,
+        // Everything global-but-not-shutdown stays for the main
+        // drain.  DpiChange is in here despite being per-child
+        // because the gpane API doesn't surface DPI to Forth; if
+        // we let it match, the runtime would decode it as
+        // EV_NONE and the demo would livelock fetching the same
+        // event over and over from the stash.
+        IGuiEvent::ThemeChange
+        | IGuiEvent::Menu { .. }
+        | IGuiEvent::EvalBuffer { .. }
+        | IGuiEvent::ForthRestart
+        | IGuiEvent::ReplSubmit { .. }
+        | IGuiEvent::DpiChange { .. } => false,
+        // Per-window events only match when their child_id is target.
         IGuiEvent::Key { child_id, .. }
         | IGuiEvent::Char { child_id, .. }
         | IGuiEvent::Mouse { child_id, .. }
         | IGuiEvent::Focus { child_id, .. }
         | IGuiEvent::Resize { child_id, .. }
         | IGuiEvent::Close { child_id }
-        | IGuiEvent::DpiChange { child_id, .. }
-        | IGuiEvent::ReplSubmit { child_id }
         | IGuiEvent::Tick { child_id, .. } => *child_id == target,
+    }
+}
+
+/// Push an event back onto the stash — used by a pane-targeted
+/// consumer that received an event it can't surface (e.g. Forth
+/// got a `ThemeChange` it doesn't represent in its event-kind
+/// tagging).  The worker's main drain will pick it up next pass.
+pub fn stash_event(ev: IGuiEvent) {
+    if let Ok(mut s) = EVENT_STASH.lock() {
+        s.push_back(ev);
     }
 }
 

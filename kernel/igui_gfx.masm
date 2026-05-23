@@ -49,8 +49,17 @@ endp()
 
 ; gpane-present  ( -- )
 ;     Submit the current batch to the GUI thread.  Triggers a paint.
+;
+;     Must save/restore TOS around the call: `win64_call` ends in
+;     `call rt_gpane_present`, which clobbers RAX with the runtime
+;     function's return value (0).  RAX *is* TOS in our Forth ABI,
+;     so a naive 0-in-0-out wrapper would silently zero whatever
+;     was on top of the data stack — exactly the bug that bit the
+;     gfx-click / gfx-diag event-loop demos.
 proc(gpane_present_word)
+    mov     [DSP - cell], TOS              ; spill TOS to scratch
     win64_call(rt_gpane_present)
+    mov     TOS, [DSP - cell]              ; restore TOS
     next()
 endp()
 
@@ -146,5 +155,78 @@ proc(gpane_fill_circle_word)
     win64_call(rt_gpane_fill_circle)
     mov     TOS, [DSP + 3*cell]
     stk(4, 0)
+    next()
+endp()
+
+
+; gpane-next-event  ( id timeout-ms -- p4 p3 p2 p1 kind )
+;     Block up to `timeout-ms` for the next event whose `child_id`
+;     equals `id` (or which is a global, e.g. EV_FRAME_CLOSE).
+;     Non-matching events get stashed by the kernel mailbox and the
+;     worker picks them up on its next drain pass — so this is
+;     safe to call from inside a Forth event loop without losing
+;     infrastructure events.
+;
+;     `timeout-ms < 0` blocks indefinitely.  On timeout the result
+;     is (0 0 0 0 0) — `kind = EV_NONE = 0`, all params 0 — so
+;     the stack effect is fixed and callers always pop five cells.
+;
+;     The decoding mirrors `decode_event` in src/runtime.rs:
+;         EV_KEY    ( vkey mods down repeat )
+;         EV_CHAR   ( cp mods 0 0 )
+;         EV_MOUSE  ( x y op mods|button<<8 )
+;         EV_FOCUS  ( gained 0 0 0 )
+;         EV_RESIZE ( w h 0 0 )
+;         EV_CLOSE  ( 0 0 0 0 )
+;         EV_FRAME_CLOSE ( 0 0 0 0 )
+;         EV_TICK   ( time_ms 0 0 0 )
+;
+;     We hand 5 PAD-pointers to the runtime as out-args.  PAD is
+;     thread-local-equivalent (per session) so no cross-call
+;     interference.
+proc(gpane_next_event_word)
+    ; Stack: timeout-ms=TOS, id=[DSP].
+    mov     rcx, [DSP]                          ; arg1: id
+    mov     rdx, TOS                            ; arg2: timeout_ms
+    lea     r8,  [UP + user_PAD + 0]            ; arg3: &kind
+    lea     r9,  [UP + user_PAD + 8]            ; arg4: &p1
+    ; Args 5-7 go on the stack at [rsp+32..56].
+    mov     r12, rsp
+    and     rsp, -16
+    sub     rsp, 64                             ; 32 shadow + 32 spill (16-byte aligned)
+    lea     rax, [UP + user_PAD + 16]
+    mov     [rsp + 32], rax                     ; arg5: &p2
+    lea     rax, [UP + user_PAD + 24]
+    mov     [rsp + 40], rax                     ; arg6: &p3
+    lea     rax, [UP + user_PAD + 32]
+    mov     [rsp + 48], rax                     ; arg7: &p4
+    call    rt_gpane_next_event_for
+    mov     rsp, r12
+
+    ; rax now holds 1 if an event was returned (PAD slots filled),
+    ; 0 on timeout (slots zeroed by the runtime).  Either way the
+    ; output shape is fixed: ( id timeout -- p4 p3 p2 p1 kind ),
+    ; net +3 cells (consume 2, leave 5).
+    sub     DSP, 3*cell                         ; allocate 3 fresh cells
+
+    ; Layout after sub DSP, 3*cell — Forth stack (top to bottom):
+    ;   TOS                       (kind, set below)
+    ;   [DSP + 0]                 → p1
+    ;   [DSP + 1*cell]            → p2
+    ;   [DSP + 2*cell]            → p3
+    ;   [DSP + 3*cell]            → p4
+    ;   [DSP + 4*cell]            = previous NOS (unchanged)
+    ;
+    ; Caller asked for ( p4 p3 p2 p1 kind ): kind on TOS, then p1,
+    ; p2, p3, p4 deeper.  That matches the layout above.
+    mov     rax, [UP + user_PAD + 8]            ; p1
+    mov     [DSP + 0],     rax
+    mov     rax, [UP + user_PAD + 16]           ; p2
+    mov     [DSP + 1*cell], rax
+    mov     rax, [UP + user_PAD + 24]           ; p3
+    mov     [DSP + 2*cell], rax
+    mov     rax, [UP + user_PAD + 32]           ; p4
+    mov     [DSP + 3*cell], rax
+    mov     TOS, [UP + user_PAD + 0]            ; kind → TOS
     next()
 endp()

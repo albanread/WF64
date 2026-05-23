@@ -45,6 +45,11 @@ pub mod gc;
 #[cfg(windows)]
 pub mod igui;
 
+// NewFactor IDE support — Forth→Factor transpiler and in-process
+// Factor session.  Windows-only (same gate as igui).
+#[cfg(windows)]
+pub mod newfactor;
+
 pub const KERNEL_ENTRY: &str = "kernel/main.masm";
 
 /// (forth_name, asm_symbol, flags). Insertion order = scan order:
@@ -187,6 +192,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("gpane-stroke-rect",  "gpane_stroke_rect_word",   0),
     ("gpane-line",         "gpane_line_word",          0),
     ("gpane-fill-circle",  "gpane_fill_circle_word",   0),
+    ("gpane-next-event",   "gpane_next_event_word",    0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -1163,6 +1169,7 @@ impl Wf64Session {
                 "rt_gpane_stroke_rect"  => Some(runtime::rt_gpane_stroke_rect  as *mut c_void),
                 "rt_gpane_line"         => Some(runtime::rt_gpane_line         as *mut c_void),
                 "rt_gpane_fill_circle"  => Some(runtime::rt_gpane_fill_circle  as *mut c_void),
+                "rt_gpane_next_event_for" => Some(runtime::rt_gpane_next_event_for as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;

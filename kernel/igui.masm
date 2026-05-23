@@ -17,8 +17,15 @@
 ;     Clear the console scrollback.  Equivalent to a terminal's
 ;     "clear screen."  Cursor returns implicitly to the top-left
 ;     of the now-empty screen on the next emit.
+;
+;     Save/restore TOS around the call — `call` clobbers RAX (our
+;     TOS) with the runtime's return value.  Without this a
+;     naive 0-in-0-out wrapper silently zeros whatever was on top
+;     of the data stack.
 proc(page_word)
+    mov     [DSP - cell], TOS
     win64_call(rt_igui_page)
+    mov     TOS, [DSP - cell]
     next()
 endp()
 
@@ -48,7 +55,9 @@ endp()
 ;     catch_unwind catches the panic, drops the session, opens
 ;     the crash-dump window).  Process stays alive.
 proc(bug_rust_panic_word)
+    mov     [DSP - cell], TOS
     win64_call(rt_bug_rust_panic)
+    mov     TOS, [DSP - cell]
     next()
 endp()
 
@@ -61,6 +70,8 @@ endp()
 ;     captured register state shown in the crash dump window.
 ;     Process stays alive.  Never call from production code.
 proc(bug_seh_av_word)
+    mov     [DSP - cell], TOS
     win64_call(rt_bug_seh_av)
+    mov     TOS, [DSP - cell]
     next()
 endp()

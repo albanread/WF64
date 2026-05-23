@@ -6,7 +6,7 @@
 ; → function pointers in src/runtime.rs.
 ; ─────────────────────────────────────────────────────────────────────
 
-@extern rt_print_int(1)         ; print a cell as signed decimal + space
+@extern rt_print_int(2)         ; (n, base) — print signed cell in base + space
 @extern rt_dot_s(4)             ; print the live stack from tos/dsp/sp0/rsp
 @extern rt_emit(1)              ; write one byte to current output
 @extern rt_type(2)              ; write u bytes from addr to current output
@@ -82,3 +82,8 @@
 @extern rt_gpane_stroke_rect(6) ; (x, y, w, h, thick, rgb) -> 0
 @extern rt_gpane_line(6)        ; (x0, y0, x1, y1, thick, rgb) -> 0
 @extern rt_gpane_fill_circle(4) ; (cx, cy, r, rgb) -> 0
+
+; Event polling: matches `child_id` (or globals), writes the
+; decoded event into 5 cells of scratch storage passed as
+; pointers.  Returns 1 if an event was returned, 0 on timeout.
+@extern rt_gpane_next_event_for(7) ; (id, timeout_ms, &kind, &p1, &p2, &p3, &p4) -> 0|1

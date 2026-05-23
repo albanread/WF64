@@ -10,12 +10,19 @@
 ; ─────────────────────────────────────────────────────────────────────
 
 ; .  ( n -- )
-;     Print TOS as a signed decimal followed by a space, then drop it.
+;     Print TOS in the current BASE, followed by a space, then
+;     drop it.  Honours `decimal` / `hex` / `octal` via the BASE
+;     user-area variable.  The high-level `.` in core.f normally
+;     shadows us via pictured numeric output; this kernel-level
+;     fallback now agrees with it, so headless `wf64` and the
+;     test harness (which skip core.f) format numbers the same
+;     way as the live IDE.
 proc(dot)
-    mov     rcx, TOS              ; Win64 arg1 = value to print
-    win64_call(rt_print_int)      ; clobbers RAX
-    mov     TOS, [DSP]            ; pop: raise NOS into TOS
-    stk(1, 0)                     ; pop: raise stack pointer (add rbp, 8)
+    mov     rcx, TOS                      ; Win64 arg1 = value to print
+    mov     rdx, [UP + user_BASE]         ; Win64 arg2 = base
+    win64_call(rt_print_int)              ; clobbers RAX
+    mov     TOS, [DSP]                    ; pop: raise NOS into TOS
+    stk(1, 0)                             ; pop: raise stack pointer (add rbp, 8)
     next()
 endp()
 

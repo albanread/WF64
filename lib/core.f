@@ -958,4 +958,33 @@ tools-wordlist set-current
         1+
     repeat 2drop cr ;
 
+\ ─── Graphical-pane event kinds ──────────────────────────────────
+\ Tags returned in TOS by `gpane-next-event`.  Mirror EV_* in
+\ src/runtime.rs and the IGuiEvent variants in src/igui/channels.rs.
+\ Use with CASE for tidy event dispatch.
+0  constant ev-none           \ timeout / no event yet
+1  constant ev-key            \ ( vkey mods down repeat )
+2  constant ev-char           \ ( codepoint mods 0 0 )
+3  constant ev-mouse          \ ( x y op mods|button<<8 )
+4  constant ev-focus          \ ( gained 0 0 0 )
+5  constant ev-resize         \ ( width height 0 0 )
+6  constant ev-close          \ pane requested close — ( 0 0 0 0 )
+7  constant ev-frame-close    \ IDE frame closing — ( 0 0 0 0 )
+13 constant ev-tick           \ ( time_ms 0 0 0 )
+
+\ Mouse op codes (subfield of p3 in EV_MOUSE).  Match `mouse_op`
+\ in src/igui/channels.rs.
+0 constant mouse-move
+1 constant mouse-left-down
+2 constant mouse-left-up
+3 constant mouse-right-down
+4 constant mouse-right-up
+5 constant mouse-middle-down
+6 constant mouse-middle-up
+7 constant mouse-wheel
+
+\ Drop the four params left below an event-kind on the stack.
+\ Useful for events whose params you don't care about.
+: event-drop ( p4 p3 p2 p1 -- )  drop drop drop drop ;
+
 forth-wordlist set-current
