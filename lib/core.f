@@ -489,18 +489,21 @@ forth-wordlist set-current
 \ Implemented via ANSI escape sequences. Modern Windows terminals
 \ (Windows Terminal, conhost on Windows 10+) handle these by default.
 
-\ AT-XY ( col row -- )    Position cursor at (col, row), zero-based.
-: at-xy  ( col row -- )
-    27 emit [char] [ emit
-    1+ 0 <# #s #> type
-    [char] ; emit
-    1+ 0 <# #s #> type
-    [char] H emit ;
+\ AT-XY  ( col row -- )  is provided by the kernel as a primitive,
+\ same reasoning as PAGE above.  The old colon-def here emitted
+\ ANSI ESC[r;cH cursor-position sequences which become visible
+\ junk in wf64-ui's console; the kernel primitive instead records
+\ the requested (col, row) for the next emit (V1 — still partial;
+\ needs streaming-emit IO to fully take effect).
 
-\ PAGE ( -- )    Clear screen and home cursor.
-: page   ( -- )
-    27 emit [char] [ emit [char] 2 emit [char] J emit
-    27 emit [char] [ emit [char] H emit ;
+\ PAGE  ( -- )  is provided by the kernel as a primitive — it
+\ dispatches to the UI front-end (wf64-ui clears its console
+\ scrollback) or is a no-op when running headless.  The Lisp/CL
+\ heritage of this core library had a Forth-side fallback that
+\ emitted ANSI ESC[2J / ESC[H sequences here, but those just
+\ appear as garbage in wf64-ui's text buffer.  If you need ANSI
+\ behaviour at a real terminal, redefine PAGE-ANSI yourself —
+\ we deliberately leave the standard PAGE wired to the kernel.
 
 \ ── File-Access constants ─────────────────────────────────────────────────
 \ R/O W/O R/W BIN are the file-access-method constants used by OPEN-FILE

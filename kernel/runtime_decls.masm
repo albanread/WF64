@@ -68,3 +68,4 @@
 @extern rt_string_words_into(4) ; (UP, haystack, out_addr, max_parts) -> n tokens (or -1)
 @extern rt_igui_page(0)         ; () — clear the wf64-ui console scrollback (no-op headless)
 @extern rt_igui_at_xy(2)        ; (col, row) — record cursor pos for the next emit
+@extern rt_bug_rust_panic(0)    ; () — deliberately panic, for testing crash recovery

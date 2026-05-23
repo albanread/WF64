@@ -40,3 +40,14 @@ proc(at_xy_word)
     stk(2, 0)
     next()
 endp()
+
+
+; bug-rust-panic  ( -- )
+;     Manually-triggerable Rust panic, for verifying the wf64-ui
+;     crash-handler path.  Never returns (the worker thread's
+;     catch_unwind catches the panic, drops the session, opens
+;     the crash-dump window).  Process stays alive.
+proc(bug_rust_panic_word)
+    win64_call(rt_bug_rust_panic)
+    next()
+endp()

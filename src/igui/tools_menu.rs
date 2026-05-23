@@ -18,6 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::log_view;
 use super::fedit;
 use super::fconsole;
+use super::crash_view;
 use windows::Win32::UI::WindowsAndMessaging::MF_SEPARATOR;
 
 /// Append an `Edit` submenu to `bar`.  Routed to the active MDI
@@ -126,6 +127,18 @@ pub fn append_tools_menu(bar: HMENU) {
         eprintln!("[tools-menu] append console: {e}");
     }
 
+    let crash_item: Vec<u16> = "Crash dump\tCtrl+Shift+X\0".encode_utf16().collect();
+    if let Err(e) = unsafe {
+        AppendMenuW(
+            popup,
+            MF_STRING,
+            crash_view::MENU_CMD_ID as usize,
+            PCWSTR(crash_item.as_ptr()),
+        )
+    } {
+        eprintln!("[tools-menu] append crash: {e}");
+    }
+
     let title: Vec<u16> = "&Tools\0".encode_utf16().collect();
     if let Err(e) = unsafe {
         AppendMenuW(
@@ -213,6 +226,11 @@ pub fn build_accelerator_table() -> Option<HACCEL> {
             fVirt: FCONTROL | FSHIFT | FVIRTKEY,
             key: VK_F5.0,
             cmd: FORTH_RESTART_CMD_ID,
+        },
+        ACCEL {
+            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
+            key: b'X' as u16,
+            cmd: crash_view::MENU_CMD_ID,
         },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }

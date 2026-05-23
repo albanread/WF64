@@ -1969,7 +1969,8 @@ impl FeditState {
                 .unwrap_or_else(|| "<untitled>".to_string()),
             None => "<untitled>".to_string(),
         };
-        let title = format!("ledit — {name}{star}", star = if self.dirty { " *" } else { "" });
+        let title = format!("\u{2234} fedit — {name}{star}",
+            star = if self.dirty { " *" } else { "" });
         let mut w: Vec<u16> = title.encode_utf16().collect();
         w.push(0);
         unsafe {

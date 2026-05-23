@@ -67,19 +67,55 @@ fn auto_open_console() {
     };
 }
 
-/// Boot a `Wf64Session`, load core.f, then loop draining events.
-/// Restart by dropping the session and bringing a fresh one up
-/// when `IGuiEvent::ForthRestart` arrives — invoked from the
-/// Forth → Restart menu (Ctrl+Shift+F5).
+/// Top-level worker loop with crash recovery.  Each iteration
+/// runs the actual session-drain loop inside `catch_unwind`; on
+/// any panic we capture the message, push to the crash-dump
+/// view (which auto-opens), drop the panicked session, and boot
+/// a fresh one.  The process keeps running.
+///
+/// Doesn't catch SEH exceptions yet (Windows access-violations
+/// from JIT'd code) — those still take down the worker thread.
+/// Phase 3b plans a VEH-based recovery that redirects RIP to a
+/// thread-exit thunk so the process survives even those.
 #[cfg(windows)]
 fn run_forth_worker() {
-    use wf64::igui::channels::{self, IGuiEvent};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use wf64::igui::fconsole;
 
-    let mut session = match boot_session(true /* fresh banner */) {
-        Some(s) => s,
-        None => return,
-    };
+    loop {
+        let session = match boot_session(true) {
+            Some(s) => s,
+            None => {
+                eprintln!("[wf64-ui] session boot failed; worker exiting");
+                return;
+            }
+        };
+        // catch_unwind takes ownership of session — on panic it
+        // gets dropped here, freeing the Wf64Session's heap/kernel
+        // arena.  On clean exit (Ok(())) we return from the worker.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_drain_loop(session)
+        }));
+        match result {
+            Ok(()) => return,
+            Err(payload) => {
+                report_panic(payload);
+                fconsole::reset_for_restart();
+                fconsole::append("∴ session crashed — rebooting Forth.");
+                fconsole::append("");
+                // loop continues; boot_session brings up a new one
+            }
+        }
+    }
+}
+
+/// The original drain loop — extracted so `run_forth_worker` can
+/// wrap it in `catch_unwind`.  Takes the session by value so it
+/// gets dropped on panic-unwind.
+#[cfg(windows)]
+fn run_drain_loop(mut session: wf64::Wf64Session) {
+    use wf64::igui::channels::{self, IGuiEvent};
+    use wf64::igui::fconsole;
 
     loop {
         let twait = std::time::Instant::now();
@@ -99,6 +135,15 @@ fn run_forth_worker() {
                     format_args!("eval ({} bytes) took {}us",
                         source.len(), teval.elapsed().as_micros()),
                 );
+                // Deferred-panic check: `bug-rust-panic` from
+                // Forth set this flag during the eval; panic NOW,
+                // in pure-Rust context, so unwinding is sound
+                // (panic from inside extern "C" → JIT'd asm is UB).
+                if wf64::runtime::BUG_PANIC_PENDING.swap(
+                    false, std::sync::atomic::Ordering::SeqCst,
+                ) {
+                    panic!("bug-rust-panic triggered from Forth — testing crash recovery");
+                }
             }
             IGuiEvent::ForthRestart => {
                 fconsole::reset_for_restart();
@@ -112,11 +157,49 @@ fn run_forth_worker() {
             }
             IGuiEvent::FrameClose => {
                 fconsole::append("∴ frame closing");
-                break;
+                return;
             }
             _ => {}
         }
     }
+}
+
+/// Format a panic payload into a multi-line dump and push it
+/// to the crash view.  Captures: panic message, thread name,
+/// captured backtrace if RUST_BACKTRACE=1 (else a hint).
+#[cfg(windows)]
+fn report_panic(payload: Box<dyn std::any::Any + Send>) {
+    use wf64::igui::crash_view;
+    let msg: String = if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<panic payload not a string>".to_string()
+    };
+    let thread = std::thread::current()
+        .name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}.{:03}", d.as_secs(), d.subsec_millis()))
+        .unwrap_or_else(|_| "<no time>".into());
+
+    let mut dump = String::new();
+    dump.push_str(&format!("when:    {ts}\n"));
+    dump.push_str(&format!("thread:  {thread}\n"));
+    dump.push_str(&format!("kind:    Rust panic\n"));
+    dump.push_str(&format!("message: {msg}\n"));
+    dump.push_str("\n");
+    dump.push_str("Session has been dropped and a fresh one booted below.\n");
+    dump.push_str("Any user definitions from before the crash are gone.\n");
+    dump.push_str("\n");
+    dump.push_str("(SEH exceptions — access-violations from JIT'd Forth code —\n");
+    dump.push_str("are NOT yet recovered: those still take the worker thread\n");
+    dump.push_str("down.  Phase 3b will add a VEH-based recovery path.)\n");
+
+    crash_view::push(dump);
 }
 
 /// Create a session, load core.f, emit the startup banner.  Used

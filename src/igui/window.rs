@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePatternBrush,
     CreateSolidBrush, DeleteDC, DeleteObject, FillRect as GdiFillRect, GetDC, ReleaseDC,
@@ -83,6 +84,10 @@ const WM_IGUI_TEXT_FLUSH: u32 = WM_USER + 8;
 /// rationale as WM_IGUI_TEXT_FLUSH: keep all state mutation on
 /// the GUI thread so the worker side never holds a lock long.
 pub(crate) const WM_IGUI_FCONSOLE_FLUSH: u32 = WM_USER + 9;
+/// Worker thread caught a Rust panic (or SEH dump arrived from
+/// a future VEH path); flush the captured dumps into the crash
+/// view, opening it if it isn't already.  wparam/lparam unused.
+pub(crate) const WM_IGUI_CRASH_FLUSH: u32 = WM_USER + 10;
 /// Sent from the language thread to a render-host HWND to install
 /// or clear a Win32 timer driving `EvTick` events.
 /// `wparam` carries the interval in ms (0 = clear), `lparam` is unused.
@@ -98,34 +103,37 @@ static GUI_THREAD_ID: OnceLock<u32> = OnceLock::new();
 /// Original WNDPROC of the MDICLIENT, saved before we replace it so
 /// our subclass can forward unhandled messages correctly.
 static MDICLIENT_ORIG_PROC: OnceLock<isize> = OnceLock::new();
-/// λ brush handle (raw isize) kept alive for the process lifetime.
-static LAMBDA_BRUSH_RAW: OnceLock<isize> = OnceLock::new();
+/// ∴ logo brush handle (raw isize) kept alive for the process lifetime.
+/// Was LAMBDA_BRUSH_RAW (lisp wallpaper) before the Forth port.
+static LOGO_BRUSH_RAW: OnceLock<isize> = OnceLock::new();
 
-// ── Lambda background brush ────────────────────────────────────────────────
+// ── ∴ logo wallpaper brush ─────────────────────────────────────────────────
 
 /// Color helpers: COLORREF = R | (G<<8) | (B<<16).
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
-/// Build an 80×80 GDI pattern brush: dark-slate navy background with a
-/// barely-lighter italic λ (U+03BB) tiled at two diagonal offsets per
-/// cell.  The half-brick offset creates a continuous diagonal lattice.
+/// Build an 80×80 GDI pattern brush: deep navy-slate background with a
+/// barely-lighter ∴ (U+2234) tiled at two diagonal offsets per cell.
+/// The half-brick offset creates a continuous diagonal lattice.
+///
+/// ∴ ("therefore") replaces the λ that the original NewCormanLisp UI
+/// used — same role, Forth-flavoured glyph.  Three dots arranged like
+/// a stack diagram, mathematical inference glyph; the right symbol for
+/// a postfix-RPN language.
 ///
 /// Called once on the GUI thread immediately after MDICLIENT is created.
 /// The returned HBRUSH lives for the process lifetime.
-unsafe fn make_lambda_brush() -> HBRUSH {
+unsafe fn make_logo_brush() -> HBRUSH {
     const TILE: i32 = 80;
 
     // Background: deep navy-slate  #1C2834
     const BG: COLORREF = rgb(28, 40, 52);
-    // Lambda glyph: ~55 units brighter per channel — subtle but legible
+    // Logo glyph: ~55 units brighter per channel — subtle but legible
     const FG: COLORREF = rgb(58, 80, 104);
 
-    // All GDI calls are unsafe; group them in one block so Rust 2024's
-    // "unsafe in unsafe fn" lint is satisfied without scattering blocks.
     unsafe {
-        // Build bitmap on a screen-compatible DC.
         let screen_dc = GetDC(None);
         let mem_dc = CreateCompatibleDC(Some(screen_dc));
         let bmp: HBITMAP = CreateCompatibleBitmap(screen_dc, TILE, TILE);
@@ -137,37 +145,40 @@ unsafe fn make_lambda_brush() -> HBRUSH {
         GdiFillRect(mem_dc, &tile_rect, bg_brush);
         DeleteObject(HGDIOBJ(bg_brush.0));
 
-        // Draw λ with a thin italic Segoe UI — the slant echoes the
-        // traditional hand-written Greek letter and looks elegant at small
-        // sizes.  Two stamps per tile at (8,6) and (48,46) produce a
-        // half-brick diagonal repeat when the brush is tiled.
+        // ∴ has less ink than λ at the same point size — the three
+        // dots occupy a tiny fraction of the glyph cell.  Pump the
+        // height up so the pattern reads as a wallpaper, not as
+        // accidental specks.  Bold weight also helps the dots show.
+        // Italic doesn't change anything visually on dot glyphs;
+        // dropped.
         SetBkMode(mem_dc, BACKGROUND_MODE(TRANSPARENT.0));
         SetTextColor(mem_dc, FG);
 
         let font: HFONT = CreateFontW(
-            28, 0,                        // height (cell height), width (auto)
-            0, 0,                         // escapement, orientation
-            100,                          // weight: FW_THIN
-            1, 0, 0,                      // italic, no underline, no strikeout
+            44, 0,                        // height ↑ from 28 — dots need air
+            0, 0,
+            700,                          // FW_BOLD (was FW_THIN)
+            0, 0, 0,                      // italic off
             FONT_CHARSET(1),              // DEFAULT_CHARSET
-            FONT_OUTPUT_PRECISION(0),     // OUT_DEFAULT_PRECIS
-            FONT_CLIP_PRECISION(0),       // CLIP_DEFAULT_PRECIS
+            FONT_OUTPUT_PRECISION(0),
+            FONT_CLIP_PRECISION(0),
             FONT_QUALITY(5),              // CLEARTYPE_QUALITY
-            32u32,                        // FF_SWISS (sans-serif)
+            32u32,                        // FF_SWISS
             w!("Segoe UI"),
         );
         let old_font: HGDIOBJ = SelectObject(mem_dc, HGDIOBJ(font.0));
 
-        // U+03BB λ — one UTF-16 codepoint (BMP, no surrogate needed).
-        let lambda: &[u16] = &[0x03BB_u16];
-        let _ = TextOutW(mem_dc,  8,  6, lambda); // top-left stamp
-        let _ = TextOutW(mem_dc, 48, 46, lambda); // bottom-right stamp (half-brick)
+        // U+2234 ∴ — one UTF-16 codepoint (BMP).
+        let glyph: &[u16] = &[0x2234_u16];
+        // Stamps centred-ish in each half of the tile.  Tweaked to
+        // give a pleasing diagonal repeat for the wider/taller font.
+        let _ = TextOutW(mem_dc,  6,  4, glyph); // top-left
+        let _ = TextOutW(mem_dc, 46, 36, glyph); // bottom-right (half-brick)
 
         SelectObject(mem_dc, old_font);
         DeleteObject(HGDIOBJ(font.0));
         SelectObject(mem_dc, old_bmp);
 
-        // Pattern brush tiles the bitmap seamlessly.
         let brush: HBRUSH = CreatePatternBrush(bmp);
 
         DeleteObject(HGDIOBJ(bmp.0));
@@ -175,6 +186,135 @@ unsafe fn make_lambda_brush() -> HBRUSH {
         let _ = ReleaseDC(None, screen_dc);
 
         brush
+    }
+}
+
+/// Build a 32×32 HICON with the ∴ logo on a deep navy disk.  Used
+/// as the frame's window icon (title-bar, Alt+Tab, taskbar).  No
+/// .ico asset; generated procedurally from GDI primitives so the
+/// build stays self-contained.
+unsafe fn make_app_icon() -> HICON {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+        CreateDIBSection,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
+
+    const SIZE: i32 = 32;
+    const BG: COLORREF = rgb(20, 28, 40);    // even darker than wallpaper
+    const FG: COLORREF = rgb(255, 184, 96);  // warm amber, readable at 16×16
+
+    unsafe {
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+
+        // 32-bit DIB so the icon supports the alpha channel for
+        // smooth edges and modern shell rendering.
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: SIZE,
+                biHeight: SIZE,  // positive = bottom-up
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let color_bmp: HBITMAP = CreateDIBSection(
+            Some(mem_dc),
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits_ptr,
+            None,
+            0,
+        ).unwrap_or_default();
+        if color_bmp.is_invalid() {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return HICON::default();
+        }
+        let old_color = SelectObject(mem_dc, HGDIOBJ(color_bmp.0));
+
+        // Pre-fill all pixels with opaque BG (alpha=0xFF + BG rgb).
+        // bits_ptr is BGRA, bottom-up.
+        let _ = bmi;
+        let pixels = bits_ptr as *mut u32;
+        let bg_argb = 0xFF000000
+            | (BG.0 & 0xFF) << 16          // R → high byte (BGRA → ARGB)
+            | (BG.0 & 0xFF00)              // G stays
+            | (BG.0 & 0xFF0000) >> 16;     // B
+        let total_pixels = (SIZE * SIZE) as isize;
+        for i in 0..total_pixels {
+            *pixels.offset(i) = bg_argb;
+        }
+
+        // Now blit the ∴ glyph on top.  GDI text writes 24-bit RGB
+        // and clobbers our pre-set alpha to 0 — but the icon mask
+        // (below) will treat alpha=0 as transparent, so we re-set
+        // alpha to 0xFF on every text pixel afterwards (cheaper to
+        // re-fill all 32×32 pixels' alpha at the end).
+        SetBkMode(mem_dc, BACKGROUND_MODE(TRANSPARENT.0));
+        SetTextColor(mem_dc, FG);
+        let font: HFONT = CreateFontW(
+            28, 0,
+            0, 0,
+            900,                          // FW_BLACK — heaviest available
+            0, 0, 0,
+            FONT_CHARSET(1),
+            FONT_OUTPUT_PRECISION(0),
+            FONT_CLIP_PRECISION(0),
+            FONT_QUALITY(5),
+            32u32,
+            w!("Segoe UI"),
+        );
+        let old_font = SelectObject(mem_dc, HGDIOBJ(font.0));
+        let glyph: &[u16] = &[0x2234_u16];
+        let _ = TextOutW(mem_dc, 4, 0, glyph);
+        SelectObject(mem_dc, old_font);
+        DeleteObject(HGDIOBJ(font.0));
+
+        // Re-set alpha = 0xFF on every pixel so the icon is fully
+        // opaque (we don't want a Windows-default transparency
+        // path; the disk is solid and the glyph reads on it).
+        for i in 0..total_pixels {
+            let p = pixels.offset(i);
+            *p |= 0xFF000000;
+        }
+
+        SelectObject(mem_dc, old_color);
+
+        // Build the AND mask: all-zero = fully opaque per pixel.
+        // 32×32 / 8 = 128 bytes.  Required by ICONINFO even for
+        // 32-bit colour icons.
+        let mask_bmp: HBITMAP = CreateCompatibleBitmap(screen_dc, SIZE, SIZE);
+        // (Default-initialised CompatibleBitmap content is undefined;
+        // explicitly zero it via FillRect with a black brush so AND
+        // mask is all-zero = opaque.)
+        let old_mask = SelectObject(mem_dc, HGDIOBJ(mask_bmp.0));
+        let black: HBRUSH = CreateSolidBrush(rgb(0, 0, 0));
+        let r = RECT { left: 0, top: 0, right: SIZE, bottom: SIZE };
+        GdiFillRect(mem_dc, &r, black);
+        DeleteObject(HGDIOBJ(black.0));
+        SelectObject(mem_dc, old_mask);
+
+        let icon_info = ICONINFO {
+            fIcon: true.into(),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask_bmp,
+            hbmColor: color_bmp,
+        };
+        let icon = CreateIconIndirect(&icon_info).unwrap_or_default();
+
+        DeleteObject(HGDIOBJ(mask_bmp.0));
+        DeleteObject(HGDIOBJ(color_bmp.0));
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        icon
     }
 }
 
@@ -188,7 +328,7 @@ unsafe extern "system" fn mdi_bg_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_ERASEBKGND {
-        if let Some(&raw) = LAMBDA_BRUSH_RAW.get() {
+        if let Some(&raw) = LOGO_BRUSH_RAW.get() {
             let hdc = HDC(wparam.0 as *mut _);
             let brush = HBRUSH(raw as *mut _);
             let mut rect = RECT::default();
@@ -213,7 +353,7 @@ unsafe extern "system" fn mdi_bg_proc(
     }
 }
 
-fn mdi_client_hwnd() -> Option<HWND> {
+pub(crate) fn mdi_client_hwnd() -> Option<HWND> {
     let raw = MDI_CLIENT.lock().ok()?;
     raw.map(|r| HWND(r as *mut _))
 }
@@ -241,6 +381,12 @@ where
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }
         .map_err(|e| IGuiError::Win32(format!("LoadCursorW failed: {e}")))?;
 
+    // Window icon — procedurally generated ∴ on a navy disk.  Used
+    // for the title bar, taskbar, Alt+Tab.  Survives the process
+    // lifetime; HICON is process-managed so no explicit cleanup
+    // needed.
+    let app_icon = unsafe { make_app_icon() };
+
     // Frame class.
     let frame_class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -249,12 +395,12 @@ where
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: h_instance,
-        hIcon: Default::default(),
+        hIcon: app_icon,
         hCursor: cursor,
         hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(ptr::null_mut()),
         lpszMenuName: PCWSTR::null(),
         lpszClassName: FRAME_CLASS,
-        hIconSm: Default::default(),
+        hIconSm: app_icon,  // 16×16 — Windows downsamples our 32×32
     };
     if unsafe { RegisterClassExW(&frame_class) } == 0 {
         return Err(IGuiError::Win32("RegisterClassExW (frame) returned 0".into()));
@@ -315,11 +461,11 @@ where
         *slot = Some(mdi.0 as isize);
     }
 
-    // Install the λ-tiled background.  The brush lives for the process
+    // Install the ∴-tiled background.  The brush lives for the process
     // lifetime; no explicit cleanup needed since we exit shortly after
     // the frame is destroyed.
-    let lambda_brush = unsafe { make_lambda_brush() };
-    let _ = LAMBDA_BRUSH_RAW.set(lambda_brush.0 as isize);
+    let logo_brush = unsafe { make_logo_brush() };
+    let _ = LOGO_BRUSH_RAW.set(logo_brush.0 as isize);
     unsafe {
         // Save the original MDICLIENT WndProc then replace it with ours.
         let orig = GetWindowLongPtrW(mdi, GWLP_WNDPROC);
@@ -423,6 +569,10 @@ unsafe extern "system" fn frame_wnd_proc(
             super::fconsole::flush_on_gui_thread();
             LRESULT(0)
         }
+        WM_IGUI_CRASH_FLUSH => {
+            super::crash_view::flush_on_gui_thread(hwnd);
+            LRESULT(0)
+        }
         WM_IGUI_CLOSE_CHILD => {
             let req_ptr = lparam.0 as *mut CloseChildRequest;
             if !req_ptr.is_null() {
@@ -491,6 +641,12 @@ unsafe extern "system" fn frame_wnd_proc(
             if cmd_id == super::fconsole::MENU_CMD_ID {
                 if mdi.0 as isize != 0 {
                     super::fconsole::open(hwnd, mdi);
+                }
+                return LRESULT(0);
+            }
+            if cmd_id == super::crash_view::MENU_CMD_ID {
+                if mdi.0 as isize != 0 {
+                    super::crash_view::open(hwnd, mdi);
                 }
                 return LRESULT(0);
             }
@@ -967,6 +1123,25 @@ pub(crate) fn post_fconsole_flush() {
         )
     };
 }
+
+/// Worker thread (or any non-GUI thread) calls this after pushing
+/// a new crash dump into `crash_view::DUMPS`, to ask the UI thread
+/// to open / refresh the crash view.
+pub(crate) fn post_crash_flush() {
+    let Some(frame_raw) = FRAME_HWND.get() else {
+        return;
+    };
+    let frame = HWND(*frame_raw as *mut _);
+    let _ = unsafe {
+        PostMessageW(
+            Some(frame),
+            WM_IGUI_CRASH_FLUSH,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    };
+}
+
 
 /// Marshal an MDI verb to the GUI thread for execution.
 pub fn dispatch_mdi_verb(verb: super::menu::MdiVerb) {

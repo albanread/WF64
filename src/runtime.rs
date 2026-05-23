@@ -1648,6 +1648,24 @@ pub extern "C" fn rt_igui_page() -> u64 {
     0
 }
 
+/// Atomic flag set by `rt_bug_rust_panic`; consumed by the
+/// wf64-ui worker loop after each eval.  The deferred-panic
+/// pattern avoids unwinding across the extern "C" boundary
+/// back into JIT'd asm (which is undefined behaviour).
+pub static BUG_PANIC_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the "panic on return from eval" flag.  Used by the Forth
+/// word `bug-rust-panic` to manually exercise the wf64-ui crash
+/// handler — the actual panic happens in pure-Rust context
+/// (run_drain_loop after the JIT returns), where unwinding is
+/// well-defined.  Never panics from inside the extern "C" body.
+#[no_mangle]
+pub extern "C" fn rt_bug_rust_panic() -> u64 {
+    BUG_PANIC_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    0
+}
+
 /// Record a cursor position for the next emit.  V1 limitation
 /// (see the at-xy doc in `kernel/igui.masm`): not yet routed
 /// through emit's write path.  Lands in `IGUI_PENDING_AT_XY` so

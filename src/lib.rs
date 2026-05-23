@@ -174,6 +174,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     // Both are no-ops when running headless.  See kernel/igui.masm.
     ("page",               "page_word",                0),
     ("at-xy",              "at_xy_word",               0),
+    ("bug-rust-panic",     "bug_rust_panic_word",      0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -1052,6 +1053,7 @@ impl Wf64Session {
                 "rt_string_words_into"  => Some(runtime::rt_string_words_into  as *mut c_void),
                 "rt_igui_page"          => Some(runtime::rt_igui_page          as *mut c_void),
                 "rt_igui_at_xy"         => Some(runtime::rt_igui_at_xy         as *mut c_void),
+                "rt_bug_rust_panic"     => Some(runtime::rt_bug_rust_panic     as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;
