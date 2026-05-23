@@ -442,11 +442,22 @@ variable ls-idx
 variable ls-addr
 variable ls-len
 
-\ Record a single local in the table.
+\ Record a single local in the table.  Each slot is 32 bytes:
+\   +0       length (1 byte, capped at 15)
+\   +1..+15  name bytes (15 bytes, zero-padded — we erase first
+\            so a longer local from a previous definition can't
+\            leave stale bytes that a future stricter compare
+\            would mistakenly match)
+\   +16..+23 byte-offset within the locals frame (8 bytes)
 : locals-set  ( idx c-addr u -- )
     ls-len !  ls-addr !  ls-idx !
     ls-len @ 15 > if 15 ls-len ! then
     ls-idx @ locals-slot                       ( slot )
+    \ Zero the name area (1 byte length + 15 bytes name) before
+    \ writing — see header comment.  Without this a longer local
+    \ from a previous definition leaves stale bytes that a future
+    \ stricter compare could mistakenly match.
+    dup 16 erase
     ls-len @ over c!                            \ length byte
     1+  ls-addr @ swap  ls-len @ cmove          \ name bytes
     ls-idx @ cells  ls-idx @ locals-slot 16 + ! ;  \ byte-offset
@@ -466,6 +477,14 @@ forth-wordlist set-current
                 2drop true
             else
                 ( cell-offset c-addr u )
+                \ Overflow guard: the table has 16 slots (idx
+                \ 0..15) before it runs into user_TOOLS_WID at
+                \ +0x200.  Stop at the 17th name and throw -29
+                \ (compiler nesting) rather than silently
+                \ corrupting the TOOLS wordlist.
+                2 pick 15 > if
+                    2drop  -29 throw
+                then
                 2 pick -rot                  ( offset offset c-addr u )
                 locals-set                   ( offset )
                 1+ false

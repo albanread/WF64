@@ -91,6 +91,20 @@ proc(throw_mismatch_const)
     next()
 endp()
 
+; -29 = compiler nesting (ANS Forth section 9.3.5).  Used when a
+; defining word like `:` runs while STATE is already 1 — typical
+; cause is a forgotten `;` or `]` in a definition.  Surfacing this
+; cleanly is far better than letting compilation continue in an
+; undefined state (which previously presented as multi-token `?`
+; floods downstream of the broken def — see the gfx-click
+; locals-bug investigation).
+proc(throw_compnest_const)
+    mov     [DSP - cell], TOS
+    mov     TOS, -29
+    stk(0, 1)
+    next()
+endp()
+
 ; catch  ( i*x xt -- j*x 0 | i*x n )
 ;     Execute xt with a throw handler frame installed on the native
 ;     return stack. Normal return appends 0; THROW unwinds directly to

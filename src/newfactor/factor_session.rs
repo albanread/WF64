@@ -1,4 +1,39 @@
-//! In-process Factor VM session.
+//! Headless Factor VM session — runs `factor.com` as a child process.
+//!
+//! ## Why a subprocess, not in-process embedding?
+//!
+//! Earlier iterations of this module loaded `factor.dll` into our address
+//! space and called `start_standalone_factor_in_new_thread`.  That approach
+//! ran into three independent showstoppers:
+//!
+//!   1. `factor_vm::init_ffi()` calls `GetModuleHandle(NULL)`, which returns
+//!      the **host EXE's** HMODULE rather than `factor.dll`'s.  Every later
+//!      `GetProcAddress(NULL_dll, "primitive_xyz")` returns NULL → first
+//!      primitive call dereferences a NULL function pointer.
+//!
+//!   2. Factor's C++ runtime captures CRT `stdin`/`stdout` FILE* pointers
+//!      directly.  In a GUI-subsystem process those FILE*s have
+//!      `_fileno == -2` (NO_ASSOCIATED_STREAM), so Factor falls back to
+//!      `fopen("nul", …)` regardless of any `_dup2` we do.
+//!
+//!   3. Even past those, the stock `factor.image` launches `ui.tools`
+//!      (Factor's full IDE) when no `-run=` is supplied — exactly the
+//!      "Factor IDE next to our window" surprise we want to avoid.
+//!
+//! All three are someone else's choice, baked deep into a binary we don't
+//! build.  Fighting them in-process is expensive AND fragile.  Running
+//! `factor.com` as a child process side-steps every one of them:
+//!
+//!   * The child gets its own CRT, its own stdio FILE* objects connected
+//!     to our pipes by the OS — no `VALID_HANDLE` fallback, no _dup2 dance.
+//!   * `factor.com` is the **console-subsystem** Factor binary; with
+//!     `CREATE_NO_WINDOW` it spawns no visible window.
+//!   * Crashes in the Factor VM kill the child only; the IDE survives and
+//!     can respawn a fresh session.
+//!
+//! `factor.com` (~780 KB) plus `factor.dll` (~660 KB) plus the image
+//! (currently 128 MB — a follow-up task is building a slimmer image
+//! without UI/OpenGL/fonts) is our "headless Factor VM."
 //!
 //! ## Architecture
 //!
@@ -6,67 +41,49 @@
 //! Worker thread (owns FactorSession)
 //! │   transpiler: Forth → Factor source
 //! │
-//! │  stdin_write ──────────► Factor listener thread
-//! │                               (start_standalone_factor_in_new_thread)
-//! │  stdout_read ◄──────────       writes output to our pipe
+//! │   stdin_writer  ──────────►  factor.com (child process)
+//! │                                  │ -run=listener
+//! │   stdout_reader ◄──────────      │ stdin/stdout/stderr piped
 //! ```
-//!
-//! Factor runs in a **dedicated OS thread within our process** — no
-//! subprocess is spawned.  The Factor thread is started by calling
-//! `start_standalone_factor_in_new_thread` from `factor.dll` (a plain
-//! C export, accessed via `libloading`).
-//!
-//! ## I/O Redirection
-//!
-//! Before starting the Factor thread we redirect CRT file descriptors
-//! 0 (stdin) and 1 (stdout) to a pair of anonymous Windows pipes.
-//! Factor's `init_factor` captures the CRT `stdin`/`stdout` FILE*
-//! objects via its `VALID_HANDLE` macro, which uses fd 0/1 — so Factor
-//! automatically reads from our write-end and writes to our read-end.
-//!
-//! Because `newfactor-ui` is a GUI application the process has no
-//! console; CRT stdin/stdout are unattached (`/dev/nul`).  Redirecting
-//! them to our pipes is safe and does not break any other I/O.
 //!
 //! ## Listener Suppression
 //!
 //! Factor's `listener-step` normally prints the data-stack and a vocab
-//! prompt (`IN: scratchpad`) at the START of every step (before reading).
-//! During bootstrap we suppress both:
+//! prompt (`IN: scratchpad`) at the START of every step.  During bootstrap
+//! we suppress both:
 //!
 //! ```factor
 //! display-stacks? off           ! stop printing the data-stack between steps
-//! M: object prompt. 2drop ;    ! redefine prompt method to do nothing
+//! M: object prompt. 2drop ;     ! redefine prompt method to do nothing
 //! ```
 //!
-//! After that the pipe contains only output explicitly produced by user code.
+//! After that the stdout pipe contains only output explicitly produced by
+//! user code (plus our sentinel lines, which we strip).
 //!
 //! ## Eval Protocol
 //!
-//! For each evaluation we send TWO lines:
+//! For each evaluation we send TWO listener-steps:
 //!
 //! ```factor
 //! <transpiled-factor-code>
 //! "%%NF-DONE%%\n" write flush
 //! ```
 //!
-//! Line 1 is the user expression.  If it throws, Factor's `call-error-hook`
+//! Line 1 is the user's expression.  If it throws, Factor's `call-error-hook`
 //! prints a formatted error and `recover` keeps the listener alive.  Either
-//! way, Factor then reads Line 2, writes our sentinel to stdout, and the
-//! `read_until_sentinel` call returns with everything up to (not including)
-//! the sentinel line.
+//! way, Factor reads Line 2 next and writes our sentinel — so the read side
+//! always synchronizes.
 //!
 //! ## Stack Query
 //!
-//! After eval, we query the data stack:
 //! ```factor
 //! get-datastack [ dup integer? [ . ] [ drop ] if ] each
 //! "%%NF-STACK%%\n" write flush
 //! ```
-//! Stack items are printed one per line (integers only).
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -75,282 +92,132 @@ use crate::newfactor::transpiler::Transpiler;
 
 // ── Configuration ─────────────────────────────────────────────────────────
 
-/// Root of the NewFactor repository — vocabularies, image, and DLL all live here.
-pub const NEWFACTOR_ROOT: &str = "E:\\NewFactor";
+/// Headless console-subsystem Factor launcher.  Same VM as `factor.exe`;
+/// links subsystem 3 (Windows console) instead of 2 (Windows GUI), so with
+/// `CREATE_NO_WINDOW` it spawns no visible window.
+pub const FACTOR_COM: &str = "E:\\factor\\factor.com";
 
-/// Path to the Factor DLL (copied into the NewFactor repo).
-pub const FACTOR_DLL: &str = "E:\\NewFactor\\factor.dll";
-/// Path to the Factor boot image (copied into the NewFactor repo).
+/// Path to the Factor image.
 pub const FACTOR_IMAGE: &str = "E:\\NewFactor\\factor.image";
+
+/// Root of the NewFactor repo (vocab root for `forth.all`).
+pub const NEWFACTOR_ROOT: &str = "E:\\NewFactor";
 
 /// Sentinel written by Factor after each eval (or error recovery).
 const SENTINEL_DONE:  &str = "%%NF-DONE%%";
-/// Sentinel used to probe for Factor readiness.
+/// Sentinel for the startup readiness probe.
 const SENTINEL_READY: &str = "%%NF-READY%%";
-/// Sentinel that ends a stack dump.
+/// Sentinel ending a stack dump.
 const SENTINEL_STACK: &str = "%%NF-STACK%%";
 
-/// Time to wait for Factor's image to load before probing.
-const STARTUP_WAIT_MS: u64 = 4_000;
 /// Maximum time to wait for any sentinel response.
-const SENTINEL_TIMEOUT: Duration = Duration::from_secs(30);
+const SENTINEL_TIMEOUT: Duration = Duration::from_secs(60);
 
-// ── Win32 / CRT raw FFI ───────────────────────────────────────────────────
-//
-// We use raw extern declarations so we don't pull in extra windows-crate
-// features.  All of these are always present on Windows (kernel32.dll /
-// ucrtbase.dll).
+// ── FactorSession ─────────────────────────────────────────────────────────
 
-type HANDLE = *mut std::ffi::c_void;
-const NULL: HANDLE = std::ptr::null_mut();
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn CreatePipe(
-        hReadPipe: *mut HANDLE,
-        hWritePipe: *mut HANDLE,
-        lpPipeAttributes: *const std::ffi::c_void, // SECURITY_ATTRIBUTES*, may be null
-        nSize: u32,
-    ) -> i32; // BOOL: 0 = failure
-
-    /// Add a directory to the beginning of the DLL search path.
-    /// Called before loading factor.dll so that its sibling DLLs
-    /// (libssl, libcrypto, sqlite3) are found automatically.
-    fn SetDllDirectoryW(lpPathName: *const u16) -> i32;
-}
-
-extern "C" {
-    /// Associate a Win32 HANDLE with a new CRT file descriptor.
-    /// The CRT takes ownership of the handle; do NOT close it separately.
-    /// Returns the new fd (≥ 0) on success, -1 on error.
-    fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
-
-    /// Duplicate CRT fd `fd1` onto fd slot `fd2` (POSIX dup2).
-    /// Returns 0 on success, -1 on error.
-    fn _dup2(fd1: i32, fd2: i32) -> i32;
-
-    /// Close a CRT file descriptor and its underlying HANDLE.
-    fn _close(fd: i32) -> i32;
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────
-
-/// Create an anonymous Windows pipe, returning `(read_end, write_end)`.
-fn create_pipe(buf_size: u32) -> Result<(HANDLE, HANDLE)> {
-    let mut r: HANDLE = NULL;
-    let mut w: HANDLE = NULL;
-    let ok = unsafe { CreatePipe(&mut r, &mut w, NULL, buf_size) };
-    anyhow::ensure!(ok != 0, "CreatePipe failed");
-    Ok((r, w))
-}
-
-/// Convert a Win32 HANDLE to a Rust `File` by wrapping it.
-///
-/// # Safety
-/// `handle` must be a valid, open handle that this `File` will own.
-unsafe fn handle_to_file(handle: HANDLE) -> std::fs::File {
-    use std::os::windows::io::FromRawHandle;
-    std::fs::File::from_raw_handle(handle)
-}
-
-// ── FactorSession ──────────────────────────────────────────────────────────
-
-/// An in-process Factor VM session.
-///
-/// Owns the write end of Factor's stdin pipe and the read end of
-/// Factor's stdout pipe.  All eval calls are synchronous: we write
-/// Factor code to the pipe and block until we see the sentinel line.
+/// A headless Factor VM session backed by a `factor.com` child process.
 pub struct FactorSession {
     transpiler: Transpiler,
-    /// BufWriter around the write end of Factor's stdin pipe.
-    stdin_writer: io::BufWriter<std::fs::File>,
-    /// BufReader around the read end of Factor's stdout pipe.
-    stdout_reader: io::BufReader<std::fs::File>,
+    /// `factor.com` child process.  Killed in `Drop`.
+    child: Child,
+    /// BufWriter around the child's stdin.  `Option` so `Drop` can `.take()`
+    /// it and half-close stdin before waiting/killing the child.
+    stdin_writer: Option<io::BufWriter<ChildStdin>>,
+    /// BufReader around the child's stdout.
+    stdout_reader: io::BufReader<ChildStdout>,
     /// Last known data stack (integers only).
     data_stack: Vec<i64>,
 }
 
-// SAFETY: FactorSession holds std::fs::File objects (Send) and a
-// Transpiler (plain Rust, Send).  The Factor thread owns its own TLS
-// and VM state; we communicate only through the pipes.
-unsafe impl Send for FactorSession {}
-
 impl FactorSession {
-    // ── Construction ───────────────────────────────────────────────────
+    // ── Construction ──────────────────────────────────────────────────
 
-    /// Create a new Factor session.
-    ///
-    /// 1. Creates anonymous pipe pairs for stdin and stdout.
-    /// 2. Redirects CRT fd 0/1 to the pipes so Factor sees them.
-    /// 3. Starts `factor.dll`'s listener thread.
-    /// 4. Waits for Factor to be ready, then loads `forth.all`.
+    /// Spawn `factor.com`, wait for the listener to be ready, then bootstrap
+    /// `forth.all` and silence listener noise.
     pub fn new() -> Result<Self> {
-        eprintln!("[NF] FactorSession::new — creating pipes");
-        // stdin pipe: Factor reads from stdin_r; we write to stdin_w.
-        let (stdin_r, stdin_w) = create_pipe(65_536)
-            .context("CreatePipe (Factor stdin)")?;
+        eprintln!("[NF] spawning {FACTOR_COM}");
 
-        // stdout pipe: we read from stdout_r; Factor writes to stdout_w.
-        let (stdout_r, stdout_w) = create_pipe(256_000)
-            .context("CreatePipe (Factor stdout)")?;
+        // CREATE_NO_WINDOW = 0x08000000 — suppresses the brief console flash
+        // that would otherwise appear when a GUI-subsystem process spawns
+        // a console-subsystem child.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        eprintln!("[NF] pipes created — redirecting CRT fds");
-        // ── Redirect CRT fds 0 and 1 ──────────────────────────────────
-        //
-        // _open_osfhandle transfers handle ownership to the CRT.
-        // _dup2 installs a copy on fd 0 or 1.
-        // _close releases the original temporary fd (0/1 remain open).
-        unsafe {
-            let r_fd = _open_osfhandle(stdin_r as isize, 0 /* O_RDONLY */);
-            anyhow::ensure!(r_fd >= 0, "_open_osfhandle(stdin_r) failed");
-            let rc = _dup2(r_fd, 0); // redirect CRT stdin → our pipe
-            _close(r_fd);
-            anyhow::ensure!(rc == 0, "_dup2(stdin → 0) failed");
+        let mut child = {
+            use std::os::windows::process::CommandExt;
+            Command::new(FACTOR_COM)
+                .arg(format!("-i={FACTOR_IMAGE}"))
+                .arg("-run=listener")  // override main-vocab-hook → no IDE
+                .arg("-no-user-init")  // skip ~/.factor-rc
+                .arg("-no-signals")    // we own the signal handlers
+                .arg("-q")             // suppress version banner
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .with_context(|| format!("spawn {FACTOR_COM}"))?
+        };
 
-            let w_fd = _open_osfhandle(stdout_w as isize, 0 /* O_WRONLY */);
-            anyhow::ensure!(w_fd >= 0, "_open_osfhandle(stdout_w) failed");
-            let rc = _dup2(w_fd, 1); // redirect CRT stdout → our pipe
-            _close(w_fd);
-            anyhow::ensure!(rc == 0, "_dup2(stdout → 1) failed");
+        eprintln!("[NF] spawned PID={}", child.id());
+
+        // Take ownership of the piped stdio.  These `Option`s are `Some`
+        // because we configured `Stdio::piped()` for all three streams.
+        let stdin  = child.stdin .take().context("child stdin missing")?;
+        let stdout = child.stdout.take().context("child stdout missing")?;
+
+        // Drain stderr in a background thread so it never blocks the child
+        // by filling the pipe buffer.  We just log it (could surface in
+        // the UI later if useful).
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::Builder::new()
+                .name("nf-stderr-drain".into())
+                .spawn(move || drain_child_stderr(stderr))
+                .ok();
         }
-
-        eprintln!("[NF] fd redirect done — loading factor.dll");
-        // ── Start Factor listener thread ──────────────────────────────
-
-        Self::start_factor_thread().context("start Factor listener thread")?;
-        eprintln!("[NF] factor.dll loaded, thread started");
-
-        // ── Wrap remaining pipe ends as Rust Files ─────────────────────
-        //
-        // stdin_r and stdout_w are now owned by CRT fds 0 and 1.
-        // We keep stdin_w (write to Factor) and stdout_r (read from Factor).
-        let stdin_file  = unsafe { handle_to_file(stdin_w)  };
-        let stdout_file = unsafe { handle_to_file(stdout_r) };
 
         let mut session = FactorSession {
             transpiler:    Transpiler::new(),
-            stdin_writer:  io::BufWriter::new(stdin_file),
-            stdout_reader: io::BufReader::new(stdout_file),
+            child,
+            stdin_writer:  Some(io::BufWriter::new(stdin)),
+            stdout_reader: io::BufReader::new(stdout),
             data_stack:    Vec::new(),
         };
 
-        // ── Wait for Factor, then bootstrap ──────────────────────────
-
-        eprintln!("[NF] sleeping {}ms for image load", STARTUP_WAIT_MS);
+        eprintln!("[NF] probing for listener readiness");
         session.wait_for_ready().context("Factor startup probe")?;
-        eprintln!("[NF] Factor ready — bootstrapping");
+        eprintln!("[NF] listener responsive — bootstrapping");
         session.bootstrap().context("forth.all bootstrap")?;
-        eprintln!("[NF] bootstrap done");
+        eprintln!("[NF] bootstrap complete");
 
         Ok(session)
     }
 
-    /// Load `factor.dll` via libloading and call
-    /// `start_standalone_factor_in_new_thread`.
-    ///
-    /// Factor's listener starts in a new OS thread within our process.
-    /// It reads from CRT fd 0 (our stdin pipe) and writes to fd 1
-    /// (our stdout pipe) because we redirected them above.
-    fn start_factor_thread() -> Result<()> {
-        // factor.dll exports this as a C symbol (VM_C_API = dllexport + extern "C").
-        type StartFactorFn = unsafe extern "C" fn(
-            argc: i32,
-            argv: *mut *mut u16, // wchar_t** on Windows
-        ) -> *mut std::ffi::c_void; // returns THREADHANDLE (HANDLE)
+    // ── Startup / bootstrap ───────────────────────────────────────────
 
-        // Prepend the NewFactor repo directory to the DLL search path so
-        // that factor.dll's runtime dependencies (libssl, libcrypto,
-        // sqlite3) are found even when the binary lives elsewhere.
-        let dir_wide: Vec<u16> = NEWFACTOR_ROOT
-            .encode_utf16()
-            .chain(Some(0u16))
-            .collect();
-        unsafe { SetDllDirectoryW(dir_wide.as_ptr()); }
-
-        let lib = unsafe {
-            libloading::Library::new(FACTOR_DLL)
-                .with_context(|| format!("load {FACTOR_DLL}"))?
-        };
-
-        let start_fn: libloading::Symbol<StartFactorFn> = unsafe {
-            lib.get(b"start_standalone_factor_in_new_thread\0")
-                .context("find start_standalone_factor_in_new_thread in factor.dll")?
-        };
-
-        // Build wide-string argv.
-        // Factor's init_from_args parses -i= (image) and -no-signals.
-        let args_utf8: &[&str] = &[
-            "newfactor-ui.exe",          // argv[0] — Factor uses this for crash dumps
-            &format!("-i={FACTOR_IMAGE}"),
-            "-no-signals",               // don't install signal handlers (conflicts with Rust's)
-        ];
-        let wide: Vec<Vec<u16>> = args_utf8.iter()
-            .map(|s| s.encode_utf16().chain(Some(0u16)).collect())
-            .collect();
-        let mut ptrs: Vec<*mut u16> = wide.iter()
-            .map(|v| v.as_ptr() as *mut u16)
-            .collect();
-
-        // `ptrs` and `wide` live until the end of this function, which is
-        // past the call — Factor only needs argv during `init_from_args`.
-        let _thread_handle = unsafe {
-            start_fn(ptrs.len() as i32, ptrs.as_mut_ptr())
-        };
-
-        // Intentionally leak the Library: the DLL must stay loaded for the
-        // lifetime of the process (the Factor thread is still running in it).
-        std::mem::forget(lib);
-
-        Ok(())
-    }
-
-    // ── Startup / bootstrap ────────────────────────────────────────────
-
-    /// Wait for Factor to finish loading its image, then verify it's alive.
-    ///
-    /// We sleep first so that Factor's Stage 2 compilation output is already
-    /// buffered in the pipe before we start our sentinel handshake.  The
-    /// listener may still be mid-startup when the probe arrives; it will
-    /// process the probe as soon as it enters its first `listener-step`.
+    /// Send a probe through the listener and wait for it to echo back.
+    /// This is how we know the image is fully loaded and the listener is
+    /// reading from its stdin.
     fn wait_for_ready(&mut self) -> Result<()> {
-        // Factor's Stage 2 compilation takes a few seconds on first boot.
-        std::thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
-
-        // Ask Factor to print our ready sentinel.
         self.send_raw("\"%%NF-READY%%\\n\" write flush\n")
             .context("send ready probe")?;
-
-        // Drain Factor's startup banner until we see the sentinel.
         self.read_until_sentinel(SENTINEL_READY, SENTINEL_TIMEOUT)
             .context("wait for Factor ready sentinel")?;
-
         Ok(())
     }
 
-    /// Load the NewFactor vocabulary suite (`forth.all`) into Factor,
-    /// then silence the listener's verbose output.
+    /// Load `forth.all` and silence the listener's between-step noise.
     fn bootstrap(&mut self) -> Result<()> {
-        // Escape backslashes for Factor string literals.
         let root_escaped = NEWFACTOR_ROOT.replace('\\', "\\\\");
 
-        // Each line is one `listener-step`.  The listener reads them from the
-        // pipe one by one and executes them.
-        //
-        // After loading forth.all, we suppress the two sources of noise that
-        // the listener normally injects between evals:
+        // Each `\n` is one listener-step.
         //
         //   display-stacks? off
-        //       Factor's listener-step prints the data-stack at the START of
-        //       every step (before reading the next expression).  Turning this
-        //       off stops the `3\n5\n` etc. appearing in our output stream.
+        //       Stops the listener printing the data-stack at the START of
+        //       every step.
         //
         //   M: object prompt. 2drop ;
-        //       listener-step also prints the vocab prompt ("IN: scratchpad\n")
-        //       by calling `prompt.` on the current input stream.  Redefining
-        //       the catch-all method to do nothing silences it permanently.
-        //
-        // After these two lines take effect, our pipe is clean: only text that
-        // user code explicitly writes appears between successive sentinels.
+        //       Stops the listener printing `IN: scratchpad\n` at the start
+        //       of every step.  Redefining the catch-all method is permanent.
         let boot = format!(concat!(
             "USE: vocabs.loader\n",
             "\"{root}\" add-vocab-root\n",
@@ -361,27 +228,31 @@ impl FactorSession {
         ), root = root_escaped);
 
         self.send_raw(&boot).context("send bootstrap")?;
-
         self.read_until_sentinel(SENTINEL_READY, SENTINEL_TIMEOUT)
             .context("wait for bootstrap ready sentinel")?;
-
         Ok(())
     }
 
     // ── Low-level I/O ─────────────────────────────────────────────────
 
     fn send_raw(&mut self, code: &str) -> Result<()> {
-        self.stdin_writer.write_all(code.as_bytes())
+        let stdin = self
+            .stdin_writer
+            .as_mut()
+            .context("Factor stdin already closed")?;
+        stdin
+            .write_all(code.as_bytes())
             .context("write to Factor stdin pipe")?;
-        self.stdin_writer.flush()
+        stdin
+            .flush()
             .context("flush Factor stdin pipe")?;
         Ok(())
     }
 
     /// Read from Factor's stdout until a line consists solely of `sentinel`.
     ///
-    /// Returns all output lines that appeared before the sentinel.
-    /// Returns an error if `timeout` elapses.
+    /// Returns all output lines that appeared before the sentinel
+    /// (with their trailing newlines preserved).
     fn read_until_sentinel(&mut self, sentinel: &str, timeout: Duration) -> Result<String> {
         let deadline = Instant::now() + timeout;
         let mut output = String::new();
@@ -394,10 +265,15 @@ impl FactorSession {
                 );
             }
             line.clear();
-            let n = self.stdout_reader.read_line(&mut line)
+            let n = self
+                .stdout_reader
+                .read_line(&mut line)
                 .context("read from Factor stdout pipe")?;
             if n == 0 {
-                anyhow::bail!("Factor stdout EOF while waiting for sentinel {sentinel:?}");
+                anyhow::bail!(
+                    "Factor stdout EOF while waiting for sentinel {sentinel:?} \
+                     (child likely exited)"
+                );
             }
             let trimmed = line.trim_end_matches(['\r', '\n']);
             if trimmed == sentinel {
@@ -412,34 +288,26 @@ impl FactorSession {
     /// Evaluate Forth source code.
     ///
     /// The code is transpiled to Factor, sent to the listener, and the
-    /// output is returned.  On error Factor's `call-error-hook` prints a
-    /// formatted error and `recover` keeps the listener alive; the error
-    /// text appears in the returned string before the sentinel.
+    /// captured output is returned.  On error, Factor's `call-error-hook`
+    /// prints a formatted error and `recover` keeps the listener alive;
+    /// the error text appears in the returned string.
     pub fn eval(&mut self, forth_source: &str) -> Result<String> {
         let factor_code = self.transpiler.transpile(forth_source);
 
         // Two listener-steps:
-        //   Step 1 — user's transpiled Factor code (may produce output / errors)
-        //   Step 2 — write the done-sentinel and flush; always executes because
-        //             Factor's listener recovers from any error in step 1.
-        //
-        // The listener prints NO ` ok` nor any prompt between steps (those were
-        // suppressed during bootstrap), so captured output is exactly what the
-        // user code writes to stdout.
+        //   Step 1 — transpiled Factor code (may produce output / error)
+        //   Step 2 — write the done-sentinel; runs after any step-1 error
         let msg = format!(
             "{factor_code}\n\
              \"{SENTINEL_DONE}\\n\" write flush\n"
         );
 
         self.send_raw(&msg).context("send eval to Factor")?;
-
         self.read_until_sentinel(SENTINEL_DONE, SENTINEL_TIMEOUT)
             .context("receive eval output from Factor")
     }
 
-    /// Query the current Factor data stack.
-    ///
-    /// Returns stack contents (integers only) with TOS last.
+    /// Query the current Factor data stack.  Returns integers only, TOS last.
     pub fn stack(&mut self) -> Vec<i64> {
         let probe = format!(
             "get-datastack \
@@ -451,7 +319,8 @@ impl FactorSession {
         }
         match self.read_until_sentinel(SENTINEL_STACK, Duration::from_secs(5)) {
             Ok(raw) => {
-                let parsed: Vec<i64> = raw.lines()
+                let parsed: Vec<i64> = raw
+                    .lines()
                     .filter_map(|l| l.trim().parse().ok())
                     .collect();
                 self.data_stack = parsed;
@@ -461,8 +330,7 @@ impl FactorSession {
         self.data_stack.clone()
     }
 
-    /// Reset the transpiler ctrl-stack.
-    /// Does NOT restart the Factor VM.
+    /// Reset the transpiler ctrl-stack.  Does NOT restart the Factor VM.
     pub fn reset(&mut self) {
         self.transpiler.reset();
     }
@@ -482,5 +350,63 @@ impl FactorSession {
         self.eval(&code)
             .with_context(|| format!("load {}", path.display()))?;
         Ok(())
+    }
+}
+
+impl Drop for FactorSession {
+    /// Best-effort: half-close stdin (so the listener sees EOF and exits
+    /// cleanly via `quit`), then wait briefly, then kill if needed.
+    fn drop(&mut self) {
+        let pid = self.child.id();
+
+        // Drop the BufWriter; this closes the write half of the stdin pipe,
+        // which signals EOF to the listener loop in the child.
+        drop(self.stdin_writer.take());
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return, // child exited on its own — good
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        eprintln!("[NF] killed factor.com (PID {pid})");
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    eprintln!("[NF] try_wait on child PID {pid}: {e}");
+                    let _ = self.child.kill();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Background-thread loop that drains the child's stderr so it can't
+/// block by filling the pipe buffer.  Each line is prefixed and printed
+/// to our own stderr for diagnostics.
+fn drain_child_stderr(stderr: std::process::ChildStderr) {
+    use std::io::Read;
+    let mut reader = io::BufReader::new(stderr);
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return, // EOF — child exited
+            Ok(n) => {
+                let s = String::from_utf8_lossy(&buf[..n]);
+                for line in s.lines() {
+                    if !line.is_empty() {
+                        eprintln!("[factor stderr] {line}");
+                    }
+                }
+            }
+            Err(_) => return,
+        }
     }
 }

@@ -5072,6 +5072,43 @@ fn search_wordlist_returns_xt_and_immediacy_flag() {
     assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n-1 \n ok\n1 \n ok\n1 \n ok\n-1 \n ok\n");
 }
 
+// ─── Forth 2012 locals (`{: … :}`) — known-broken note ───────────────
+//
+// Attempting to exercise `{:` via `s.eval(...)` after
+// `load_source_file(core.f)` currently reproduces the same
+// `?`-flood failure that broke `demos/gfx-click.f` — every token
+// in the colon body (including kernel primitives like `bye`)
+// shows `?`, even though `[']` can find `{:` cleanly.  Locals
+// work via the direct REPL path (`cargo run --bin wf64`) but
+// not through the `session.eval` test path.  The mismatch is
+// the locals-impl bug we still need to root-cause; until then,
+// the test matrix here can't lock in `{:` behaviour and is
+// deferred.  See project_wf64.md and the post-session notes.
+//
+// Tests we still keep: the state-mismatch throw on nested-`:`,
+// because that path doesn't depend on `{:` itself.
+
+#[test]
+fn double_colon_inside_definition_throws_minus_29() {
+    // Calling `:` while STATE != 0 must throw -29 (compiler nesting)
+    // rather than silently re-entering compile mode and producing
+    // `?`-flood downstream.
+    let mut s = sess();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    s.load_source_file(&path).unwrap();
+    let out = s.eval(
+        ": provoke   ( -- throw-code )\n\
+             state @ >r\n\
+             1 state !\n\
+             ['] : catch\n\
+             r> state !\n\
+         ;\n\
+         provoke . cr\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out, " ok\n ok\n ok\n ok\n ok\n ok\n-29 \n ok\n");
+}
+
 #[test]
 fn set_flags_marks_word_immediate() {
     // Build a word "IMM" pointing at `cr_word` (no-op for the data

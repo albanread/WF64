@@ -2121,6 +2121,20 @@ endp()
 ;     so a definition can refer to itself (recursive by default,
 ;     matching most modern Forths).
 proc(colon)
+    ; State-mismatch guard: if we're already in compile mode, the
+    ; user (or a misbehaving immediate word) is starting a new
+    ; definition without closing the current one.  This is almost
+    ; always a forgotten `;` or `]` and the right thing is to
+    ; throw -29 (compiler nesting) immediately rather than let
+    ; the broken definition silently corrupt state and produce
+    ; a flood of `?` markers in subsequent token lookups.
+    cmp     qword ptr [UP + user_STATE], 0
+    je      .ok_to_compile
+    call    throw_compnest_const
+    call    throw_word
+    next()
+
+.ok_to_compile:
     call    parse_name                       ; ( -- c-addr u )
     test    TOS, TOS
     jnz     .got_name
