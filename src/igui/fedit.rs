@@ -362,6 +362,10 @@ struct FeditState {
 
     file_path: Option<PathBuf>,
     dirty: bool,
+    /// Source language for syntax highlighting.  Tracked
+    /// separately from `file_path` so a new (untitled) buffer
+    /// can still default-highlight as Forth.
+    lang: FileLang,
 
     client_w: u32,
     client_h: u32,
@@ -412,6 +416,7 @@ impl FeditState {
             pref_col: 0,
             scroll_top: 0,
             file_path: None,
+            lang: FileLang::default(),
             dirty: false,
             client_w: 0,
             client_h: 0,
@@ -995,7 +1000,7 @@ impl FeditState {
 
         // Refresh tokens lazily, before any line is laid out.
         if self.tokens_dirty {
-            self.tokens = tokenize_rope(&self.buffer);
+            self.tokens = tokenize_rope(&self.buffer, self.lang);
             self.tokens_dirty = false;
         }
 
@@ -1935,6 +1940,7 @@ impl FeditState {
                 self.tokens_dirty = true;
                 self.diagnostics.clear();
                 self.diagnostics_stale = true;
+                self.lang = FileLang::from_path(&path);
                 self.file_path = Some(path);
                 self.update_title();
                 self.invalidate();
@@ -1950,9 +1956,11 @@ impl FeditState {
         let text = lf_text.replace('\n', "\r\n");
         match std::fs::write(&path, text.as_bytes()) {
             Ok(()) => {
+                self.lang = FileLang::from_path(&path);
                 self.file_path = Some(path);
                 self.dirty = false;
                 self.update_title();
+                self.tokens_dirty = true;
                 // Saving is a natural moment to refresh diagnostics:
                 // the file the compiler will see now matches the
                 // editor buffer, so checker output is meaningful.
@@ -2575,6 +2583,39 @@ fn display_col_to_buffer(line: &str, display_col: usize) -> usize {
 // to `RopeBuffer::from_utf8`, which handles BOM, CRLF, and invalid
 // sequences internally.
 
+// ─── File-type aware tokenizer dispatch ────────────────────────────
+
+/// Source language we're highlighting.  Inferred from the file
+/// extension on `load_from` / `save_to`; defaults to Forth for
+/// new buffers (most editing in WF64 is Forth source).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+enum FileLang {
+    #[default]
+    Forth,
+    /// JASM macro-assembly (`*.masm`).  Different palette anchors
+    /// (Comment uses `;` not `\`, registers/mnemonics get the
+    /// Primitive/Keyword brushes, directives `@…` and `.…` are
+    /// Defining).
+    Masm,
+}
+
+impl FileLang {
+    /// Infer language from a file path's extension.  Anything not
+    /// recognised falls back to Forth (the editor's default
+    /// language).
+    fn from_path(path: &std::path::Path) -> Self {
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+            return Self::Forth;
+        };
+        let ext_lc = ext.to_ascii_lowercase();
+        match ext_lc.as_str() {
+            "masm" => Self::Masm,
+            "f" | "fs" | "4th" | "fth" => Self::Forth,
+            _ => Self::Forth,
+        }
+    }
+}
+
 // ─── Forth tokenizer (syntax highlighting) ─────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2857,22 +2898,262 @@ fn tokenize_line(line: &str, _depth_in: u32) -> (Vec<Token>, u32) {
     (tokens, 0)
 }
 
-/// Tokenize the whole buffer.  Forth doesn't have multi-line
-/// constructs that the line-by-line tokenizer would mishandle
-/// (no nested block comments; paren comments are single-line),
-/// so the depth state is unused but kept for shape parity with
-/// the older Pascal-flavoured signature.
-fn tokenize_rope(rope: &RopeBuffer) -> Vec<Vec<Token>> {
+/// Tokenize the whole buffer.  Dispatches per-line based on the
+/// editor's current `lang`.  Neither Forth nor MASM has cross-
+/// line tokenization state worth threading (no nested block
+/// comments, both treat each line independently), so `depth` is
+/// effectively unused but kept for shape parity.
+fn tokenize_rope(rope: &RopeBuffer, lang: FileLang) -> Vec<Vec<Token>> {
     let n = rope.line_count();
     let mut out = Vec::with_capacity(n);
     let mut depth: u32 = 0;
     for row in 0..n {
         let line = codepoints_to_utf8(&rope.get_line(row));
-        let (tokens, next_depth) = tokenize_line(&line, depth);
+        let (tokens, next_depth) = match lang {
+            FileLang::Forth => tokenize_line(&line, depth),
+            FileLang::Masm  => tokenize_masm_line(&line, depth),
+        };
         out.push(tokens);
         depth = next_depth;
     }
     out
+}
+
+// ─── JASM/MASM tokenizer ───────────────────────────────────────────
+
+/// x86-64 mnemonics we care about for highlighting.  Treated as
+/// `Keyword` (structural).  Lower-cased; matched case-insensitively.
+const MASM_INSTRUCTIONS: &[&str] = &[
+    // data movement
+    "mov", "movabs", "movsx", "movsxd", "movzx", "lea", "push", "pop", "xchg",
+    "cmovz", "cmovnz", "cmove", "cmovne", "cmovl", "cmovle", "cmovg", "cmovge",
+    "cmova", "cmovae", "cmovb", "cmovbe", "cmovs", "cmovns",
+    // arithmetic
+    "add", "adc", "sub", "sbb", "mul", "imul", "div", "idiv",
+    "inc", "dec", "neg",
+    "sar", "shr", "shl", "sal", "rol", "ror", "rcl", "rcr",
+    // logic
+    "and", "or", "xor", "not", "test", "bt", "bts", "btr", "btc", "bsr", "bsf",
+    // control flow
+    "jmp", "call", "ret", "retn", "retf", "iret", "iretd", "iretq",
+    "je", "jne", "jz", "jnz", "jl", "jle", "jg", "jge",
+    "ja", "jae", "jb", "jbe", "jc", "jnc", "jo", "jno", "js", "jns", "jp", "jnp",
+    "loop", "loope", "loopne",
+    "cmp",
+    // string ops
+    "rep", "repe", "repne", "repz", "repnz",
+    "movsb", "movsw", "movsd", "movsq",
+    "lodsb", "lodsw", "lodsd", "lodsq",
+    "stosb", "stosw", "stosd", "stosq",
+    "scasb", "scasw", "scasd", "scasq",
+    "cmpsb", "cmpsw", "cmpsd", "cmpsq",
+    // float / SIMD basics
+    "movss", "movsd", "movups", "movupd", "movdqu", "movdqa",
+    "addsd", "subsd", "mulsd", "divsd", "sqrtsd",
+    "addss", "subss", "mulss", "divss",
+    "ucomisd", "comisd", "ucomiss", "comiss",
+    "cvtsi2sd", "cvtsd2si", "cvtsi2ss", "cvtss2si", "cvttsd2si", "cvttss2si",
+    "cvtsd2ss", "cvtss2sd",
+    "movq", "movd",
+    "pxor", "xorpd", "xorps",
+    // misc
+    "nop", "int", "int3", "hlt", "cdq", "cqo", "cwd",
+    "syscall", "sysret", "sysenter", "sysexit",
+    "endbr64", "cli", "sti", "pushfq", "popfq",
+    "lock", "fence", "mfence", "sfence", "lfence",
+];
+
+/// x86-64 + JASM register-ish names that we colour as `Primitive`.
+/// Not exhaustive — covers everything WF64 code uses.
+const MASM_REGISTERS: &[&str] = &[
+    // 64-bit GPRs
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    // 32-bit / 16-bit / 8-bit lower forms
+    "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+    "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
+    "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+    "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w",
+    "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
+    "sil", "dil", "bpl", "spl",
+    "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+    // SIMD
+    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+    "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
+    "ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7",
+    "ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "ymm14", "ymm15",
+    // x87 / control
+    "rip", "rflags", "eflags", "flags", "cs", "ds", "es", "ss", "fs", "gs",
+    // WF64-specific register aliases defined in macros.masm
+    "tos", "dsp", "up", "lp",
+];
+
+/// JASM control / structural macros — `proc`, `endp`, `next`,
+/// `pushd`, `popd`, `win64_call`, `brk`, `pushd_call`,
+/// `pushd_call_or`, `stk`.  Treated as `Keyword` (structural)
+/// except `proc` / `endp` which are `Defining`.
+const MASM_MACROS_KEYWORD: &[&str] = &[
+    "next", "pushd", "popd", "win64_call", "brk",
+    "pushd_call", "pushd_call_or", "stk",
+];
+
+const MASM_MACROS_DEFINING: &[&str] = &[
+    "proc", "endp",
+];
+
+/// JASM directives — `@include`, `@extern`, `@assign`, `@define`,
+/// `@macro`, `@endmacro`, `@scope`, `@endscope`, `@if`, `@endif`,
+/// `@for`, `@endfor`.  GAS-style `.text`, `.globl`, `.intel_syntax`
+/// also handled (anything starting with `.` followed by an
+/// identifier character).
+fn looks_like_directive(word_lc: &str) -> bool {
+    word_lc.starts_with('@')
+        || (word_lc.starts_with('.')
+            && word_lc.len() > 1
+            && word_lc.as_bytes()[1].is_ascii_alphabetic())
+}
+
+fn is_masm_instruction(word_lc: &str) -> bool {
+    MASM_INSTRUCTIONS.iter().any(|m| *m == word_lc)
+}
+
+fn is_masm_register(word_lc: &str) -> bool {
+    MASM_REGISTERS.iter().any(|r| *r == word_lc)
+}
+
+fn is_masm_macro_kw(word_lc: &str) -> bool {
+    MASM_MACROS_KEYWORD.iter().any(|m| *m == word_lc)
+}
+
+fn is_masm_macro_def(word_lc: &str) -> bool {
+    MASM_MACROS_DEFINING.iter().any(|m| *m == word_lc)
+}
+
+/// Number recognition for MASM literals — decimal, hex with `0x`
+/// prefix, binary with `0b` prefix.  Sign accepted at front.
+fn looks_like_masm_number(word: &str) -> bool {
+    if word.is_empty() { return false; }
+    let mut s = word;
+    if s.starts_with('-') || s.starts_with('+') {
+        s = &s[1..];
+        if s.is_empty() { return false; }
+    }
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        return !rest.is_empty() && rest.bytes().all(|b| b == b'0' || b == b'1');
+    }
+    s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Tokenize one line of JASM/MASM source.  Rules:
+///   - `;` to EOL → Comment.
+///   - `"..."` → StringLit (single line; no escape handling).
+///   - identifier ending with `:` at start of (trimmed) line →
+///     DefName (it's a label being defined).
+///   - directives `@xxx` / `.xxx` → Defining.
+///   - macros (proc/endp) → Defining.
+///   - macros (next/win64_call/…) → Keyword.
+///   - mnemonics (mov/add/…) → Keyword.
+///   - registers (rax/xmm0/…) → Primitive.
+///   - numbers → Number.
+///   - other identifiers → unstyled.
+///
+/// MASM uses comma-separated operands, but commas / brackets /
+/// arithmetic operators inside operand lists are left unstyled.
+fn tokenize_masm_line(line: &str, _depth_in: u32) -> (Vec<Token>, u32) {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut i = 0usize;
+
+    // First non-whitespace position on the line — used for label
+    // recognition (labels are bare-identifier-then-colon at the
+    // very start of the line, optionally indented).
+    let line_start = {
+        let mut k = 0usize;
+        while k < n && chars[k].is_whitespace() { k += 1; }
+        k
+    };
+
+    while i < n {
+        let c = chars[i];
+        // Whitespace.
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Line comment.
+        if c == ';' {
+            tokens.push(Token { start: i, end: n, kind: TokenKind::Comment });
+            break;
+        }
+        // String literal.
+        if c == '"' {
+            let start = i;
+            i += 1;
+            while i < n && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < n {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if i < n { i += 1; }
+            tokens.push(Token { start, end: i, kind: TokenKind::StringLit });
+            continue;
+        }
+        // Read an identifier-ish run (alnum, `_`, `.`, `@`, `:`
+        // — the latter handled below for label detection).
+        let start = i;
+        let is_ident_char = |c: char|
+            c.is_ascii_alphanumeric() || c == '_' || c == '@' || c == '.' || c == '$';
+        if is_ident_char(c) || c == '-' || c == '+' {
+            i += 1;
+            while i < n && is_ident_char(chars[i]) {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let word_lc = word.to_ascii_lowercase();
+
+            // Label form: identifier immediately followed by `:`,
+            // and we're at the start of the line's content.
+            let label_here = start == line_start
+                && i < n && chars[i] == ':';
+            if label_here {
+                // Include the trailing `:` in the highlighted span.
+                let label_end = i + 1;
+                tokens.push(Token { start, end: label_end, kind: TokenKind::DefName });
+                i = label_end;
+                continue;
+            }
+
+            let kind = if looks_like_directive(&word_lc) {
+                TokenKind::Defining
+            } else if is_masm_macro_def(&word_lc) {
+                TokenKind::Defining
+            } else if is_masm_macro_kw(&word_lc) {
+                TokenKind::Keyword
+            } else if is_masm_register(&word_lc) {
+                TokenKind::Primitive
+            } else if is_masm_instruction(&word_lc) {
+                TokenKind::Keyword
+            } else if looks_like_masm_number(&word) {
+                TokenKind::Number
+            } else {
+                // Skip emitting a token (default colour).
+                continue;
+            };
+            tokens.push(Token { start, end: i, kind });
+            continue;
+        }
+        // Anything else (brackets, commas, +/-/* operators) —
+        // single char, unstyled.
+        i += 1;
+    }
+
+    (tokens, 0)
 }
 
 // ─── Clipboard helpers ──────────────────────────────────────────────
