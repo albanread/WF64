@@ -350,6 +350,112 @@ proc(vec_f_store)
 endp()
 
 
+; vec-ref@  ( handle index -- tagged )
+;     Fetch the tagged pointer at payload cell `index` of the
+;     RefVec referenced by [handle].  Index is 0-based; cell 0 is
+;     the first payload cell (the header is hidden).
+;
+;     RefVec cells hold either nil (0) or a tagged GC pointer; the
+;     GC walks them precisely.  Throws -2060 on a non-RefVec
+;     handle, -2061 on nil.  Bounds checking is deferred to V3
+;     (the demo using this stays inside its declared length).
+proc(vec_ref_fetch)
+    ; TOS = index, [DSP] = handle.
+    mov     r9, [DSP]                               ; handle
+    mov     r9, [r9]                                ; tagged pointer
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 3                                  ; TAG_REFVEC
+    jne     .wrong_type
+    and     r9, -8                                  ; strip tag → base
+
+    ; Load cell at base + 8 + index*8.  rax holds index.
+    mov     r9, [r9 + 8 + rax*8]
+
+    ; Drop handle and index from stack, push the loaded value.
+    mov     TOS, r9
+    stk(1, 0)
+    next()
+
+.wrong_type:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+
+.nil_deref:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; vec-ref!  ( tagged handle index -- )
+;     Store `tagged` into payload cell `index` of the RefVec
+;     referenced by [handle].
+;
+;     SHARP TOOL note: V2s ships this without a card-mark write
+;     barrier.  Storing a young-generation pointer into a tenured
+;     RefVec creates an old→young edge that a future minor GC
+;     might miss.  In V2s-era programs the RefVec and its
+;     contents are usually allocated in the same burst and stay
+;     in the same generation, so this hasn't bitten yet.  The
+;     proper fix is the static-card-table integration tracked as
+;     item #1 in docs/forth_gc_needs.md.
+proc(vec_ref_store)
+    ; TOS = index, [DSP] = handle, [DSP + cell] = tagged.
+    mov     r9, [DSP]                               ; handle
+    mov     r9, [r9]                                ; tagged refvec ptr
+    test    r9, r9
+    jz      .nil_deref
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 3
+    jne     .wrong_type
+    and     r9, -8
+
+    ; Compute cell addr = base + 8 + index*8.
+    lea     r9, [r9 + 8 + rax*8]
+    ; Load the value-to-store.
+    mov     r10, [DSP + cell]
+    mov     [r9], r10
+
+    ; Drop 3 cells: (tagged handle index --).  We have NNOS=tagged,
+    ; NOS=handle, TOS=index.  After: TOS = whatever was below NNOS.
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    next()
+
+.wrong_type:
+    ; Drop 3, push -2060.
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+
+.nil_deref:
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
 ; vec-len  ( handle -- n )
 ;     Read the length field from the object's header.  For FloatVec
 ;     and RefVec, returns payload-cell count.  For String, returns

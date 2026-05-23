@@ -110,6 +110,8 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("vec-alloc-refs!",    "vec_alloc_refs_store",     0),
     ("vec-f@",             "vec_f_fetch",              0),
     ("vec-f!",             "vec_f_store",              0),
+    ("vec-ref@",           "vec_ref_fetch",            0),
+    ("vec-ref!",           "vec_ref_store",            0),
     ("vec-len",            "vec_len",                  0),
     // Managed strings (V2s stage A).  See docs/strings_design.md.
     (">$",                 "to_string_word",           0),

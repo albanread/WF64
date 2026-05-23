@@ -3977,6 +3977,202 @@ fn str_d_wrong_types_throw() {
     assert!(msg.contains("-2060"), "got {msg}");
 }
 
+// ── RefVec accessors (added alongside V2s integration demo) ──────
+
+// Convention reminder: vec-ref@ / vec-ref! take a HANDLE (HEAPPTR
+// slot address — what `v` pushes), not a raw tagged pointer.  The
+// kernel derefs internally.  Same shape as vec-f@ / vec-f!.
+
+#[test]
+fn refvec_fresh_cells_are_nil() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR v\n\
+         4 v vec-alloc-refs!\n\
+         v 0 vec-ref@ .\n\
+         v 3 vec-ref@ .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![0, 0], "fresh RefVec cells should be nil; got {nums:?}");
+}
+
+#[test]
+fn refvec_store_and_fetch_string_pointer() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR v\n\
+         HEAPPTR s\n\
+         4 v vec-alloc-refs!\n\
+         s\" hello\" >$ s !$\n\
+         s @$ v 2 vec-ref!\n\
+         v 2 vec-ref@ $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("hello"),
+        "RefVec cell should yield back the string; got {out:?}");
+}
+
+#[test]
+fn refvec_can_nil_a_cell() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR v\n\
+         4 v vec-alloc-refs!\n\
+         s\" hi\" >$ v 0 vec-ref!\n\
+         0 v 0 vec-ref!                 \\ nil it out\n\
+         v 0 vec-ref@ .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("0  ok"),
+        "nil'd cell should fetch 0; got {out:?}");
+}
+
+#[test]
+fn refvec_wrong_type_throws() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR v\n\
+         4 v vec-alloc-floats!\n\
+         v 0 vec-ref@ .\n\
+         bye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2060"),
+        "vec-ref@ on FloatVec should throw -2060; got {msg}");
+}
+
+#[test]
+fn refvec_nil_throws() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR v\n\
+         v 0 vec-ref@ .\n\
+         bye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2061"),
+        "vec-ref@ on nil should throw -2061; got {msg}");
+}
+
+#[test]
+fn refvec_survives_collection() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR v\n\
+         3 v vec-alloc-refs!\n\
+         s\" alpha\" >$ v 0 vec-ref!\n\
+         s\" beta\"  >$ v 1 vec-ref!\n\
+         s\" gamma\" >$ v 2 vec-ref!\n\
+         (gc)\n\
+         v 0 vec-ref@ $>addr type cr\n\
+         v 1 vec-ref@ $>addr type cr\n\
+         v 2 vec-ref@ $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("alpha"), "got {out:?}");
+    assert!(out.contains("beta"),  "got {out:?}");
+    assert!(out.contains("gamma"), "got {out:?}");
+}
+
+// ── V2s integration demo: word-frequency counter ─────────────────
+
+/// Plain-Forth word-frequency counter exercising the V2s surface
+/// end-to-end.  A tiny associative array as two parallel arrays:
+/// strings in a RefVec, counts in a FloatVec.  Find-or-insert via
+/// linear scan; output is unsorted (the assertions inspect all
+/// emitted lines).
+///
+/// Bigger sort/top-K logic was attempted but is non-trivial to get
+/// right purely on the data stack — deferred until WF64 grows
+/// Forth-side locals or LET-style scalar bindings for non-FP code.
+const WORDCOUNT_DEMO_SRC: &str = r#"
+64 constant WC-CAP
+
+HEAPPTR wc-words
+HEAPPTR wc-counts
+variable wc-n
+
+: wc-init  ( -- )
+    WC-CAP wc-words vec-alloc-refs!
+    WC-CAP wc-counts vec-alloc-floats!
+    0 wc-n ! ;
+
+\ Linear scan: index of matching $word in wc-words, or -1.
+: wc-find  ( $word -- i | -1 )
+    wc-n @ 0 ?do
+        dup wc-words i vec-ref@ $=
+        if drop i unloop exit then
+    loop
+    drop -1 ;
+
+\ Bump count at index by one.
+: wc-bump  ( i -- )
+    dup wc-counts swap vec-f@        ( i ) ( F: c )
+    1e f+                             ( i ) ( F: c+1 )
+    wc-counts swap vec-f! ;
+
+\ Insert a brand-new word with count 1.  Caller guarantees room.
+: wc-insert  ( $word -- )
+    wc-words wc-n @ vec-ref!          \ wc-words[n] := $word
+    1e wc-counts wc-n @ vec-f!         \ wc-counts[n] := 1
+    1 wc-n +! ;
+
+\ Find-or-insert, bumping on hit, dropping on cap.
+: wc-add  ( $word -- )
+    dup wc-find dup -1 = if
+        drop
+        wc-n @ WC-CAP >= if drop exit then
+        wc-insert
+    else
+        nip wc-bump
+    then ;
+
+\ Tokenise + count.
+: wc-feed  ( $text -- )
+    $words                            ( $1 .. $n n )
+    0 ?do wc-add loop ;
+
+\ Print every (count, word) row.  No sort.
+: wc-print  ( -- )
+    wc-n @ 0 ?do
+        wc-counts i vec-f@ f>$ $>addr type space
+        wc-words i vec-ref@ $>addr type cr
+    loop ;
+
+: wc-run  ( $text -- )
+    wc-init wc-feed wc-print ;
+"#;
+
+#[test]
+fn v2s_integration_word_frequency_demo() {
+    let mut s = sess_with_core();
+    let mut script = String::from(WORDCOUNT_DEMO_SRC);
+    script.push_str(
+        "\nS$\" the quick brown fox jumps over the lazy dog the fox is quick \
+         the dog is lazy and the brown fox is quicker than the lazy dog\" \
+         wc-run\nbye\n"
+    );
+    let out = s.eval(&script).unwrap();
+    // Each unique token should appear exactly once in the report.
+    // Counts: the=6, fox=3, dog=3, is=3, lazy=3, quick=2, brown=2,
+    // quicker=1, jumps=1, over=1, and=1, than=1.
+    // Output rows look like "<count> <word>\n" — `f>$` for an
+    // integer-valued f64 produces "6" (no decimal point), then
+    // `space` emits one space, then the word, then `cr`.
+    for (word, n) in [
+        ("the", 6), ("fox", 3), ("dog", 3), ("is", 3), ("lazy", 3),
+        ("quick", 2), ("brown", 2), ("quicker", 1), ("jumps", 1),
+        ("over", 1), ("and", 1), ("than", 1),
+    ] {
+        let needle = format!("{n} {word}\n");
+        assert!(out.contains(&needle),
+            "expected row {needle:?}; output:\n{out}");
+    }
+}
+
 // ── V2s stage E — UTF-8, floats, char$, $words ────────────────────
 
 #[test]
