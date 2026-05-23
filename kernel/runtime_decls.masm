@@ -38,3 +38,16 @@
 @extern rt_sb_append_codepoint(2); (builder_tagged, codepoint) -> 0 or u64::MAX
 @extern rt_sb_append_int(2)     ; (builder_tagged, n) -> 0 or u64::MAX
 @extern rt_sb_to_string(2)      ; (UP, builder_tagged) -> tagged String (or u64::MAX)
+@extern rt_string_concat(3)     ; (UP, tagged_a, tagged_b) -> tagged String (or u64::MAX)
+@extern rt_string_slice(4)      ; (UP, tagged, start, end) -> tagged String (or u64::MAX)
+@extern rt_string_find(2)       ; (needle, haystack) -> byte idx (or u64::MAX = -1)
+@extern rt_string_starts(2)     ; (prefix, s) -> -1 if match, else 0
+@extern rt_string_ends(2)       ; (suffix, s) -> -1 if match, else 0
+@extern rt_string_cmp(2)        ; (a, b) -> -1 / 0 / +1
+@extern rt_string_hash(1)       ; (tagged) -> u64 hash
+@extern rt_string_ci_eq(2)      ; (a, b) -> -1 if ASCII-ci-equal, else 0
+@extern rt_string_trim(2)       ; (UP, tagged) -> tagged String
+@extern rt_string_ltrim(2)      ; (UP, tagged) -> tagged String
+@extern rt_string_rtrim(2)      ; (UP, tagged) -> tagged String
+@extern rt_int_to_string(2)     ; (UP, n) -> tagged String
+@extern rt_string_to_int(2)     ; (tagged, out_value_addr) -> -1 if parsed, 0 if not

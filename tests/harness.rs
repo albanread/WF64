@@ -3541,6 +3541,264 @@ fn sb_round_trip_through_to_string() {
         "concatenated output wrong; got {out:?}");
 }
 
+// ── V2s stage C2 — operations library ─────────────────────────────
+
+#[test]
+fn str_concat_produces_fresh_string() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" foo\" >$ s\" bar\" >$ $+ $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("foobar"), "got {out:?}");
+}
+
+#[test]
+fn str_concat_empty_left() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "empty$ s\" tail\" >$ $+ $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("tail"), "got {out:?}");
+}
+
+#[test]
+fn str_concat_empty_right() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" head\" >$ empty$ $+ $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("head"), "got {out:?}");
+}
+
+#[test]
+fn str_slice_basic() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" hello world\" >$ 6 11 $slice $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("world"), "got {out:?}");
+}
+
+#[test]
+fn str_slice_empty_range() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" hello\" >$ 2 2 $slice $len .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("0  ok"), "expected empty slice; got {out:?}");
+}
+
+#[test]
+fn str_slice_out_of_bounds_throws() {
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "s\" hello\" >$ 0 99 $slice drop\nbye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2058"),
+        "out-of-bounds $slice should throw -2058; got {msg}");
+}
+
+#[test]
+fn str_find_present() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" world\" >$ s\" hello world\" >$ $find .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("6  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_find_absent_returns_minus_one() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" xyz\" >$ s\" hello\" >$ $find .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("-1  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_find_empty_needle_matches_at_zero() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "empty$ s\" hello\" >$ $find .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("0  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_starts_and_ends() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" hel\" >$ s\" hello\" >$ $starts? .\n\
+         s\" llo\" >$ s\" hello\" >$ $ends? .\n\
+         s\" xyz\" >$ s\" hello\" >$ $starts? .\n\
+         s\" xyz\" >$ s\" hello\" >$ $ends? .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![-1, -1, 0, 0],
+        "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_cmp_orders_correctly() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" abc\" >$ s\" abd\" >$ $cmp .\n\
+         s\" abd\" >$ s\" abc\" >$ $cmp .\n\
+         s\" abc\" >$ s\" abc\" >$ $cmp .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![-1, 1, 0], "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_hash_same_bytes_same_hash() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" hello\" >$ $hash .\n\
+         s\" hello\" >$ $hash .\n\
+         s\" world\" >$ $hash .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums.len(), 3);
+    assert_eq!(nums[0], nums[1], "identical bytes should hash equal; got {nums:?}");
+    assert_ne!(nums[0], nums[2], "different bytes should hash differently; got {nums:?}");
+}
+
+#[test]
+fn str_ci_eq_ascii() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" Hello\" >$ s\" hello\" >$ $ci= .\n\
+         s\" HELLO\" >$ s\" hello\" >$ $ci= .\n\
+         s\" hello\" >$ s\" world\" >$ $ci= .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![-1, -1, 0], "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_trim_strips_whitespace_both_ends() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\"    hello world   \" >$ $trim $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    // After trim, the byte content should be exactly "hello world".
+    assert!(out.contains("hello world"), "got {out:?}");
+    // The leading whitespace should be gone — check by length.
+    let out2 = s.eval(
+        "s\"    abc \" >$ $trim $len .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out2.contains("3  ok"), "$trim length wrong; got {out2:?}");
+}
+
+#[test]
+fn str_ltrim_rtrim() {
+    // `s"   abc   "` — `s"` consumes ONE leading space (the
+    // standard delimiter), so the parsed bytes are 2 leading + "abc"
+    // + 3 trailing = 8 bytes.  After ltrim: "abc   " = 6.  After
+    // rtrim: "  abc" = 5.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\"   abc   \" >$ $ltrim $len .\n\
+         s\"   abc   \" >$ $rtrim $len .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![6, 5], "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_n_to_string_decimal_round_trip() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "42 n>$ $>addr type cr\n\
+         -17 n>$ $>addr type cr\n\
+         0 n>$ $>addr type cr\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("42\n"), "got {out:?}");
+    assert!(out.contains("-17\n"), "got {out:?}");
+    assert!(out.contains("0\n"), "got {out:?}");
+}
+
+#[test]
+fn str_to_n_parses_decimal() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" 123\" >$ $>n . .\n\
+         s\" -42\" >$ $>n . .\n\
+         bye\n"
+    ).unwrap();
+    // On success: ( n true ).  `. .` prints `true value` (top first).
+    // For 123 success: prints "-1 123" → "-1 123".
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![-1, 123, -1, -42], "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_to_n_failure_returns_false() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" not a number\" >$ $>n .\n\
+         bye\n"
+    ).unwrap();
+    // Failure: pushes only 0 (false).
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![0], "got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_empty_string_has_zero_length() {
+    let mut s = sess_with_core();
+    let out = s.eval("empty$ $len .\nbye\n").unwrap();
+    assert!(out.contains("0  ok"), "got {out:?}");
+}
+
+#[test]
+fn str_ops_compose() {
+    // Realistic composition: take a string, slice the middle,
+    // concat with a prefix, compare.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "s\" hello, world!\" >$ 7 12 $slice            ( \"world\" )\n\
+         s\" hello \" >$ swap $+                        ( \"hello world\" )\n\
+         s\" hello world\" >$ $= .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("-1  ok"),
+        "expected $= true after compose; got {out:?}");
+}
+
 #[test]
 fn gc_vec_f_fetch_wrong_type_still_throws_minus_2060() {
     // Make sure -2060 still fires when the slot holds something with

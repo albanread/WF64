@@ -892,6 +892,270 @@ pub extern "C" fn rt_sb_to_string(up: u64, builder_tagged: u64) -> u64 {
     tagged
 }
 
+// ── String operations (V2s stage C2) ─────────────────────────────────
+
+/// Read (payload_addr, length) from a String tagged pointer.
+/// Caller MUST have verified the tag is `TAG_STRING`.
+#[inline]
+unsafe fn string_payload(tagged: u64) -> (*const u8, usize) {
+    let base = (tagged & !7) as *const u64;
+    let hdr = unsafe { *base };
+    let len = ((hdr >> 5) & 0xFF_FFFF) as usize;
+    let payload = unsafe { (base as *const u8).add(8) };
+    (payload, len)
+}
+
+/// Concatenate two `String` payloads into a fresh `String`.
+/// Caller must have type-checked both inputs.  Returns tagged
+/// `String` ptr or `u64::MAX` on failure.
+///
+/// Allocates directly via `gc::alloc_string` (rather than going
+/// through `rt_string_from_bytes`) so we can write the two source
+/// halves into the payload without a phantom memcpy from a synthetic
+/// "merged" buffer.  Fragmentation-retry mirrors the other paths.
+#[no_mangle]
+pub extern "C" fn rt_string_concat(up: u64, tagged_a: u64, tagged_b: u64) -> u64 {
+    let (a_ptr, a_len) = unsafe { string_payload(tagged_a) };
+    let (b_ptr, b_len) = unsafe { string_payload(tagged_b) };
+    let total = a_len + b_len;
+    if total > u32::MAX as usize {
+        eprintln!("$+: combined length {total} exceeds u32::MAX");
+        return u64::MAX;
+    }
+    let tagged = match gc::alloc_string(total as u32) {
+        Some(t) => t,
+        None => {
+            let payload_cells = ((total + 7) / 8) as u64;
+            if payload_cells > PAGE_SIZE_CELLS {
+                let regions = gc_root_regions(up);
+                unsafe { gc::collect_full(&regions); }
+                match gc::alloc_string(total as u32) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("$+: out of GC heap (combined len {total}, post-compaction retry failed)");
+                        return u64::MAX;
+                    }
+                }
+            } else {
+                eprintln!("$+: out of GC heap (combined len {total})");
+                return u64::MAX;
+            }
+        }
+    };
+    let base = tagged & !7;
+    let dst = (base + 8) as *mut u8;
+    unsafe {
+        if a_len > 0 {
+            std::ptr::copy_nonoverlapping(a_ptr, dst, a_len);
+        }
+        if b_len > 0 {
+            std::ptr::copy_nonoverlapping(b_ptr, dst.add(a_len), b_len);
+        }
+    }
+    tagged
+}
+
+/// Build a fresh `String` from the byte slice `tagged[start..end)`.
+/// Caller guarantees `start <= end <= len`.  Returns tagged String
+/// or `u64::MAX` on alloc failure.
+#[no_mangle]
+pub extern "C" fn rt_string_slice(
+    up: u64,
+    tagged: u64,
+    start: u64,
+    end: u64,
+) -> u64 {
+    let (payload, len) = unsafe { string_payload(tagged) };
+    let len = len as u64;
+    if start > end || end > len {
+        eprintln!("$slice: bounds [{start}, {end}) out of range for len {len}");
+        return u64::MAX;
+    }
+    let slice_len = end - start;
+    let src = unsafe { payload.add(start as usize) };
+    rt_string_from_bytes(up, src as u64, slice_len)
+}
+
+/// Find the first occurrence of `needle` in `haystack` (byte
+/// search, no Unicode normalisation).  Returns the byte index or
+/// `u64::MAX` (= -1 in Forth-signed) if not found.  Empty needle
+/// matches at index 0.  Caller type-checks both inputs.
+#[no_mangle]
+pub extern "C" fn rt_string_find(needle: u64, haystack: u64) -> u64 {
+    let (n_ptr, n_len) = unsafe { string_payload(needle) };
+    let (h_ptr, h_len) = unsafe { string_payload(haystack) };
+    if n_len == 0 {
+        return 0;
+    }
+    if n_len > h_len {
+        return u64::MAX;
+    }
+    let n_slice = unsafe { std::slice::from_raw_parts(n_ptr, n_len) };
+    let h_slice = unsafe { std::slice::from_raw_parts(h_ptr, h_len) };
+    // Naive memmem; good enough for V2s stage C2.
+    for i in 0..=(h_len - n_len) {
+        if &h_slice[i..i + n_len] == n_slice {
+            return i as u64;
+        }
+    }
+    u64::MAX
+}
+
+/// True iff `prefix` matches the first `prefix.len` bytes of `s`.
+#[no_mangle]
+pub extern "C" fn rt_string_starts(prefix: u64, s: u64) -> u64 {
+    let (p_ptr, p_len) = unsafe { string_payload(prefix) };
+    let (s_ptr, s_len) = unsafe { string_payload(s) };
+    if p_len > s_len {
+        return 0;
+    }
+    let p_slice = unsafe { std::slice::from_raw_parts(p_ptr, p_len) };
+    let s_slice = unsafe { std::slice::from_raw_parts(s_ptr, p_len) };
+    if p_slice == s_slice { u64::MAX } else { 0 }
+}
+
+/// True iff `suffix` matches the last `suffix.len` bytes of `s`.
+#[no_mangle]
+pub extern "C" fn rt_string_ends(suffix: u64, s: u64) -> u64 {
+    let (p_ptr, p_len) = unsafe { string_payload(suffix) };
+    let (s_ptr, s_len) = unsafe { string_payload(s) };
+    if p_len > s_len {
+        return 0;
+    }
+    let s_tail = unsafe { s_ptr.add(s_len - p_len) };
+    let p_slice = unsafe { std::slice::from_raw_parts(p_ptr, p_len) };
+    let s_slice = unsafe { std::slice::from_raw_parts(s_tail, p_len) };
+    if p_slice == s_slice { u64::MAX } else { 0 }
+}
+
+/// Lexicographic byte compare.  Returns -1 if a < b, 0 if equal,
+/// +1 if a > b.  Same convention as memcmp's sign / Rust's
+/// `Ord::cmp`.
+#[no_mangle]
+pub extern "C" fn rt_string_cmp(tagged_a: u64, tagged_b: u64) -> u64 {
+    let (a_ptr, a_len) = unsafe { string_payload(tagged_a) };
+    let (b_ptr, b_len) = unsafe { string_payload(tagged_b) };
+    let a = unsafe { std::slice::from_raw_parts(a_ptr, a_len) };
+    let b = unsafe { std::slice::from_raw_parts(b_ptr, b_len) };
+    match a.cmp(b) {
+        std::cmp::Ordering::Less    => (-1i64) as u64,
+        std::cmp::Ordering::Equal   => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// FxHash-style 64-bit hash of the byte payload.  Cheap,
+/// non-cryptographic; suitable for hash-table keys within a
+/// single process run.  Identical inputs hash identically across
+/// calls.
+#[no_mangle]
+pub extern "C" fn rt_string_hash(tagged: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut h: u64 = 0xcbf29ce484222325; // FNV-1a 64-bit basis
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// ASCII-only case-insensitive equality.  Non-ASCII bytes
+/// compare as-is (no Unicode folding — that's a later stage).
+#[no_mangle]
+pub extern "C" fn rt_string_ci_eq(tagged_a: u64, tagged_b: u64) -> u64 {
+    let (a_ptr, a_len) = unsafe { string_payload(tagged_a) };
+    let (b_ptr, b_len) = unsafe { string_payload(tagged_b) };
+    if a_len != b_len {
+        return 0;
+    }
+    let a = unsafe { std::slice::from_raw_parts(a_ptr, a_len) };
+    let b = unsafe { std::slice::from_raw_parts(b_ptr, b_len) };
+    for i in 0..a_len {
+        if a[i].eq_ignore_ascii_case(&b[i]) {
+            continue;
+        }
+        return 0;
+    }
+    u64::MAX
+}
+
+/// Trim ASCII whitespace from both ends, return a fresh String.
+/// (Unicode whitespace handling is V2s stage D.)
+#[no_mangle]
+pub extern "C" fn rt_string_trim(up: u64, tagged: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut start = 0;
+    let mut end = len;
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let new_len = (end - start) as u64;
+    rt_string_from_bytes(up, unsafe { ptr.add(start) as u64 }, new_len)
+}
+
+/// Trim ASCII whitespace from the left only.
+#[no_mangle]
+pub extern "C" fn rt_string_ltrim(up: u64, tagged: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut start = 0;
+    while start < len && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let new_len = (len - start) as u64;
+    rt_string_from_bytes(up, unsafe { ptr.add(start) as u64 }, new_len)
+}
+
+/// Trim ASCII whitespace from the right only.
+#[no_mangle]
+pub extern "C" fn rt_string_rtrim(up: u64, tagged: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut end = len;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    rt_string_from_bytes(up, ptr as u64, end as u64)
+}
+
+/// Format a signed integer as a decimal `String`.
+#[no_mangle]
+pub extern "C" fn rt_int_to_string(up: u64, n: u64) -> u64 {
+    let s = (n as i64).to_string();
+    rt_string_from_bytes(up, s.as_ptr() as u64, s.len() as u64)
+}
+
+/// Parse `tagged` as a signed decimal integer.  Returns
+/// `(value, true)` on the data stack — wait, we can't return two
+/// values from a single C function easily.  Use a different shape:
+/// returns `value` on success or stashes a flag via the kernel's
+/// out-pointer.
+///
+/// Simpler convention: returns `u64::MAX` on parse failure (caller
+/// surfaces as "false" with no value pushed), otherwise the
+/// parsed value (and the kernel pushes both value + true).
+#[no_mangle]
+pub extern "C" fn rt_string_to_int(tagged: u64, out_value: u64) -> u64 {
+    let (ptr, len) = unsafe { string_payload(tagged) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let s = match std::str::from_utf8(bytes) {
+        Ok(s) => s.trim(),
+        Err(_) => return 0,
+    };
+    match s.parse::<i64>() {
+        Ok(n) => {
+            unsafe { *(out_value as *mut i64) = n; }
+            u64::MAX
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Compile-mode helper for `S$"`.  Allocates a LITERAL slot,
 /// allocates a fresh `String` GC object copying `len` bytes from
 /// `src_addr`, stores the tagged pointer into the literal slot,

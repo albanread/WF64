@@ -604,6 +604,534 @@ proc(sb_to_string_word)
 endp()
 
 
+; ── String operations (V2s stage C2) ────────────────────────────────
+
+
+; $+  ( $a $b -- $c )
+;     Allocate a fresh String containing $a's bytes followed by
+;     $b's.  Operands unchanged.  Throws -2060 on wrong type,
+;     -2061 on nil, -2059 on alloc failure.
+proc(string_concat_word)
+    ; Stack: $b in TOS, $a at [DSP].
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, UP
+    mov     rdx, r11                                ; $a
+    mov     r8,  r9                                 ; $b
+    win64_call(rt_string_concat)
+    cmp     rax, -1
+    je      .alloc_err
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.alloc_err:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2059
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $slice  ( $h start end -- $s )
+;     Fresh String containing bytes [start, end) of $h.  end
+;     exclusive.  Throws -2058 on out-of-bounds, -2060 on wrong
+;     type, -2061 on nil.
+proc(string_slice_word)
+    ; Stack: end in TOS, start at [DSP], $h at [DSP+cell].
+    ; Type-check $h (NNOS).
+    mov     r9, [DSP + cell]                        ; $h
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    ; Build args.
+    mov     rcx, UP                                 ; arg1: up
+    mov     rdx, r9                                 ; arg2: $h
+    mov     r8,  [DSP]                              ; arg3: start
+    mov     r9,  TOS                                ; arg4: end
+    win64_call(rt_string_slice)
+    cmp     rax, -1
+    je      .bounds
+    ; ( $h start end -- $s ): 3 in, 1 out.
+    mov     TOS, rax
+    stk(2, 0)
+    next()
+.bounds:
+    ; Drop 3, push -2058.
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2058
+    stk(0, 1)
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + 2*cell]
+    add     DSP, 3*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $find  ( $needle $haystack -- byte-idx | -1 )
+;     First index of needle in haystack (byte search).  Empty
+;     needle returns 0.  Returns -1 if not found.
+proc(string_find_word)
+    mov     r9, TOS                                 ; $haystack
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]                              ; $needle
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r11
+    mov     rdx, r9
+    win64_call(rt_string_find)
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; Helper macro thinking: $starts?, $ends?, $cmp, $ci= all share the
+; "type-check two Strings, call extern with (NOS, TOS), replace
+; with rax" pattern.  Inline each for clarity.
+
+
+; $starts?  ( $prefix $h -- f )
+proc(string_starts_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r11
+    mov     rdx, r9
+    win64_call(rt_string_starts)
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $ends?  ( $suffix $h -- f )
+proc(string_ends_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r11
+    mov     rdx, r9
+    win64_call(rt_string_ends)
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $cmp  ( $a $b -- n )    -1 / 0 / +1 (memcmp-style)
+proc(string_cmp_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r11
+    mov     rdx, r9
+    win64_call(rt_string_cmp)
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $hash  ( $h -- u )
+proc(string_hash_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r9
+    win64_call(rt_string_hash)
+    mov     TOS, rax
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; $ci=  ( $a $b -- f )   ASCII case-insensitive equality
+proc(string_ci_eq_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     r11, [DSP]
+    test    r11, r11
+    jz      .nil
+    mov     r10, r11
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, r11
+    mov     rdx, r9
+    win64_call(rt_string_ci_eq)
+    mov     TOS, rax
+    stk(1, 0)
+    next()
+.wrong:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2060
+    stk(0, 1)
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2061
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
+; $trim, $ltrim, $rtrim  ( $h -- $s )
+;     ASCII whitespace trim, both/left/right.
+proc(string_trim_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, UP
+    mov     rdx, r9
+    win64_call(rt_string_trim)
+    cmp     rax, -1
+    je      .alloc_err
+    mov     TOS, rax
+    next()
+.alloc_err:
+    mov     TOS, -2059
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+proc(string_ltrim_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, UP
+    mov     rdx, r9
+    win64_call(rt_string_ltrim)
+    cmp     rax, -1
+    je      .alloc_err
+    mov     TOS, rax
+    next()
+.alloc_err:
+    mov     TOS, -2059
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+proc(string_rtrim_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    mov     rcx, UP
+    mov     rdx, r9
+    win64_call(rt_string_rtrim)
+    cmp     rax, -1
+    je      .alloc_err
+    mov     TOS, rax
+    next()
+.alloc_err:
+    mov     TOS, -2059
+    call    throw_word
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; n>$  ( n -- $s )
+;     Format signed integer n as a decimal String.
+proc(int_to_string_word)
+    mov     rcx, UP
+    mov     rdx, TOS
+    win64_call(rt_int_to_string)
+    cmp     rax, -1
+    je      .err
+    mov     TOS, rax
+    next()
+.err:
+    mov     TOS, -2059
+    call    throw_word
+    next()
+endp()
+
+
+; $>n  ( $h -- n true | false )
+;     Parse $h as a signed decimal integer.  On success pushes the
+;     parsed value and -1 (true); on failure pushes only 0 (false).
+;     Leading/trailing whitespace is trimmed before parsing.
+proc(string_to_int_word)
+    mov     r9, TOS
+    test    r9, r9
+    jz      .nil
+    mov     r10, r9
+    and     r10, 7
+    cmp     r10, 4
+    jne     .wrong
+    ; Reserve a stack slot to hold the out value.  We'll use PAD
+    ; for this — needs no allocation, the result is read out
+    ; before we leave the proc.
+    lea     r10, [UP + user_PAD]
+    mov     rcx, r9
+    mov     rdx, r10
+    win64_call(rt_string_to_int)
+    test    rax, rax
+    jz      .parse_fail
+    ; rax = -1 (success).  Push value then -1.
+    ; Stack before: TOS = $h.  After: NOS = parsed_value, TOS = -1.
+    mov     r10, [UP + user_PAD]                    ; parsed value
+    mov     [DSP - cell], r10                       ; new NOS = parsed value
+    mov     TOS, -1                                 ; TOS = true
+    stk(0, 1)                                       ; one extra cell allocated
+    next()
+.parse_fail:
+    ; Replace $h with 0 (false).
+    mov     TOS, 0
+    next()
+.wrong:
+    mov     TOS, -2060
+    call    throw_word
+    next()
+.nil:
+    mov     TOS, -2061
+    call    throw_word
+    next()
+endp()
+
+
+; empty$  ( -- $ )
+;     Push a fresh zero-length String.  Mostly useful as the
+;     starting value before a concatenation loop.
+;
+;     NOTE on push-pattern: spill old TOS to memory BEFORE the
+;     Win64 call.  rt_string_from_bytes returns its result in rax
+;     (= our cached TOS), so any post-call attempt to spill the
+;     OLD TOS would actually spill the NEW value — silently
+;     corrupting the caller's stack.  Same hazard as gc-cycle.
+proc(empty_string_word)
+    mov     [DSP - cell], TOS                       ; spill old TOS first
+    mov     rcx, UP
+    xor     rdx, rdx                                ; src=0 (ignored when len=0)
+    xor     r8,  r8                                 ; len=0
+    win64_call(rt_string_from_bytes)
+    cmp     rax, -1
+    je      .err
+    mov     TOS, rax
+    stk(0, 1)
+    next()
+.err:
+    mov     TOS, -2059
+    call    throw_word
+    next()
+endp()
+
+
 ; !$  ( $ handle -- )
 ;     Store a managed String pointer into a HEAPPTR slot.
 ;     Accepts nil ($ = 0) to allow clearing a slot; otherwise the
