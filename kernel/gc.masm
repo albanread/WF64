@@ -213,6 +213,29 @@ proc(vec_alloc_refs_store)
 endp()
 
 
+; !heapptr  ( tagged handle -- )
+;     Store `tagged` (a tagged GC pointer or nil) into the HEAPPTR
+;     slot at [handle].  Functionally equivalent to `!` today, but
+;     it's the conceptual hook for future card-marking: when V2c
+;     wires up the static-region card table (see
+;     docs/forth_gc_needs.md item #1), this is where we'll call
+;     into paged_gc to dirty the card containing [handle].
+;
+;     Right now the HEAPPTR region is fully rescanned on every
+;     minor GC, so the barrier is a no-op — but using `!heapptr`
+;     instead of raw `!` is the intent signal that lets us add the
+;     barrier later in one place without touching client code.
+proc(store_heapptr_word)
+    ; Stack: handle in TOS, tagged at [DSP].
+    mov     r9, [DSP]                               ; tagged value
+    mov     qword ptr [TOS], r9                     ; store into slot
+    ; Drop both args.
+    mov     TOS, [DSP + cell]
+    stk(2, 0)
+    next()
+endp()
+
+
 ; gc-cycle  ( -- n )
 ;     Push the current GC cycle counter (monotonic, incremented on
 ;     each major or minor collection).  See V2 in docs/gc_design.md:

@@ -2825,6 +2825,162 @@ fn gc_auto_collects_does_not_lose_rooted_data() {
 }
 
 #[test]
+fn gc_store_heapptr_copies_tagged_pointer() {
+    // V2-B: `!heapptr` is the safe-by-intent way to copy a tagged
+    // pointer from one HEAPPTR to another (or to nil out a slot).
+    // After `a @ b !heapptr`, both slots reference the same vector
+    // and reading payload via b returns what was written via a.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR a\n\
+         HEAPPTR b\n\
+         4 a vec-alloc-floats!\n\
+         7.25e a 2 vec-f!\n\
+         a @ b !heapptr\n\
+         b 2 vec-f@ f.\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("7.250000"),
+        "b should see the cell a wrote; got {out:?}");
+}
+
+#[test]
+fn gc_store_heapptr_can_nil_a_slot() {
+    // Storing 0 (nil) via !heapptr makes the slot vec-len-able
+    // throw -2061 the way a freshly-declared HEAPPTR does.
+    let mut s = sess_with_core();
+    let err = s.eval(
+        "HEAPPTR a\n\
+         4 a vec-alloc-floats!\n\
+         0 a !heapptr\n\
+         a vec-len .\n\
+         bye\n"
+    ).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("-2061"),
+        "nil'd slot should throw -2061; got {msg}");
+}
+
+#[test]
+fn gc_store_heapptr_survives_subsequent_collection() {
+    // After !heapptr from a → b, run (gc).  Both slots should
+    // resolve to the (possibly relocated) object, and the payload
+    // should be intact.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        "HEAPPTR a\n\
+         HEAPPTR b\n\
+         4 a vec-alloc-floats!\n\
+         1.5e a 0 vec-f!\n\
+         2.5e a 1 vec-f!\n\
+         a @ b !heapptr\n\
+         (gc)\n\
+         a 0 vec-f@ f.\n\
+         a 1 vec-f@ f.\n\
+         b 0 vec-f@ f.\n\
+         b 1 vec-f@ f.\n\
+         bye\n"
+    ).unwrap();
+    // Each value should appear twice (once via a, once via b).
+    assert_eq!(out.matches("1.500000").count(), 2,
+        "cell 0 should be readable via both a and b post-GC; got {out:?}");
+    assert_eq!(out.matches("2.500000").count(), 2,
+        "cell 1 should be readable via both a and b post-GC; got {out:?}");
+}
+
+#[test]
+fn gc_long_running_promotes_and_survives() {
+    // Tenure-promotion stress test.  Allocate a rooted vector,
+    // then run a large number of minor GCs interleaved with
+    // throw-away allocations.  paged_gc promotes G0 → G1 → Tenured
+    // across multiple cycles; after 20+ cycles the rooted object
+    // is definitely tenured.  Verify the payload is still intact.
+    //
+    // This is the read-only half of the V2 generational stress
+    // test from docs/gc_design.md ("allocate young, promote to
+    // old via repeated collections").  The "mutate old to point
+    // at young" half needs vec-ref! (V3 + write barrier), which
+    // hasn't landed yet — see docs/forth_gc_needs.md item #2.
+    let mut s = sess_with_core();
+    let mut script = String::from(
+        "HEAPPTR rooted\n\
+         HEAPPTR scratch\n\
+         8 rooted vec-alloc-floats!\n\
+         1.5e rooted 0 vec-f!\n\
+         2.5e rooted 1 vec-f!\n\
+         3.5e rooted 2 vec-f!\n\
+         4.5e rooted 3 vec-f!\n\
+         5.5e rooted 4 vec-f!\n\
+         6.5e rooted 5 vec-f!\n\
+         7.5e rooted 6 vec-f!\n\
+         8.5e rooted 7 vec-f!\n"
+    );
+    // 25 rounds of (alloc-throwaway, gc-minor) — enough to promote
+    // and exercise multiple promotion-cycle transitions.
+    for _ in 0..25 {
+        script.push_str("16 scratch vec-alloc-floats!\ngc-minor\n");
+    }
+    script.push_str(
+        "gc-cycle .\n\
+         rooted 0 vec-f@ f.\n\
+         rooted 1 vec-f@ f.\n\
+         rooted 2 vec-f@ f.\n\
+         rooted 3 vec-f@ f.\n\
+         rooted 4 vec-f@ f.\n\
+         rooted 5 vec-f@ f.\n\
+         rooted 6 vec-f@ f.\n\
+         rooted 7 vec-f@ f.\n\
+         bye\n"
+    );
+    let out = s.eval(&script).unwrap();
+    // gc-cycle should reflect at least our 25 explicit gc-minor
+    // calls (possibly more if auto-GC fired too).
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert!(nums.first().copied().unwrap_or(0) >= 25,
+        "expected >=25 gc cycles; got {nums:?} from start of {out:?}");
+    for v in [
+        "1.500000", "2.500000", "3.500000", "4.500000",
+        "5.500000", "6.500000", "7.500000", "8.500000",
+    ] {
+        assert!(out.contains(v),
+            "payload cell {v} lost across {} cycles; got {out:?}",
+            nums.first().copied().unwrap_or(0));
+    }
+}
+
+#[test]
+fn gc_many_rooted_vectors_all_survive() {
+    // Stress: bind ten HEAPPTRs to ten distinct vectors, each
+    // with a unique marker cell.  Run many minor collections.
+    // All ten markers should still be readable.
+    let mut s = sess_with_core();
+    let mut script = String::new();
+    for i in 0..10 {
+        script.push_str(&format!("HEAPPTR slot{i}\n"));
+    }
+    for i in 0..10 {
+        script.push_str(&format!(
+            "4 slot{i} vec-alloc-floats!\n{i}.5e slot{i} 0 vec-f!\n"
+        ));
+    }
+    for _ in 0..15 {
+        script.push_str("gc-minor\n");
+    }
+    for i in 0..10 {
+        script.push_str(&format!("slot{i} 0 vec-f@ f.\n"));
+    }
+    script.push_str("bye\n");
+    let out = s.eval(&script).unwrap();
+    for i in 0..10 {
+        let expected = format!("{i}.500000");
+        assert!(out.contains(&expected),
+            "slot{i} payload lost after 15 cycles; expected {expected}, got {out:?}");
+    }
+}
+
+#[test]
 fn gc_vec_f_fetch_wrong_type_still_throws_minus_2060() {
     // Make sure -2060 still fires when the slot holds something with
     // a non-zero, non-FloatVec tag (e.g., a RefVec).  Distinct from

@@ -105,6 +105,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("(gc)",               "gc_collect_word",          0),
     ("gc-minor",           "gc_collect_minor_word",    0),
     ("gc-cycle",           "gc_cycle_word",            0),
+    ("!heapptr",           "store_heapptr_word",       0),
     ("vec-alloc-floats!",  "vec_alloc_floats_store",   0),
     ("vec-alloc-refs!",    "vec_alloc_refs_store",     0),
     ("vec-f@",             "vec_f_fetch",              0),
