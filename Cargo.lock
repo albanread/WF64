@@ -64,6 +64,8 @@ dependencies = [
  "anyhow",
  "newgc-core",
  "wfasm",
+ "windows",
+ "windows-numerics",
 ]
 
 [[package]]

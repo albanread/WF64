@@ -39,6 +39,12 @@ use wfasm::{Assembler, Jit};
 pub mod let_lang;
 pub mod gc;
 
+// iGui — Windows MDI front-end, ported from NewCormanLisp.
+// Lives behind cfg(windows); the module file applies its own
+// cfg(windows) gates on the renderer/window code.
+#[cfg(windows)]
+pub mod igui;
+
 pub const KERNEL_ENTRY: &str = "kernel/main.masm";
 
 /// (forth_name, asm_symbol, flags). Insertion order = scan order:
