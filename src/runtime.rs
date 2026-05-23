@@ -520,40 +520,71 @@ pub extern "C" fn rt_slurp_pop() -> u64 {
 
 use crate::gc;
 
+/// Threshold above which an allocation is routed through paged_gc's
+/// large-object path (which can fail for lack of contiguous free
+/// pages even when the total free count is enough — see #9 in
+/// forth_gc_needs.md).  Mirrors `newgc_core::page_heap::PAGE_SIZE_CELLS`.
+const PAGE_SIZE_CELLS: u64 = 8192;
+
 /// Allocate a FloatVec of `n_cells` payload cells, store the tagged
 /// pointer at `*slot_addr`.  `slot_addr` is the absolute address of
 /// a HEAPPTR slot (caller's responsibility to ensure it's inside
 /// `user_HEAPPTR_REGION`).
 ///
-/// Returns 0 on success, u64::MAX on allocation failure (heap full).
+/// On allocation failure for a large object (> 1 page payload), we
+/// run a `collect_full` (Tenured compaction) and retry once before
+/// surfacing failure — this rescues the fragmentation-defeat case
+/// where total free pages are enough but no contiguous run is.
+///
+/// Returns 0 on success, u64::MAX on allocation failure (heap full
+/// even after compaction, or `n_cells > u32::MAX`).
 #[no_mangle]
-pub extern "C" fn rt_vec_alloc_floats(n_cells: u64, slot_addr: u64) -> u64 {
+pub extern "C" fn rt_vec_alloc_floats(up: u64, n_cells: u64, slot_addr: u64) -> u64 {
     if n_cells > u32::MAX as u64 {
         eprintln!("vec-alloc-floats!: requested length {n_cells} exceeds u32::MAX");
         return u64::MAX;
     }
-    let Some(tagged) = gc::alloc_floatvec(n_cells as u32) else {
-        eprintln!("vec-alloc-floats!: out of GC heap (requested {n_cells} cells)");
-        return u64::MAX;
-    };
-    unsafe { *(slot_addr as *mut u64) = tagged; }
-    0
+    let n = n_cells as u32;
+    if let Some(tagged) = gc::alloc_floatvec(n) {
+        unsafe { *(slot_addr as *mut u64) = tagged; }
+        return 0;
+    }
+    if n_cells > PAGE_SIZE_CELLS {
+        let regions = gc_root_regions(up);
+        unsafe { gc::collect_full(&regions); }
+        if let Some(tagged) = gc::alloc_floatvec(n) {
+            unsafe { *(slot_addr as *mut u64) = tagged; }
+            return 0;
+        }
+    }
+    eprintln!("vec-alloc-floats!: out of GC heap (requested {n_cells} cells)");
+    u64::MAX
 }
 
 /// Allocate a RefVec of `n_cells` (all initialised to nil), store
-/// the tagged pointer at `*slot_addr`.
+/// the tagged pointer at `*slot_addr`.  Fragmentation-retry path
+/// mirrors `rt_vec_alloc_floats`.
 #[no_mangle]
-pub extern "C" fn rt_vec_alloc_refs(n_cells: u64, slot_addr: u64) -> u64 {
+pub extern "C" fn rt_vec_alloc_refs(up: u64, n_cells: u64, slot_addr: u64) -> u64 {
     if n_cells > u32::MAX as u64 {
         eprintln!("vec-alloc-refs!: requested length {n_cells} exceeds u32::MAX");
         return u64::MAX;
     }
-    let Some(tagged) = gc::alloc_refvec(n_cells as u32) else {
-        eprintln!("vec-alloc-refs!: out of GC heap (requested {n_cells} cells)");
-        return u64::MAX;
-    };
-    unsafe { *(slot_addr as *mut u64) = tagged; }
-    0
+    let n = n_cells as u32;
+    if let Some(tagged) = gc::alloc_refvec(n) {
+        unsafe { *(slot_addr as *mut u64) = tagged; }
+        return 0;
+    }
+    if n_cells > PAGE_SIZE_CELLS {
+        let regions = gc_root_regions(up);
+        unsafe { gc::collect_full(&regions); }
+        if let Some(tagged) = gc::alloc_refvec(n) {
+            unsafe { *(slot_addr as *mut u64) = tagged; }
+            return 0;
+        }
+    }
+    eprintln!("vec-alloc-refs!: out of GC heap (requested {n_cells} cells)");
+    u64::MAX
 }
 
 /// Read the (base, next) pair for both GC root regions —
@@ -600,13 +631,50 @@ pub extern "C" fn rt_gc_collect_minor(up: u64) -> u64 {
 
 /// True (returns 1) when paged_gc's allocation budget has been
 /// exhausted and the next allocation should be preceded by a
-/// minor GC.  The kernel's `vec-alloc-*!` words call this to
-/// decide whether to insert an auto-trigger.
+/// minor GC.  Retained for diagnostics / future opt-out callers;
+/// the kernel allocators now go through `rt_gc_auto_step` instead.
 ///
 /// Returns 0 when no collection is needed.  Never errors.
 #[no_mangle]
 pub extern "C" fn rt_gc_should_collect() -> u64 {
     if gc::should_collect() { 1 } else { 0 }
+}
+
+/// Combined auto-trigger: if `should_collect()` is true, run
+/// `collect_auto` (which chooses minor vs major based on tenure
+/// pressure — see docs/forth_gc_needs.md item #7).  Otherwise
+/// no-op.  Folds the previous "rt_gc_should_collect + maybe
+/// rt_gc_collect_minor" two-call pattern into one extern call
+/// from kernel-side allocators.
+///
+/// Returns 0 always; the auto-cycle's outcome is observable
+/// indirectly via `gc-cycle`.
+#[no_mangle]
+pub extern "C" fn rt_gc_auto_step(up: u64) -> u64 {
+    if !gc::should_collect() {
+        return 0;
+    }
+    let regions = gc_root_regions(up);
+    unsafe { gc::collect_auto(&regions); }
+    0
+}
+
+/// Full stop-the-world collection — compacts Tenured.  Called by
+/// the large-object alloc retry path when `try_alloc_large`
+/// failed for lack of contiguous free pages (paged_gc's page
+/// allocator is linear-scan; scattered free pages can defeat a
+/// multi-page request even when the total free count is enough).
+/// Per docs/forth_gc_needs.md item #9.
+#[no_mangle]
+pub extern "C" fn rt_gc_collect_full(up: u64) -> u64 {
+    let regions = gc_root_regions(up);
+    for (base, next) in regions {
+        if next < base {
+            return u64::MAX;
+        }
+    }
+    unsafe { gc::collect_full(&regions); }
+    0
 }
 
 /// Current value of the GC cycle counter — monotonically incremented
@@ -630,6 +698,9 @@ pub extern "C" fn rt_gc_cycle_count() -> u64 {
 /// readable memory (PAD, dictionary heap, slurped-file buffer); the
 /// copy is independent of the source after this call returns.
 ///
+/// Same fragmentation-retry path as `rt_vec_alloc_*` for strings
+/// whose payload exceeds one page (~64 KB).
+///
 /// Returns the tagged pointer (low 3 bits = `TAG_STRING`) on
 /// success, `u64::MAX` on allocation failure or oversized input.
 ///
@@ -638,14 +709,32 @@ pub extern "C" fn rt_gc_cycle_count() -> u64 {
 /// guarantees this — it gets the (c-addr, u) pair directly from
 /// the Forth data stack.
 #[no_mangle]
-pub extern "C" fn rt_string_from_bytes(src_addr: u64, len: u64) -> u64 {
+pub extern "C" fn rt_string_from_bytes(up: u64, src_addr: u64, len: u64) -> u64 {
     if len > u32::MAX as u64 {
         eprintln!(">$: requested length {len} exceeds u32::MAX");
         return u64::MAX;
     }
-    let Some(tagged) = gc::alloc_string(len as u32) else {
-        eprintln!(">$: out of GC heap (requested {len} bytes)");
-        return u64::MAX;
+    let n = len as u32;
+    let tagged = match gc::alloc_string(n) {
+        Some(t) => t,
+        None => {
+            // Retry via collect_full if this is a large object.
+            let payload_cells = ((len + 7) / 8) as u64;
+            if payload_cells > PAGE_SIZE_CELLS {
+                let regions = gc_root_regions(up);
+                unsafe { gc::collect_full(&regions); }
+                match gc::alloc_string(n) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!(">$: out of GC heap (requested {len} bytes, post-compaction retry failed)");
+                        return u64::MAX;
+                    }
+                }
+            } else {
+                eprintln!(">$: out of GC heap (requested {len} bytes)");
+                return u64::MAX;
+            }
+        }
     };
     if len > 0 {
         // Payload lives at base + 8 (one header cell).  Strip tag
@@ -690,7 +779,7 @@ pub extern "C" fn rt_s_literal_compile_at_here(
     }
 
     // Allocate a String and copy bytes.
-    let tagged = rt_string_from_bytes(src_addr, len);
+    let tagged = rt_string_from_bytes(up, src_addr, len);
     if tagged == u64::MAX {
         return u64::MAX;
     }

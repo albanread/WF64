@@ -31,17 +31,14 @@
 proc(to_string_word)
     ; Stack: u in TOS, c-addr at [DSP].
     ; Stash both in callee-saved regs (r13, r14) so they survive
-    ; rt_gc_should_collect and rt_gc_collect_minor.
+    ; rt_gc_auto_step.
     mov     r14, TOS                                ; u (length)
     mov     r13, [DSP]                              ; c-addr (source)
-    win64_call(rt_gc_should_collect)
-    test    rax, rax
-    jz      .alloc
     mov     rcx, UP
-    win64_call(rt_gc_collect_minor)
-.alloc:
-    mov     rcx, r13                                ; arg1: src_addr
-    mov     rdx, r14                                ; arg2: len
+    win64_call(rt_gc_auto_step)
+    mov     rcx, UP                                 ; arg1: up
+    mov     rdx, r13                                ; arg2: src_addr
+    mov     r8,  r14                                ; arg3: len
     win64_call(rt_string_from_bytes)
     cmp     rax, -1
     je      .err

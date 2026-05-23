@@ -199,6 +199,80 @@ pub unsafe fn collect_minor(regions: &[(u64, u64)]) {
     WF_GC_CYCLES.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
+/// Auto-cycle: paged_gc internally chooses minor vs major based on
+/// `should_collect_major`.  Wraps `PageHeap::collect_auto`.  Walks
+/// the same multi-region root set as `collect_major`/`collect_minor`.
+///
+/// Used by the kernel-side `vec-alloc-*` / `>$` auto-trigger path
+/// in lieu of the older "should_collect ? collect_minor" pair —
+/// the auto variant will upgrade to a major when tenure pressure
+/// crosses the threshold, which the manual minor never would.
+///
+/// # Safety
+/// Same constraints as `collect_major`.
+pub unsafe fn collect_auto(regions: &[(u64, u64)]) {
+    for &(base, next) in regions {
+        debug_assert!(next >= base);
+    }
+
+    with_wf_heap(|heap| {
+        heap.collect_auto(|evac| {
+            for &(base, next) in regions {
+                let n_slots = ((next - base) / 8) as usize;
+                let base_ptr = base as *mut u64;
+                for i in 0..n_slots {
+                    unsafe { evac.visit_cell(base_ptr.add(i)); }
+                }
+            }
+        });
+    });
+    WF_GC_CYCLES.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// Full stop-the-world collection: force-promote all young objects
+/// to Tenured then compact Tenured.  Used by the fragmentation-
+/// retry path in the large-object allocators — when
+/// `try_alloc_large` can't find a contiguous run of free pages, a
+/// `collect_full` may consolidate enough pages that the retry
+/// succeeds.  Don't call casually; this is the expensive cycle.
+///
+/// # Safety
+/// Same constraints as `collect_major`.
+pub unsafe fn collect_full(regions: &[(u64, u64)]) {
+    for &(base, next) in regions {
+        debug_assert!(next >= base);
+    }
+
+    with_wf_heap(|heap| {
+        heap.collect_full(|evac| {
+            for &(base, next) in regions {
+                let n_slots = ((next - base) / 8) as usize;
+                let base_ptr = base as *mut u64;
+                for i in 0..n_slots {
+                    unsafe { evac.visit_cell(base_ptr.add(i)); }
+                }
+            }
+        });
+    });
+    WF_GC_CYCLES.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// Tune paged_gc's allocation-budget floor.  The trigger fires at
+/// `max(budget_min, 0.5 * tenured_used)` after each collection;
+/// default floor is 8 MB.  Small-object-heavy workloads can lower
+/// it to fire collections more aggressively; throughput-focused
+/// large-object workloads can leave the default.
+///
+/// No-op if the heap hasn't been initialised yet.  Persists until
+/// the next `reset_wf_heap`.
+pub fn set_gc_budget_min_bytes(bytes: usize) {
+    WF_HEAP.with(|cell| {
+        if let Some(h) = cell.borrow_mut().as_mut() {
+            h.set_gc_budget_min_bytes(bytes);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

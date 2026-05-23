@@ -153,17 +153,19 @@ endp()
 proc(vec_alloc_floats_store)
     ; Stack: handle in TOS, n at [DSP].
     ; Stash handle in r14 (callee-saved across Win64 callouts) so it
-    ; survives across rt_gc_should_collect / rt_gc_collect_minor;
-    ; n stays in memory at [DSP] (also stable).
+    ; survives across rt_gc_auto_step.  n stays in memory at [DSP].
+    ;
+    ; Auto-GC: rt_gc_auto_step gates on should_collect() internally
+    ; and runs collect_auto when needed (minor unless tenure
+    ; pressure crosses the threshold, in which case major).
+    ; Per docs/forth_gc_needs.md item #7.
     mov     r14, TOS
-    win64_call(rt_gc_should_collect)
-    test    rax, rax
-    jz      .alloc
     mov     rcx, UP
-    win64_call(rt_gc_collect_minor)
-.alloc:
-    mov     rcx, [DSP]                              ; arg1: n
-    mov     rdx, r14                                ; arg2: handle (slot addr)
+    win64_call(rt_gc_auto_step)
+    ; Allocator now takes UP for the fragmentation-retry path.
+    mov     rcx, UP                                 ; arg1: up
+    mov     rdx, [DSP]                              ; arg2: n
+    mov     r8,  r14                                ; arg3: handle (slot addr)
     win64_call(rt_vec_alloc_floats)
     test    rax, rax
     jnz     .err
@@ -185,17 +187,15 @@ endp()
 ; vec-alloc-refs!  ( n handle -- )
 ;     Allocate an n-cell RefVec (all slots initialised to nil) and
 ;     store the tagged pointer in the HEAPPTR slot at [handle].
-;     V2 auto-GC trigger, same shape as vec-alloc-floats!.
+;     Same auto-step + fragmentation-retry pattern as
+;     vec-alloc-floats!.
 proc(vec_alloc_refs_store)
     mov     r14, TOS
-    win64_call(rt_gc_should_collect)
-    test    rax, rax
-    jz      .alloc
     mov     rcx, UP
-    win64_call(rt_gc_collect_minor)
-.alloc:
-    mov     rcx, [DSP]
-    mov     rdx, r14
+    win64_call(rt_gc_auto_step)
+    mov     rcx, UP
+    mov     rdx, [DSP]
+    mov     r8,  r14
     win64_call(rt_vec_alloc_refs)
     test    rax, rax
     jnz     .err

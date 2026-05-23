@@ -22,12 +22,14 @@
 @extern rt_slurp_pop(0)         ; pop and free the top slurped file
 @extern rt_let_compile(1)       ; compile a LET form (arg = UP)
 @extern rt_code_compile_body(1) ; compile a CODE: body, returns fn_addr (arg = UP)
-@extern rt_vec_alloc_floats(2)  ; (n_cells, slot_addr) -> err — alloc + store
-@extern rt_vec_alloc_refs(2)    ; (n_cells, slot_addr) -> err — alloc + store
+@extern rt_vec_alloc_floats(3)  ; (UP, n_cells, slot_addr) -> err — alloc + store
+@extern rt_vec_alloc_refs(3)    ; (UP, n_cells, slot_addr) -> err — alloc + store
 @extern rt_gc_collect(1)        ; (UP) -> err — major collection
 @extern rt_gc_collect_minor(1)  ; (UP) -> err — minor collection
+@extern rt_gc_collect_full(1)   ; (UP) -> err — Tenured-compacting collection
+@extern rt_gc_auto_step(1)      ; (UP) -> 0 — gated auto-cycle (#7 in forth_gc_needs.md)
 @extern rt_gc_should_collect(0) ; () -> 1 if heap wants a collection, else 0
 @extern rt_gc_cycle_count(0)    ; () -> monotonically-increasing collection counter
-@extern rt_string_from_bytes(2) ; (src_addr, len) -> tagged String ptr (or u64::MAX)
+@extern rt_string_from_bytes(3) ; (UP, src_addr, len) -> tagged String ptr (or u64::MAX)
 @extern rt_string_bytes_equal(2); (tagged_a, tagged_b) -> -1 if bytes match, 0 if not
-@extern rt_s_literal_compile_at_here(3) ; (up, src_addr, len) -> 0 or u64::MAX
+@extern rt_s_literal_compile_at_here(3) ; (UP, src_addr, len) -> 0 or u64::MAX

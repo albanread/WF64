@@ -956,6 +956,8 @@ impl Wf64Session {
                 "rt_vec_alloc_refs"   => Some(runtime::rt_vec_alloc_refs   as *mut c_void),
                 "rt_gc_collect"       => Some(runtime::rt_gc_collect       as *mut c_void),
                 "rt_gc_collect_minor" => Some(runtime::rt_gc_collect_minor as *mut c_void),
+                "rt_gc_collect_full"  => Some(runtime::rt_gc_collect_full  as *mut c_void),
+                "rt_gc_auto_step"     => Some(runtime::rt_gc_auto_step     as *mut c_void),
                 "rt_gc_should_collect" => Some(runtime::rt_gc_should_collect as *mut c_void),
                 "rt_gc_cycle_count"   => Some(runtime::rt_gc_cycle_count   as *mut c_void),
                 "rt_string_from_bytes"  => Some(runtime::rt_string_from_bytes  as *mut c_void),
