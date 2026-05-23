@@ -3196,6 +3196,140 @@ fn str_empty_strings_compare_equal() {
         "two empty strings should compare equal; got {out:?}");
 }
 
+// ── V2s stage B — S$" compile-time literals ──────────────────────
+
+#[test]
+fn str_s_dollar_quote_interpret_mode_pushes_tagged() {
+    // Outside a colon definition, S$" allocates and pushes the
+    // tagged pointer immediately, just like >$ but with the bytes
+    // parsed from the input stream.
+    let mut s = sess_with_core();
+    let out = s.eval("S$\" hello, world\" $>addr type cr\nbye\n").unwrap();
+    assert!(out.contains("hello, world"),
+        "interpret-mode S$\" should produce a usable String; got {out:?}");
+}
+
+#[test]
+fn str_s_dollar_quote_compile_mode_emits_literal() {
+    // Inside a colon def, S$" allocates a LITERAL slot at compile
+    // time; each call to the word pushes the SAME tagged pointer.
+    // We can verify "same" by comparing the printed addresses.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": greet S$\" howdy\" ;\n\
+         greet $>addr type space\n\
+         greet $>addr type cr\n\
+         greet . greet . cr\n\
+         bye\n"
+    ).unwrap();
+    // The body should appear twice.
+    assert_eq!(out.matches("howdy").count(), 2,
+        "greet should produce 'howdy' twice; got {out:?}");
+    // The two tagged-ptr values from `greet .` should be equal.
+    // Pull the numeric tokens out of the final line.
+    let parsed: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert!(parsed.len() >= 2, "expected at least 2 ints; got {parsed:?} from {out:?}");
+    let n = parsed.len();
+    assert_eq!(parsed[n - 2], parsed[n - 1],
+        "two invocations of `greet` should push the same tagged ptr (literal); \
+         got {} and {}", parsed[n-2], parsed[n-1]);
+}
+
+#[test]
+fn str_s_dollar_quote_literal_survives_collection() {
+    // A LITERAL-region slot is a GC root.  Define a word that
+    // returns a literal, force a (gc), then call it again —
+    // the contents should still be readable, even if paged_gc
+    // moved the underlying String.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": label S$\" persistent\" ;\n\
+         label $>addr type cr\n\
+         (gc)\n\
+         label $>addr type cr\n\
+         label $len .\n\
+         bye\n"
+    ).unwrap();
+    assert_eq!(out.matches("persistent").count(), 2,
+        "literal should be readable both pre and post (gc); got {out:?}");
+    assert!(out.contains("10  ok"),
+        "$len should be 10; got {out:?}");
+}
+
+#[test]
+fn str_s_dollar_quote_two_literals_are_distinct() {
+    // Two textually-identical S$" forms allocate TWO slots — V2s
+    // explicitly defers interning (see strings_design.md "out of
+    // scope for V2s").  Distinct objects, equal bytes via $=.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": a S$\" same\" ;\n\
+         : b S$\" same\" ;\n\
+         a b $= .\n\
+         a b = .\n\
+         bye\n"
+    ).unwrap();
+    let nums: Vec<i64> = out.split_whitespace()
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect();
+    assert_eq!(nums, vec![-1, 0],
+        "$= should be true (bytes match), = should be false (distinct objects); \
+         got {nums:?} from {out:?}");
+}
+
+#[test]
+fn str_s_dollar_quote_empty_literal() {
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": nada S$\" \" ;\n\
+         nada $len .\n\
+         bye\n"
+    ).unwrap();
+    assert!(out.contains("0  ok"),
+        "empty literal should have $len 0; got {out:?}");
+}
+
+#[test]
+fn str_s_dollar_quote_many_literals() {
+    // Allocate 32 distinct literals, verify each reads back
+    // correctly after a major GC.  This exercises both the
+    // LITERAL bump pointer and the GC's walk of that region.
+    let mut s = sess_with_core();
+    let mut script = String::new();
+    for i in 0..32 {
+        script.push_str(&format!(": lit{i} S$\" item-{i}\" ;\n"));
+    }
+    script.push_str("(gc)\n");
+    for i in 0..32 {
+        script.push_str(&format!("lit{i} $>addr type cr\n"));
+    }
+    script.push_str("bye\n");
+    let out = s.eval(&script).unwrap();
+    for i in 0..32 {
+        let expected = format!("item-{i}");
+        assert!(out.contains(&expected),
+            "literal {expected} lost; got tail of out:\n{}",
+            &out[out.len().saturating_sub(2000)..]);
+    }
+}
+
+#[test]
+fn str_s_dollar_quote_inside_colon_def_with_other_code() {
+    // S$" can appear mid-definition alongside arithmetic and
+    // legacy words.
+    let mut s = sess_with_core();
+    let out = s.eval(
+        ": describe ( n -- )  S$\" n=\" $>addr type . cr ;\n\
+         42 describe\n\
+         bye\n"
+    ).unwrap();
+    // The TYPE prints "n=", then `.` prints " 42 ", then CR.
+    assert!(out.contains("n=42 "),
+        "mixed colon-def output wrong; got {out:?}");
+}
+
 #[test]
 fn gc_vec_f_fetch_wrong_type_still_throws_minus_2060() {
     // Make sure -2060 still fires when the slot holds something with

@@ -118,6 +118,8 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("$=",                 "string_equal_word",        0),
     ("@$",                 "fetch_string_word",        0),
     ("!$",                 "store_string_word",        0),
+    // V2s stage B: compile-time literal form.
+    ("S$\"",               "s_dollar_quote_word",      1),  // IMMEDIATE
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -579,8 +581,11 @@ const USER_PRIVATE_WID:  u64 = 0x17D0;  // wid of PRIVATE wordlist
 // docs/gc_design.md and kernel/macros.masm.  `pub(crate)` so the
 // runtime module can read them when servicing rt_gc_collect.
 pub(crate) const USER_HEAPPTR_NEXT:  u64 = 0x17E0;  // bump pointer (abs addr)
+pub(crate) const USER_LITERAL_NEXT:  u64 = 0x17E8;  // bump pointer for LITERAL region
 pub(crate) const USER_HEAPPTR_BASE:  u64 = 0x2000;  // first slot of the region
 pub(crate) const HEAPPTR_REGION_SIZE: u64 = 0x1000; // 4 KB = 512 slots
+pub(crate) const USER_LITERAL_BASE:  u64 = 0x3000;  // first slot of LITERAL region
+pub(crate) const LITERAL_REGION_SIZE: u64 = 0x10000; // 64 KB = 8 K slots
 
 /// Words that should be published to the TOOLS wordlist at bootstrap.
 /// Debug / inspection primitives the average user doesn't want in their
@@ -955,6 +960,7 @@ impl Wf64Session {
                 "rt_gc_cycle_count"   => Some(runtime::rt_gc_cycle_count   as *mut c_void),
                 "rt_string_from_bytes"  => Some(runtime::rt_string_from_bytes  as *mut c_void),
                 "rt_string_bytes_equal" => Some(runtime::rt_string_bytes_equal as *mut c_void),
+                "rt_s_literal_compile_at_here" => Some(runtime::rt_s_literal_compile_at_here as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;
@@ -1010,6 +1016,9 @@ impl Wf64Session {
             // already because the user area was VirtualAlloc'd
             // (pages start zero) and nothing has written to it yet.
             write_u64(up, USER_HEAPPTR_NEXT, user_base + USER_HEAPPTR_BASE);
+            // LITERAL region: same shape, distinct region — used by
+            // S$" for compile-time string literals.
+            write_u64(up, USER_LITERAL_NEXT, user_base + USER_LITERAL_BASE);
         }
 
         // Register kernel procs with SEH for symbolic crash dumps.
@@ -1476,18 +1485,25 @@ impl Wf64Session {
         self.write_user_u64(USER_LOCALS_COUNT, 0);
         self.write_user_u64(USER_FP0,          self.user_base + USER_FP_STACK + 0x100);
         self.write_user_u64(USER_FSP,          self.user_base + USER_FP_STACK + 0x100);
-        // HEAPPTR region reset: clear all slots, rewind bump pointer
-        // to the region base, drop the GC heap so the next test gets
-        // a fresh one.
+        // HEAPPTR + LITERAL region reset: clear both slot regions,
+        // rewind both bump pointers to their respective bases, drop
+        // the GC heap so the next test gets a fresh one.
         let heapptr_base = self.user_base + USER_HEAPPTR_BASE;
+        let literal_base = self.user_base + USER_LITERAL_BASE;
         unsafe {
             std::ptr::write_bytes(
                 heapptr_base as *mut u8,
                 0,
                 HEAPPTR_REGION_SIZE as usize,
             );
+            std::ptr::write_bytes(
+                literal_base as *mut u8,
+                0,
+                LITERAL_REGION_SIZE as usize,
+            );
         }
         self.write_user_u64(USER_HEAPPTR_NEXT, heapptr_base);
+        self.write_user_u64(USER_LITERAL_NEXT, literal_base);
         gc::reset_wf_heap();
         self.write_user_u64(USER_INDEX_HERE,   self.boot_index_here);
         self.write_user_u64(USER_INDEX_LATEST, self.boot_index_latest);

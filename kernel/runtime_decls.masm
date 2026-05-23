@@ -30,3 +30,4 @@
 @extern rt_gc_cycle_count(0)    ; () -> monotonically-increasing collection counter
 @extern rt_string_from_bytes(2) ; (src_addr, len) -> tagged String ptr (or u64::MAX)
 @extern rt_string_bytes_equal(2); (tagged_a, tagged_b) -> -1 if bytes match, 0 if not
+@extern rt_s_literal_compile_at_here(3) ; (up, src_addr, len) -> 0 or u64::MAX

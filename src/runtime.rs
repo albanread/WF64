@@ -556,31 +556,45 @@ pub extern "C" fn rt_vec_alloc_refs(n_cells: u64, slot_addr: u64) -> u64 {
     0
 }
 
-/// Run a major GC.  Walks the HEAPPTR region [base, next) as the
-/// root set.  Caller passes `up` (the UP register value); we read
-/// the region's base and bump-pointer from the user area.
+/// Read the (base, next) pair for both GC root regions —
+/// HEAPPTR and LITERAL — from the user area.  Returns
+/// `(heapptr_pair, literal_pair)`.  Either pair may be (b, b)
+/// meaning empty.
+fn gc_root_regions(up: u64) -> [(u64, u64); 2] {
+    let heapptr_next = unsafe { *((up + crate::USER_HEAPPTR_NEXT) as *const u64) };
+    let heapptr_base = up + crate::USER_HEAPPTR_BASE;
+    let literal_next = unsafe { *((up + crate::USER_LITERAL_NEXT) as *const u64) };
+    let literal_base = up + crate::USER_LITERAL_BASE;
+    [(heapptr_base, heapptr_next), (literal_base, literal_next)]
+}
+
+/// Run a major GC.  Walks BOTH the HEAPPTR region and the LITERAL
+/// region as roots (V2s: compile-time string literals live in the
+/// second region).  Caller passes `up` (the UP register value).
 #[no_mangle]
 pub extern "C" fn rt_gc_collect(up: u64) -> u64 {
-    let next = unsafe { *((up + crate::USER_HEAPPTR_NEXT) as *const u64) };
-    let base = up + crate::USER_HEAPPTR_BASE;
-    if next < base {
-        eprintln!("(gc): HEAPPTR_NEXT (0x{next:x}) is below BASE (0x{base:x}) — \
-                   probable user-area corruption");
-        return u64::MAX;
+    let regions = gc_root_regions(up);
+    for (base, next) in regions {
+        if next < base {
+            eprintln!("(gc): root region NEXT (0x{next:x}) is below BASE \
+                       (0x{base:x}) — probable user-area corruption");
+            return u64::MAX;
+        }
     }
-    unsafe { gc::collect_major(base, next); }
+    unsafe { gc::collect_major(&regions); }
     0
 }
 
 /// Run a minor GC.  Same root set as `rt_gc_collect`.
 #[no_mangle]
 pub extern "C" fn rt_gc_collect_minor(up: u64) -> u64 {
-    let next = unsafe { *((up + crate::USER_HEAPPTR_NEXT) as *const u64) };
-    let base = up + crate::USER_HEAPPTR_BASE;
-    if next < base {
-        return u64::MAX;
+    let regions = gc_root_regions(up);
+    for (base, next) in regions {
+        if next < base {
+            return u64::MAX;
+        }
     }
-    unsafe { gc::collect_minor(base, next); }
+    unsafe { gc::collect_minor(&regions); }
     0
 }
 
@@ -643,6 +657,73 @@ pub extern "C" fn rt_string_from_bytes(src_addr: u64, len: u64) -> u64 {
         }
     }
     tagged
+}
+
+/// Compile-mode helper for `S$"`.  Allocates a LITERAL slot,
+/// allocates a fresh `String` GC object copying `len` bytes from
+/// `src_addr`, stores the tagged pointer into the literal slot,
+/// and emits a 22-byte stub at HERE that pushes `[slot_addr]` at
+/// runtime.  HERE is advanced past the stub.
+///
+/// Returns 0 on success; `u64::MAX` on allocation failure or
+/// LITERAL region overflow.  Errors are surfaced to the caller as
+/// throws (caller picks the throw code: -2058 for region overflow,
+/// -2059 for alloc failure).  Stderr-logged for the developer.
+///
+/// # Safety
+/// `up` must be a valid Forth user-area pointer; `src_addr` ..
+/// `src_addr + len` must be readable.
+#[no_mangle]
+pub extern "C" fn rt_s_literal_compile_at_here(
+    up: u64,
+    src_addr: u64,
+    len: u64,
+) -> u64 {
+    // Bounds-check the LITERAL region.
+    let literal_base = up + crate::USER_LITERAL_BASE;
+    let literal_limit = literal_base + crate::LITERAL_REGION_SIZE;
+    let next_addr_ptr = (up + crate::USER_LITERAL_NEXT) as *mut u64;
+    let cur_next = unsafe { *next_addr_ptr };
+    if cur_next + 8 > literal_limit {
+        eprintln!(r#"S$": LITERAL region full (next=0x{cur_next:x}, limit=0x{literal_limit:x})"#);
+        return u64::MAX;
+    }
+
+    // Allocate a String and copy bytes.
+    let tagged = rt_string_from_bytes(src_addr, len);
+    if tagged == u64::MAX {
+        return u64::MAX;
+    }
+
+    // Reserve the slot, store the tagged ptr, bump LITERAL_NEXT.
+    let slot_addr = cur_next;
+    unsafe {
+        *(slot_addr as *mut u64) = tagged;
+        *next_addr_ptr = cur_next + 8;
+    }
+
+    // Emit the runtime stub at HERE.  Stub pushes [slot_addr]
+    // and falls through to the next compiled word in the colon
+    // body — no `ret`, because the colon body is a sequence of
+    // inline calls/operations, not a series of leaf words.
+    //   mov [rbp-8], rax         (4)  48 89 45 F8   - spill TOS
+    //   mov rax, imm64=slot_addr (10) 48 B8 + 8     - rax = slot addr
+    //   mov rax, [rax]           (3)  48 8B 00      - rax = *slot
+    //   sub rbp, 8                (4)  48 83 ED 08  - lower DSP
+    // Total = 21 bytes.  Control falls through.
+    let here = unsafe { *((up + RT_USER_HERE) as *const u64) };
+    let dst = here as *mut u8;
+    unsafe {
+        *dst.add(0)  = 0x48; *dst.add(1)  = 0x89;
+        *dst.add(2)  = 0x45; *dst.add(3)  = 0xF8;
+        *dst.add(4)  = 0x48; *dst.add(5)  = 0xB8;
+        write_u64_le(dst.add(6), slot_addr);
+        *dst.add(14) = 0x48; *dst.add(15) = 0x8B; *dst.add(16) = 0x00;
+        *dst.add(17) = 0x48; *dst.add(18) = 0x83;
+        *dst.add(19) = 0xED; *dst.add(20) = 0x08;
+        *((up + RT_USER_HERE) as *mut u64) = here + 21;
+    }
+    0
 }
 
 /// Byte-compare two `String` payloads.  Returns `u64::MAX` (-1, i.e.

@@ -225,6 +225,63 @@ proc(fetch_string_word)
 endp()
 
 
+; S$"  ( "ccc<quote>" -- $ )                            IMMEDIATE
+;     Compile or interpret a managed-string literal.
+;
+;     Interpret mode: allocate a fresh GC String containing the
+;     bytes between S$" and the closing quote, push the tagged
+;     pointer.  The bytes are copied — the source buffer is not
+;     referenced after this word returns.
+;
+;     Compile mode: allocate a slot in the LITERAL region, allocate
+;     a fresh GC String, store the tagged pointer in the slot, and
+;     emit a stub at HERE that pushes [slot_addr] at runtime.  The
+;     GC root walk covers both HEAPPTR and LITERAL regions, so the
+;     literal survives across collections; if the underlying String
+;     moves, the slot is rewritten in place and the runtime stub
+;     keeps seeing a valid pointer.
+;
+;     Throws -2058 on LITERAL region full or -2059 on alloc failure.
+proc(s_dollar_quote_word)
+    cmp     qword ptr [UP + user_STATE], 0
+    jne     .in_compile
+    ; ── Interpret mode ─────────────────────────────────────────
+    call    skip_optional_source_blank
+    mov     [DSP - cell], TOS
+    mov     TOS, 34                                 ; delimiter = '"'
+    stk(0, 1)
+    call    parse_word                              ; ( -- c-addr u )
+    call    to_string_word                          ; ( c-addr u -- $ )
+    next()
+.in_compile:
+    ; ── Compile mode ───────────────────────────────────────────
+    call    skip_optional_source_blank
+    mov     [DSP - cell], TOS
+    mov     TOS, 34
+    stk(0, 1)
+    call    parse_word                              ; ( -- c-addr u )
+    ; Hand (up, c-addr, u) to the runtime helper.
+    mov     rcx, UP
+    mov     rdx, [DSP]                              ; c-addr
+    mov     r8,  TOS                                ; u
+    win64_call(rt_s_literal_compile_at_here)
+    cmp     rax, -1
+    je      .err
+    ; Success: drop (c-addr u) from the data stack.
+    mov     TOS, [DSP + cell]
+    stk(2, 0)
+    next()
+.err:
+    mov     TOS, [DSP + cell]
+    add     DSP, 2*cell
+    mov     [DSP - cell], TOS
+    mov     TOS, -2058
+    stk(0, 1)
+    call    throw_word
+    next()
+endp()
+
+
 ; !$  ( $ handle -- )
 ;     Store a managed String pointer into a HEAPPTR slot.
 ;     Accepts nil ($ = 0) to allow clearing a slot; otherwise the

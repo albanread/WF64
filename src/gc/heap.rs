@@ -144,46 +144,55 @@ pub fn alloc_string(n_bytes: u32) -> Option<u64> {
     })
 }
 
-/// Run a major GC, walking the HEAPPTR region [base, next) as the
-/// root set.  Each cell in the region gets `evac.visit_cell`'d
-/// precisely.
+/// Run a major GC, walking each `[base, next)` region in `regions`
+/// as a root set.  Each cell gets `evac.visit_cell`'d precisely.
+///
+/// Multi-region so V2s (compile-time string literals) can register
+/// a second LITERAL region alongside HEAPPTR without changing the
+/// per-region scan semantics.
 ///
 /// # Safety
-/// `region_base` and `region_next` must point at 8-byte-aligned
-/// cells in the user-area HEAPPTR region.  `region_next` must be
-/// `>= region_base`.  The cells in between must each hold either
-/// nil (0) or a tagged Wf64Layout pointer.
-pub unsafe fn collect_major(region_base: u64, region_next: u64) {
-    debug_assert!(region_next >= region_base);
-    debug_assert!(region_base & 7 == 0, "region base must be 8-byte aligned");
-    debug_assert!(region_next & 7 == 0, "region next must be 8-byte aligned");
-
-    let n_slots = ((region_next - region_base) / 8) as usize;
-    let base_ptr = region_base as *mut u64;
+/// For every `(base, next)`: both must be 8-byte aligned, `next >=
+/// base`, and the cells in between must each hold either nil (0)
+/// or a tagged `Wf64Layout` pointer.
+pub unsafe fn collect_major(regions: &[(u64, u64)]) {
+    for &(base, next) in regions {
+        debug_assert!(next >= base);
+        debug_assert!(base & 7 == 0, "region base must be 8-byte aligned");
+        debug_assert!(next & 7 == 0, "region next must be 8-byte aligned");
+    }
 
     with_wf_heap(|heap| {
         heap.collect_major(|evac| {
-            for i in 0..n_slots {
-                unsafe { evac.visit_cell(base_ptr.add(i)); }
+            for &(base, next) in regions {
+                let n_slots = ((next - base) / 8) as usize;
+                let base_ptr = base as *mut u64;
+                for i in 0..n_slots {
+                    unsafe { evac.visit_cell(base_ptr.add(i)); }
+                }
             }
         });
     });
     WF_GC_CYCLES.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
-/// Run a minor GC over the same root set.
+/// Run a minor GC over the same multi-region root set.
 ///
 /// # Safety
 /// Same constraints as `collect_major`.
-pub unsafe fn collect_minor(region_base: u64, region_next: u64) {
-    debug_assert!(region_next >= region_base);
-    let n_slots = ((region_next - region_base) / 8) as usize;
-    let base_ptr = region_base as *mut u64;
+pub unsafe fn collect_minor(regions: &[(u64, u64)]) {
+    for &(base, next) in regions {
+        debug_assert!(next >= base);
+    }
 
     with_wf_heap(|heap| {
         heap.collect_minor(|evac| {
-            for i in 0..n_slots {
-                unsafe { evac.visit_cell(base_ptr.add(i)); }
+            for &(base, next) in regions {
+                let n_slots = ((next - base) / 8) as usize;
+                let base_ptr = base as *mut u64;
+                for i in 0..n_slots {
+                    unsafe { evac.visit_cell(base_ptr.add(i)); }
+                }
             }
         });
     });
@@ -249,7 +258,7 @@ mod tests {
 
         let base = region.as_mut_ptr() as u64;
         let next = base + 4 * 8; // 4 slots used
-        unsafe { collect_major(base, next); }
+        unsafe { collect_major(&[(base, next)]); }
 
         // Slot may have been rewritten if the object moved.
         let p_after = region[0];

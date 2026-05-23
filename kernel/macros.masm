@@ -112,8 +112,16 @@
 ; The GC root scan walks [UP + user_HEAPPTR_BASE, user_HEAPPTR_NEXT)
 ; one cell at a time, calling evac.visit_cell on each.
 @assign user_HEAPPTR_NEXT  = 0x17E0  ; bump pointer (abs addr; 0 == empty)
+@assign user_LITERAL_NEXT  = 0x17E8  ; bump pointer for compile-time literals
 @assign user_HEAPPTR_BASE  = 0x2000  ; first slot of the region
 @assign heapptr_region_size = 0x1000 ; 4 KB = 512 slots
+; Compile-time literal region — parallel to HEAPPTR, used by S$"
+; (and any future *.$" / V2s literal forms).  The GC root walk
+; covers both regions; LITERAL slots are monotonically retained
+; within a session (per V2s design — no per-forget reclamation in
+; stage B).  64 KB = 8 K slots.
+@assign user_LITERAL_BASE  = 0x3000
+@assign literal_region_size = 0x10000
 
 ; ── Dictionary header layout ─────────────────────────────────────────
 ; WF64 now models WF32's real header shape rather than the earlier
