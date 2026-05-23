@@ -977,11 +977,14 @@ impl FeditState {
         let status_bg = solid_brush(&target, 0.16, 0.18, 0.22, 1.0);
         let status_fg = solid_brush(&target, 0.80, 0.83, 0.88, 1.0);
         let sel_brush = solid_brush(&target, 0.20, 0.30, 0.55, 1.0);
-        // Syntax-highlighting brushes. Order matches `TokenKind`.
-        let kw_brush = solid_brush(&target, 0.55, 0.78, 1.00, 1.0);
-        let num_brush = solid_brush(&target, 0.95, 0.70, 0.30, 1.0);
-        let str_brush = solid_brush(&target, 0.65, 0.85, 0.55, 1.0);
-        let cmt_brush = solid_brush(&target, 0.50, 0.55, 0.60, 1.0);
+        // Syntax-highlighting brushes (Forth-specific palette).
+        let kw_brush  = solid_brush(&target, 0.55, 0.78, 1.00, 1.0); // sky blue   — keywords
+        let num_brush = solid_brush(&target, 0.95, 0.70, 0.30, 1.0); // warm amber — numbers
+        let str_brush = solid_brush(&target, 0.65, 0.85, 0.55, 1.0); // pale green — strings
+        let cmt_brush = solid_brush(&target, 0.50, 0.55, 0.60, 1.0); // dim grey   — comments
+        let prim_brush = solid_brush(&target, 0.45, 0.85, 0.95, 1.0); // teal       — kernel primitives
+        let def_brush  = solid_brush(&target, 1.00, 0.62, 0.40, 1.0); // bright orange — defining words
+        let name_brush = solid_brush(&target, 0.72, 0.92, 0.50, 1.0); // bright lime — name being defined
         // Error gutter mark — bright red. Greyed when stale (the
         // buffer has been edited since the last check).
         let err_brush = if self.diagnostics_stale {
@@ -1198,10 +1201,13 @@ impl FeditState {
                     if let Some(line_tokens) = self.tokens.get(line_idx) {
                         for tok in line_tokens {
                             let kind_brush = match tok.kind {
-                                TokenKind::Keyword => kw_brush.as_ref(),
-                                TokenKind::Number => num_brush.as_ref(),
+                                TokenKind::Keyword   => kw_brush.as_ref(),
+                                TokenKind::Number    => num_brush.as_ref(),
                                 TokenKind::StringLit => str_brush.as_ref(),
-                                TokenKind::Comment => cmt_brush.as_ref(),
+                                TokenKind::Comment   => cmt_brush.as_ref(),
+                                TokenKind::Primitive => prim_brush.as_ref(),
+                                TokenKind::Defining  => def_brush.as_ref(),
+                                TokenKind::DefName   => name_brush.as_ref(),
                             };
                             let Some(b) = kind_brush else { continue };
                             let disp_start = buffer_col_to_display(&line, tok.start);
@@ -2569,14 +2575,35 @@ fn display_col_to_buffer(line: &str, display_col: usize) -> usize {
 // to `RopeBuffer::from_utf8`, which handles BOM, CRLF, and invalid
 // sequences internally.
 
-// ─── Component Pascal tokenizer (R3 syntax highlighting) ───────────
+// ─── Forth tokenizer (syntax highlighting) ─────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TokenKind {
+    /// Control / structural words: `:`, `;`, `IF`, `THEN`, `BEGIN`,
+    /// `LOOP`, `EXIT`, `RECURSE`, `CATCH`, `THROW`, …
     Keyword,
+    /// Integer or float literal.
     Number,
+    /// `S" ..."`, `." ..."`, `S$" ..."`, `C" ..."`, `ABORT" ..."`.
+    /// The opening directive and the content are highlighted as
+    /// one span for V1; can split later for two-tone if desired.
     StringLit,
+    /// `\ ...` line comment or `( ... )` paren comment.
     Comment,
+    /// Kernel primitive (anything in `wf64::PRIMITIVES`).  Distinct
+    /// shade from Keyword so user code reads as "wired through
+    /// primitives" without losing track of control flow.
+    Primitive,
+    /// Defining words: `VARIABLE`, `CONSTANT`, `CREATE`, `HEAPPTR`,
+    /// `LET`, `CODE:`, `MARKER`, `DEFER`, `IS`, `IMMEDIATE`.
+    /// `:` is a Keyword (structural) AND a definer — coloured as
+    /// Keyword because the structural reading is more immediate.
+    Defining,
+    /// Identifier immediately following a `:` / `VARIABLE` /
+    /// `CONSTANT` / `CREATE` / `HEAPPTR` / `CODE:` / `LET` etc. —
+    /// the name being defined.  Bright lime so new definitions
+    /// pop visually.
+    DefName,
 }
 
 #[derive(Clone, Debug)]
@@ -2588,167 +2615,253 @@ struct Token {
     kind: TokenKind,
 }
 
-/// All Component Pascal reserved words plus the standard built-in
-/// type names. We treat them all the same — distinguishing types
-/// (`INTEGER`, `REAL`, etc.) from keywords would mean baking the
-/// full standard prelude in here for marginal aesthetic gain.
-const CP_KEYWORDS: &[&str] = &[
-    "ABSTRACT", "ARRAY", "BEGIN", "BY", "CASE", "CONST", "DIV", "DO", "ELSE", "ELSIF", "EMPTY",
-    "END", "EXIT", "EXTENSIBLE", "FALSE", "FOR", "IF", "IMPORT", "IN", "IS", "LIMITED", "LOOP",
-    "MOD", "MODULE", "NEW", "NIL", "OF", "OR", "OUT", "POINTER", "PROCEDURE", "RECORD", "REPEAT",
-    "RETURN", "THEN", "TO", "TRUE", "TYPE", "UNTIL", "VAR", "WHILE", "WITH",
-    // Built-in types / common pseudo-keywords
-    "ANYPTR", "ANYREC", "BOOLEAN", "BYTE", "CHAR", "INTEGER", "INTSHORT", "LONGINT", "REAL",
-    "SET", "SHORTCHAR", "SHORTINT", "SHORTREAL",
+/// Control-flow / structural Forth words.  Lower-cased; the
+/// tokenizer matches case-insensitively (Forth is traditionally
+/// case-insensitive, and `IF`/`if` should colour the same).
+const FORTH_KEYWORDS: &[&str] = &[
+    // structural
+    ":", ";", ":noname", ";code",
+    // conditionals
+    "if", "else", "then", "endif", "-if",
+    // begin/loops
+    "begin", "until", "while", "repeat", "again",
+    "do", "?do", "loop", "+loop", "leave", "unloop", "i", "j",
+    // case
+    "case", "of", "endof", "endcase",
+    // control flow
+    "exit", "recurse",
+    // exception
+    "catch", "throw", "abort",
 ];
 
-fn is_cp_keyword(word: &str) -> bool {
-    // Linear scan — array is small (~50) and this runs once per
-    // identifier. Fine for the file sizes we care about.
-    CP_KEYWORDS.iter().any(|k| *k == word)
+/// Defining words — anything that creates a new dictionary entry
+/// or modifies the most-recent one.  The token immediately
+/// following one of these is highlighted as a `DefName`.
+const FORTH_DEFINING: &[&str] = &[
+    "variable", "2variable",
+    "constant", "2constant", "fconstant",
+    "create", "does>", ">body",
+    "heapptr",
+    "code:",
+    "let",
+    "marker", "forget",
+    "immediate", "compile-only",
+    "defer", "is",
+];
+
+/// `:` is also a defining word.  Handled separately because the
+/// keyword list above already lists it as a Keyword (structural);
+/// when we see it we still want to mark the NEXT identifier as a
+/// DefName.
+fn opens_definition(word_lc: &str) -> bool {
+    word_lc == ":" || FORTH_DEFINING.iter().any(|d| *d == word_lc)
 }
 
-fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
+fn is_forth_keyword(word_lc: &str) -> bool {
+    FORTH_KEYWORDS.iter().any(|k| *k == word_lc)
 }
 
-fn is_ident_cont(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+fn is_forth_defining(word_lc: &str) -> bool {
+    FORTH_DEFINING.iter().any(|d| *d == word_lc)
 }
 
-/// Tokenize one line, given the comment-nesting depth carried in
-/// from the previous line. Returns the produced tokens and the
-/// depth to feed into the next line.
-fn tokenize_line(line: &str, depth_in: u32) -> (Vec<Token>, u32) {
-    let chars: Vec<char> = line.chars().collect();
-    let mut tokens = Vec::new();
-    let mut i = 0usize;
-    let mut depth = depth_in;
+/// Lazy-init lookup table for primitive names.  Built once from
+/// `wf64::PRIMITIVES` at first use; thereafter membership is a
+/// HashSet probe.  Names are stored lower-cased to match the
+/// case-insensitive lookup the kernel does at runtime.
+fn primitive_names() -> &'static std::collections::HashSet<String> {
+    static SET: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        crate::PRIMITIVES
+            .iter()
+            .map(|(name, _xt, _flags)| name.to_lowercase())
+            .collect()
+    })
+}
 
-    // If we entered this line already inside a comment, scan for
-    // matching `*)` first.
-    if depth > 0 {
-        let start = 0;
-        while i < chars.len() && depth > 0 {
-            if i + 1 < chars.len() && chars[i] == '(' && chars[i + 1] == '*' {
-                depth += 1;
-                i += 2;
-            } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == ')' {
-                depth -= 1;
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        tokens.push(Token {
-            start,
-            end: i,
-            kind: TokenKind::Comment,
-        });
+/// True iff the word starts a quoted-string parsing form.  Returns
+/// the length of the parser-keyword in chars so the tokenizer can
+/// advance past it.
+fn string_intro(word_lc: &str) -> Option<usize> {
+    match word_lc {
+        "s\""    | ".\""   | "c\""   | "s$\""  => Some(word_lc.chars().count()),
+        "abort\"" => Some(word_lc.chars().count()),
+        _ => None,
     }
+}
 
-    while i < chars.len() {
+/// Parse `word` as a Forth number literal.  Accepts:
+///   - signed decimal integers          (e.g. `42`, `-17`)
+///   - signed floats with `.` or `e`   (e.g. `1.5`, `-3.14e0`, `1e-9`)
+///   - the bare `'` char-literal form  (NOT yet — leave default)
+fn looks_like_number(word: &str) -> bool {
+    if word.is_empty() { return false; }
+    let bytes = word.as_bytes();
+    let start = if bytes[0] == b'-' || bytes[0] == b'+' { 1 } else { 0 };
+    if start >= bytes.len() { return false; }
+    let body = &word[start..];
+    // Plain integer.
+    if body.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // Float: must contain `.` or `e`/`E`, with otherwise digits +
+    // optional one `+`/`-` immediately after the `e`.
+    let has_dot = body.bytes().filter(|&b| b == b'.').count() <= 1;
+    let has_exp = body.bytes().any(|b| b == b'e' || b == b'E');
+    if !has_dot { return false; }
+    if !(body.bytes().any(|b| b == b'.') || has_exp) { return false; }
+    // Rough validity — let Rust's parser say yes.
+    body.parse::<f64>().is_ok()
+}
+
+/// Classify a single whitespace-delimited word (case-folded
+/// already).  Returns the visual kind.
+fn classify_word(word_lc: &str) -> TokenKind {
+    if is_forth_keyword(word_lc) {
+        TokenKind::Keyword
+    } else if is_forth_defining(word_lc) {
+        TokenKind::Defining
+    } else if primitive_names().contains(word_lc) {
+        TokenKind::Primitive
+    } else if looks_like_number(word_lc) {
+        TokenKind::Number
+    } else {
+        // Unknown identifier — return Keyword as a sentinel; the
+        // caller checks and emits nothing (default colour).  We
+        // do this so the function has a single return type without
+        // adding an `Identifier` variant the rest of the painter
+        // doesn't want to special-case.
+        TokenKind::Keyword
+    }
+}
+
+/// Scan one line of Forth source into highlight tokens.
+///
+/// Tokenization rules:
+///   - Whitespace separates words.
+///   - `\` to end-of-line is a line comment.
+///   - `( ` (paren followed by whitespace or EOL) opens a paren
+///     comment that ends at the matching `)`.  Single-line only
+///     for V1 — if no `)` is found, the rest of the line is
+///     coloured as comment.
+///   - `S"`, `."`, `S$"`, `C"`, `ABORT"` (followed by space) start
+///     a string literal that ends at the next `"`.
+///   - Any other whitespace-delimited token is classified as
+///     Keyword / Defining / Primitive / Number / unknown.
+///   - After a Defining word (or `:`), the next non-string,
+///     non-comment, non-whitespace word becomes a DefName.
+fn tokenize_line(line: &str, _depth_in: u32) -> (Vec<Token>, u32) {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut i = 0usize;
+    let mut expect_defname = false;
+
+    while i < n {
         let c = chars[i];
-
-        // Comment opener.
-        if i + 1 < chars.len() && c == '(' && chars[i + 1] == '*' {
-            let start = i;
-            depth = 1;
-            i += 2;
-            while i < chars.len() && depth > 0 {
-                if i + 1 < chars.len() && chars[i] == '(' && chars[i + 1] == '*' {
-                    depth += 1;
-                    i += 2;
-                } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == ')' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            tokens.push(Token {
-                start,
-                end: i,
-                kind: TokenKind::Comment,
-            });
-            continue;
-        }
-
-        // String / char literal — single line, no escapes (CP syntax).
-        if c == '"' || c == '\'' {
-            let quote = c;
-            let start = i;
+        // Skip whitespace.
+        if c.is_whitespace() {
             i += 1;
-            while i < chars.len() && chars[i] != quote {
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1; // consume the closing quote
-            }
-            tokens.push(Token {
-                start,
-                end: i,
-                kind: TokenKind::StringLit,
-            });
             continue;
         }
-
-        // Number — decimal, hex (with H suffix), real (with E exponent),
-        // char literal (with X suffix). CP-style: 0FFH, 1.5E2, 41X.
-        if c.is_ascii_digit() {
-            let start = i;
-            while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '+'
-                    || chars[i] == '-')
-            {
-                // Stop +/- only if it follows an E or D (the exponent
-                // sign); otherwise it's an operator and we should
-                // leave it for the next iteration.
-                if (chars[i] == '+' || chars[i] == '-') && i > start {
-                    let prev = chars[i - 1];
-                    if !(prev == 'E' || prev == 'D' || prev == 'e' || prev == 'd') {
-                        break;
-                    }
-                }
-                i += 1;
-            }
-            tokens.push(Token {
-                start,
-                end: i,
-                kind: TokenKind::Number,
-            });
-            continue;
+        // Line comment: `\` followed by EOL or whitespace.
+        if c == '\\' && (i + 1 >= n || chars[i + 1].is_whitespace() || (i == 0)) {
+            tokens.push(Token { start: i, end: n, kind: TokenKind::Comment });
+            break;
         }
-
-        // Identifier or keyword.
-        if is_ident_start(c) {
+        // Paren comment: `(` standalone (followed by whitespace or EOL).
+        if c == '(' && (i + 1 >= n || chars[i + 1].is_whitespace()) {
             let start = i;
+            // Scan to matching `)`.
             i += 1;
-            while i < chars.len() && is_ident_cont(chars[i]) {
+            while i < n && chars[i] != ')' {
                 i += 1;
             }
-            let word: String = chars[start..i].iter().collect();
-            if is_cp_keyword(&word) {
+            if i < n {
+                i += 1; // consume `)`
+            }
+            tokens.push(Token { start, end: i, kind: TokenKind::Comment });
+            continue;
+        }
+        // Read one whitespace-delimited token.
+        let start = i;
+        while i < n && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect();
+        let word_lc = word.to_lowercase();
+
+        // String-literal directive?
+        if let Some(intro_len) = string_intro(&word_lc) {
+            // Emit the directive as a Keyword (".", "S\"", etc.)
+            let directive_end = start + intro_len;
+            tokens.push(Token {
+                start,
+                end: directive_end.min(n),
+                kind: TokenKind::Keyword,
+            });
+            // Skip the obligatory leading space, then consume until `"`.
+            let mut j = i;
+            if j < n && chars[j].is_whitespace() {
+                j += 1;
+            }
+            let content_start = j;
+            while j < n && chars[j] != '"' {
+                j += 1;
+            }
+            if j < n {
+                j += 1; // consume closing `"`
+            }
+            if j > content_start {
                 tokens.push(Token {
-                    start,
-                    end: i,
-                    kind: TokenKind::Keyword,
+                    start: content_start,
+                    end: j,
+                    kind: TokenKind::StringLit,
                 });
             }
-            // Plain identifiers stay default-colored — no token emitted.
+            i = j;
+            expect_defname = false;
             continue;
         }
 
-        // Anything else (operators, whitespace, punctuation) is left
-        // unstyled.
-        i += 1;
+        // Definition-name slot.
+        if expect_defname {
+            tokens.push(Token {
+                start,
+                end: i,
+                kind: TokenKind::DefName,
+            });
+            expect_defname = false;
+            continue;
+        }
+
+        // Standard classification.
+        let kind = classify_word(&word_lc);
+        let emit = match kind {
+            TokenKind::Keyword => is_forth_keyword(&word_lc), // sentinel filter
+            other => {
+                let _ = other;
+                true
+            }
+        };
+        if emit {
+            tokens.push(Token { start, end: i, kind });
+        }
+
+        if opens_definition(&word_lc) {
+            expect_defname = true;
+        }
     }
 
-    (tokens, depth)
+    (tokens, 0)
 }
 
-/// Tokenize the whole buffer. Comment depth is threaded through
-/// lines so a `(* ... \n ... *)` block is one comment.
+/// Tokenize the whole buffer.  Forth doesn't have multi-line
+/// constructs that the line-by-line tokenizer would mishandle
+/// (no nested block comments; paren comments are single-line),
+/// so the depth state is unused but kept for shape parity with
+/// the older Pascal-flavoured signature.
 fn tokenize_rope(rope: &RopeBuffer) -> Vec<Vec<Token>> {
     let n = rope.line_count();
     let mut out = Vec::with_capacity(n);
