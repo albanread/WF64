@@ -1,26 +1,31 @@
-//! ledit — fail-safe Lisp-aware editor.
+//! fedit — fail-safe Forth-aware editor.
 //!
 //! A minimal text editor that lives entirely on the UI thread of
-//! the iGui frame. It does not consume `SurfaceCmd` batches, does
+//! the iGui frame.  It does not consume `SurfaceCmd` batches, does
 //! not touch the language-thread mailbox, and does not depend on
-//! any Lisp code being loaded. The point is that even when the
-//! rest of NewCormanLisp has a fault, the editor remains
-//! responsive so the user can fix source files and reload them.
+//! any Forth code being loaded.  The point is that even when the
+//! rest of WF64 has a fault, the editor remains responsive so the
+//! user can fix source files and reload them.
 //!
-//! Inherited verbatim from the sister NewCP repo's `redit` (which
-//! served the same role for Component Pascal). Renamed to ledit
-//! and growing a small set of Lisp-aware affordances:
+//! Adapted from NewCormanLisp's `ledit`, which in turn descends
+//! from the sister NewCP repo's `redit` (Component Pascal).  The
+//! Lisp-flavoured affordances (paren balance, sexp navigation,
+//! slurp/barf/wrap/raise) have been stripped or replaced with
+//! Forth-shaped equivalents:
 //!
 //!   - **auto-indent on Enter** — the new line gets the current
-//!     line's leading whitespace, plus an extra two spaces if the
-//!     cursor was preceded by an unmatched `(` on this line.
-//!   - **paren-balance in the status line** — a count of open vs
-//!     close parens so you can see at a glance whether an editing
-//!     buffer is well-formed.
-//!
-//! Real structural editing (slurp / barf / wrap / unwrap, balanced
-//! cursor motion, etc.) is deferred — it'll land as user-Lisp
-//! once we have enough of an editor API to drive from outside.
+//!     line's leading whitespace.  No paren-aware extra indent
+//!     because Forth doesn't bracket like Lisp does.
+//!   - **word-boundary navigation** — Ctrl+Left/Right move by
+//!     whitespace-delimited tokens, since that's the only
+//!     structural unit Forth has at the source level.
+//!   - **comment-balance in the status line** — count of
+//!     unterminated `(` — Forth uses `( ... )` for inline
+//!     comments, so unbalanced parens still mean "unclosed
+//!     comment."  (Less common to trip than in Lisp, but the
+//!     same machinery is useful.)
+//!   - **F5 → run buffer** — sends the buffer to the Forth REPL
+//!     on the worker thread for evaluation (Phase 2b wiring).
 //!
 //! Architecture: a single-instance MDI child with its own WndProc
 //! that handles WM_PAINT (Direct2D + DirectWrite, fixed grid) and
@@ -103,9 +108,10 @@ use super::rope_buffer::{codepoints_to_utf8, RopeBuffer};
 /// menu spec.
 pub const MENU_CMD_ID: u16 = 0x3000;
 
-/// Edit-menu command IDs, dispatched to the active ledit MDI child
-/// via frame WM_COMMAND forwarding. The range is contiguous so the
-/// frame can recognise them with a single `(0x3100..=0x31FF)` check.
+/// Edit-menu command IDs, dispatched to the active fedit MDI child
+/// via frame WM_COMMAND forwarding.  Contiguous range so the
+/// frame WndProc can recognise them with one `(0x3100..=0x31FF)`
+/// check.
 pub const EDIT_CMD_BASE: u16 = 0x3100;
 pub const EDIT_CMD_END: u16 = 0x31FF;
 
@@ -115,30 +121,24 @@ pub const EDIT_CMD_CUT: u16 = 0x3110;
 pub const EDIT_CMD_COPY: u16 = 0x3111;
 pub const EDIT_CMD_PASTE: u16 = 0x3112;
 pub const EDIT_CMD_SELECT_ALL: u16 = 0x3113;
-pub const EDIT_CMD_FORWARD_SEXP: u16 = 0x3120;
-pub const EDIT_CMD_BACKWARD_SEXP: u16 = 0x3121;
-pub const EDIT_CMD_SLURP_FORWARD: u16 = 0x3122;
-pub const EDIT_CMD_BARF_FORWARD: u16 = 0x3123;
-pub const EDIT_CMD_WRAP: u16 = 0x3130;
-pub const EDIT_CMD_SPLICE: u16 = 0x3131;
-pub const EDIT_CMD_RAISE: u16 = 0x3132;
-/// Run-buffer: push the buffer (or selection) at the language
-/// thread as an `EvalBuffer` event. The default event-loop handler
-/// in `events.lisp` calls `eval-string` and writes the result to
-/// the iGui log overlay.
+/// Word-boundary navigation.  Forth's only structural unit at
+/// the source level is the whitespace-delimited token, so move
+/// by that.  (Was EDIT_CMD_FORWARD_SEXP / BACKWARD_SEXP in the
+/// Lisp version; the IDs are preserved so menu wiring stays
+/// stable across the rename.)
+pub const EDIT_CMD_NEXT_WORD: u16 = 0x3120;
+pub const EDIT_CMD_PREV_WORD: u16 = 0x3121;
+/// Run-buffer: push the buffer at the worker thread as an
+/// `EvalBuffer` event.  The wf64-ui main loop hands it to
+/// `Wf64Session::eval` and writes the result to the log overlay.
 pub const EDIT_CMD_RUN_BUFFER: u16 = 0x3140;
-/// Run-form-at-point: extract the top-level form the cursor is
-/// currently inside and push just that as an `EvalBuffer` event.
-/// The canonical CL interactive-development action — Emacs's
-/// `C-M-x`, equivalent of "evaluate the defun under the cursor."
-pub const EDIT_CMD_RUN_FORM: u16 = 0x3141;
 
-const LEDIT_CLASS: PCWSTR = w!("NewCL.iGui.Ledit");
-const TITLE_NEW: PCWSTR = w!("ledit — untitled");
+const FEDIT_CLASS: PCWSTR = w!("WF64.iGui.Fedit");
+const TITLE_NEW: PCWSTR = w!("fedit — untitled");
 
 /// HWND of the singleton ledit MDI child, if one exists. Used to
 /// activate the existing instance instead of creating a second one.
-static LEDIT_HWND: Mutex<Option<isize>> = Mutex::new(None);
+static FEDIT_HWND: Mutex<Option<isize>> = Mutex::new(None);
 
 // ─── Compile-check injection point ──────────────────────────────────
 //
@@ -183,14 +183,14 @@ fn run_checker(source: &str) -> Option<Vec<Diagnostic>> {
 /// `child::register_classes`.
 pub fn register_class() -> Result<(), super::IGuiError> {
     let h_instance = unsafe { GetModuleHandleW(None) }
-        .map_err(|e| super::IGuiError::Win32(format!("GetModuleHandleW (ledit): {e}")))?
+        .map_err(|e| super::IGuiError::Win32(format!("GetModuleHandleW (fedit): {e}")))?
         .into();
     let cursor = unsafe { LoadCursorW(None, IDC_IBEAM) }
-        .map_err(|e| super::IGuiError::Win32(format!("LoadCursorW (ledit): {e}")))?;
+        .map_err(|e| super::IGuiError::Win32(format!("LoadCursorW (fedit): {e}")))?;
     let cls = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: WNDCLASS_STYLES(0),
-        lpfnWndProc: Some(ledit_wnd_proc),
+        lpfnWndProc: Some(fedit_wnd_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: h_instance,
@@ -198,7 +198,7 @@ pub fn register_class() -> Result<(), super::IGuiError> {
         hCursor: cursor,
         hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut()),
         lpszMenuName: PCWSTR::null(),
-        lpszClassName: LEDIT_CLASS,
+        lpszClassName: FEDIT_CLASS,
         hIconSm: Default::default(),
     };
     let _ = unsafe { RegisterClassExW(&cls) };
@@ -212,7 +212,7 @@ pub fn register_class() -> Result<(), super::IGuiError> {
 /// the frame WndProc when the user picks the menu item or hits the
 /// shortcut. UI-thread only.
 pub fn open(frame: HWND, mdi_client: HWND) {
-    if let Some(raw) = *LEDIT_HWND.lock().expect("LEDIT_HWND poisoned") {
+    if let Some(raw) = *FEDIT_HWND.lock().expect("FEDIT_HWND poisoned") {
         let hwnd = HWND(raw as *mut _);
         if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             unsafe {
@@ -231,12 +231,12 @@ pub fn open(frame: HWND, mdi_client: HWND) {
     let h_instance = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => windows::Win32::Foundation::HANDLE(h.0),
         Err(e) => {
-            eprintln!("[ledit] GetModuleHandleW: {e}");
+            eprintln!("[fedit] GetModuleHandleW: {e}");
             return;
         }
     };
     let create = MDICREATESTRUCTW {
-        szClass: LEDIT_CLASS,
+        szClass: FEDIT_CLASS,
         szTitle: TITLE_NEW,
         hOwner: h_instance,
         x: CW_USEDEFAULT,
@@ -255,7 +255,7 @@ pub fn open(frame: HWND, mdi_client: HWND) {
         )
     };
     if result.0 == 0 {
-        eprintln!("[ledit] WM_MDICREATE returned 0");
+        eprintln!("[fedit] WM_MDICREATE returned 0");
         return;
     }
     let _ = frame; // reserved for future use
@@ -334,7 +334,7 @@ const UNDO_CAP: usize = 1024;
 /// above), so that's what we default to.
 const TAB_WIDTH: usize = 2;
 
-struct ReditState {
+struct FeditState {
     hwnd: HWND,
     target: Option<ID2D1HwndRenderTarget>,
     text_format: Option<IDWriteTextFormat>,
@@ -395,7 +395,7 @@ struct ReditState {
     diagnostics_stale: bool,
 }
 
-impl ReditState {
+impl FeditState {
     fn new(hwnd: HWND) -> Self {
         let dpi = unsafe { GetDpiForWindow(hwnd) };
         let dpi = if dpi == 0 { 96 } else { dpi };
@@ -469,7 +469,7 @@ impl ReditState {
         };
         match target {
             Ok(t) => self.target = Some(t),
-            Err(e) => eprintln!("[ledit] CreateHwndRenderTarget failed: {e}"),
+            Err(e) => eprintln!("[fedit] CreateHwndRenderTarget failed: {e}"),
         }
     }
 
@@ -1099,9 +1099,15 @@ impl ReditState {
             // but bright enough to pop against the dark background.
             let match_brush = solid_brush(&target, 0.28, 0.34, 0.48, 1.0);
             if let Some(brush) = match_brush.as_ref() {
+                // Matching-paren highlighting is a Lisp-era feature
+                // (paredit flash on close-paren typing).  Forth's
+                // `( ... )` comments don't benefit from a one-shot
+                // flash, so the match-finder is stubbed out and no
+                // highlights are drawn here.
+                let matching_delim = |_: &crate::igui::rope_buffer::RopeBuffer, _: usize| -> Option<usize> { None };
                 for off in flash_targets {
                     if let Some(match_off) =
-                        super::sexp_nav::matching_delim(&self.buffer, off)
+                        matching_delim(&self.buffer, off)
                     {
                         for paint_off in [off, match_off] {
                             let (r, c) = self.buffer.offset_to_line_col(paint_off);
@@ -1576,13 +1582,14 @@ impl ReditState {
         self.invalidate();
     }
 
-    // ─── Paredit: atomic structural edits ────────────────────────
+    // ─── Atomic edits (used by undo machinery) ───────────────────
     //
-    // Each op produces ONE `Replaced` undo entry so a single Ctrl-Z
-    // reverses the whole structural change. The supporting machinery
-    // lives in `igui/sexp_nav.rs` (cursor → offset translations); the
-    // mutations here are simple `splice_out` + `splice_in_cps` pairs
-    // bracketed by `do_replace`.
+    // Each call to do_replace produces ONE `Replaced` undo entry so
+    // a single Ctrl-Z reverses the whole edit.  The Lisp port had a
+    // whole paredit family on top of this (slurp/barf/wrap/raise);
+    // those are gone — Forth's flat token model doesn't have a use
+    // for structural editing.  do_replace is still the primitive
+    // every mutating method funnels through.
 
     /// Apply a single Replaced edit and record the undo entry.
     /// `start..end` in the current buffer is replaced by `new_cps`;
@@ -1614,168 +1621,61 @@ impl ReditState {
         self.invalidate();
     }
 
-    /// Slurp forward: pull the next sexp outside the enclosing form
-    /// into it. Close-delim moves to after the slurped sexp.
-    ///
-    ///   (foo |bar) baz quux  →  (foo |bar baz) quux
-    fn slurp_forward(&mut self) {
-        let Some((open, close)) = super::sexp_nav::enclosing_form(&self.buffer, self.cursor)
-        else {
-            return;
-        };
-        let _ = open;
-        // Find the end of the next sexp after the close.
-        let Some(next_end) = super::sexp_nav::forward_sexp(&self.buffer, close + 1) else {
-            return; // nothing to slurp
-        };
-        // The close delim itself, as a code point.
-        let close_cp = self.buffer.char_at(close).unwrap_or(')' as u32);
-        // Replace `[close, next_end)` (the close-paren plus the
-        // whitespace+sexp we're slurping) with the slurped material
-        // followed by the close-paren — i.e. the close-paren moves
-        // from `close` to `next_end - 1`.
-        let between = self.buffer.slice(close + 1, next_end);
-        let mut new_cps = between;
-        new_cps.push(close_cp);
-        // Cursor stays at its current offset — it didn't move
-        // textually, only the close-paren around it did.
-        let cursor_after = self.cursor;
-        self.do_replace(close, next_end, new_cps, cursor_after);
+    // ── Lisp-era methods removed in the Forth port ───────────────
+    //
+    // The paredit-style structural-edit family (slurp/barf/wrap/
+    // splice/raise) and the s-expression navigation primitives
+    // are gone from this file.  The kept history below is a
+    // doc comment marker so the diff against the NewCormanLisp
+    // version is easy to read; if you need the implementations,
+    // see ledit.rs in E:\CL\NewCormanLisp\src\ncl-runtime\src\igui.
+    //
+    // Forth's structural unit is the whitespace-delimited token,
+    // so the analogous editor ops are next-word / prev-word,
+    // defined just below as move_next_word / move_prev_word.
+
+    /// Move cursor to the start of the next whitespace-delimited
+    /// token.  Skips contiguous whitespace, then skips a run of
+    /// non-whitespace; lands at the first whitespace character
+    /// after the current/next token, or at end-of-buffer.
+    fn move_next_word(&mut self, extend: bool) {
+        let mut i = self.cursor;
+        let end = self.buffer.len();
+        // Skip the rest of the current word.
+        while i < end && !is_ws_cp(self.buffer.char_at(i).unwrap_or(0)) {
+            i += 1;
+        }
+        // Skip whitespace to land at the next word's first char.
+        while i < end && is_ws_cp(self.buffer.char_at(i).unwrap_or(0)) {
+            i += 1;
+        }
+        self.set_cursor_offset(i, extend);
+        self.pref_col = self.cursor_col();
     }
 
-    /// Barf forward: push the last inner sexp out of the enclosing
-    /// form. Close-delim moves to before the last inner sexp.
-    ///
-    ///   (foo |bar baz)  →  (foo |bar) baz
-    fn barf_forward(&mut self) {
-        let Some((open, close)) = super::sexp_nav::enclosing_form(&self.buffer, self.cursor)
-        else {
-            return;
-        };
-        // Walk inner sexps from open+1 forward, recording the start
-        // of the last one. We stop when forward_sexp lands at or
-        // past `close`.
-        let mut last_inner_start: Option<usize> = None;
-        let mut probe = open + 1;
-        loop {
-            // Skip atmosphere to find the next sexp start.
-            let Some(sexp_end) = super::sexp_nav::forward_sexp(&self.buffer, probe) else {
-                break;
-            };
-            if sexp_end > close {
-                break;
-            }
-            // The sexp started somewhere in [probe, sexp_end); find
-            // its actual start by going back one sexp.
-            let sexp_start = match super::sexp_nav::backward_sexp(&self.buffer, sexp_end) {
-                Some(s) => s,
-                None => break,
-            };
-            last_inner_start = Some(sexp_start);
-            probe = sexp_end;
+    /// Move cursor to the start of the previous whitespace-delimited
+    /// token.  Skips preceding whitespace, then walks back over
+    /// non-whitespace until either start-of-buffer or another
+    /// whitespace boundary.
+    fn move_prev_word(&mut self, extend: bool) {
+        let mut i = self.cursor;
+        // Skip preceding whitespace.
+        while i > 0 && is_ws_cp(self.buffer.char_at(i - 1).unwrap_or(0)) {
+            i -= 1;
         }
-        let Some(last_start) = last_inner_start else {
-            return; // nothing inside to barf
-        };
-        let close_cp = self.buffer.char_at(close).unwrap_or(')' as u32);
-        // Trim trailing whitespace between the previous sexp's end
-        // and `last_start` so the result reads as `(foo|bar)` with
-        // single-space separation, not `(foo |bar)`. (Actually no —
-        // we WANT to preserve the original whitespace before the
-        // sexp we're barfing out. Don't trim.)
-        //
-        // Replace `[last_start, close+1)` (last inner sexp through
-        // close-delim) with `) ` followed by the inner sexp.
-        let inner = self.buffer.slice(last_start, close);
-        // Strip trailing whitespace from `inner` so we don't end up
-        // with `(foo bar )`.
-        let mut inner_trim_end = inner.len();
-        while inner_trim_end > 0 && is_ws_cp(inner[inner_trim_end - 1]) {
-            inner_trim_end -= 1;
+        // Walk back over the word body.
+        while i > 0 && !is_ws_cp(self.buffer.char_at(i - 1).unwrap_or(0)) {
+            i -= 1;
         }
-        let inner_trimmed: Vec<u32> = inner[..inner_trim_end].to_vec();
-
-        let mut new_cps = inner_trimmed;
-        new_cps.push(close_cp);
-        new_cps.push(' ' as u32);
-        // Then the barfed sexp itself.
-        let barfed = self.buffer.slice(last_start, close);
-        // Strip leading whitespace from barfed (we already kept the
-        // trimmed inner; the barfed sexp starts at last_start which
-        // is past any leading whitespace).
-        let _ = barfed; // unused — we use last_start..close + final trim above
-        // ACTUALLY: we want to KEEP the original whitespace inside
-        // (between inner_trimmed and what was barfed), so simpler
-        // reformulation:
-        // [open+1 .. close] currently contains "...inner_trim WS sexp"
-        // After:             "...inner_trim) WS sexp"
-        // i.e. just MOVE the close from position `close` to position
-        // `inner_trim_end + open + 1` (the first whitespace cp after
-        // the last inner sexp's predecessors).
-        //
-        // Compute target close position relative to `last_start`:
-        // - inner spans [open+1, close)
-        // - last sexp starts at last_start
-        // - we want close at (the first non-ws after the previous sexp)
-        //
-        // Cleaner: between [open+1, last_start) is "previous content
-        // ending in whitespace". We want to insert ) right after
-        // that content (after trimming trailing whitespace).
-        let before_last_sexp = self.buffer.slice(open + 1, last_start);
-        let mut t_end = before_last_sexp.len();
-        while t_end > 0 && is_ws_cp(before_last_sexp[t_end - 1]) {
-            t_end -= 1;
-        }
-        let kept_prefix: Vec<u32> = before_last_sexp[..t_end].to_vec();
-        let ws_between: Vec<u32> = before_last_sexp[t_end..].to_vec();
-        let barfed_sexp = self.buffer.slice(last_start, close);
-
-        let mut new_cps = kept_prefix;
-        new_cps.push(close_cp);
-        new_cps.extend_from_slice(&ws_between);
-        new_cps.extend_from_slice(&barfed_sexp);
-
-        // Cursor was somewhere in the original (open+1, close)
-        // range. We want it at the equivalent offset in the result.
-        // For simplicity: clamp into the new inner range.
-        let new_inner_end = open + 1 + t_end; // offset of the new close
-        let cursor_after = self.cursor.min(new_inner_end);
-        self.do_replace(open + 1, close + 1, new_cps, cursor_after);
+        self.set_cursor_offset(i, extend);
+        self.pref_col = self.cursor_col();
     }
 
-    /// Wrap the next sexp at point with `( … )`. Cursor lands just
-    /// after the new `(`.
-    ///
-    ///   |foo bar  →  (|foo) bar
-    fn wrap_sexp(&mut self) {
-        // Skip leading whitespace from cursor.
-        let start = self.cursor;
-        let Some(after_atmosphere) =
-            super::sexp_nav::forward_sexp(&self.buffer, start)
-        else {
-            // Nothing to wrap — insert empty `()` at cursor.
-            self.do_replace(start, start, vec!['(' as u32, ')' as u32], start + 1);
-            return;
-        };
-        // We need the actual sexp start, not just its end. Use
-        // backward_sexp from the end to find it.
-        let sexp_start = super::sexp_nav::backward_sexp(&self.buffer, after_atmosphere)
-            .unwrap_or(start);
-        let sexp_end = after_atmosphere;
-        let inner = self.buffer.slice(sexp_start, sexp_end);
-        let mut new_cps = vec!['(' as u32];
-        new_cps.extend_from_slice(&inner);
-        new_cps.push(')' as u32);
-        let cursor_after = sexp_start + 1;
-        self.do_replace(sexp_start, sexp_end, new_cps, cursor_after);
-    }
-
-    /// Push the buffer (or selection if any) at the language thread
-    /// as an `EvalBuffer` event. User-Lisp's `event-loop` macro has
-    /// a built-in handler (`%handle-eval-buffer` in events.lisp)
-    /// that calls `eval-string` on the source and writes the
-    /// printed result to the iGui log overlay. Bound to Ctrl+R, F5,
-    /// and the Edit → Run Buffer menu item.
+    /// Push the buffer (or selection) at the worker thread as an
+    /// `EvalBuffer` event.  Bound to F5 and the Edit → Run Buffer
+    /// menu item.  The wf64-ui main loop services the event by
+    /// handing the source to `Wf64Session::eval` and appending the
+    /// result to the log overlay.
     fn run_buffer(&self) {
         let (src, scope) = {
             let sel = self.selected_text();
@@ -1785,87 +1685,14 @@ impl ReditState {
                 (sel, "selection")
             }
         };
-        // Log immediately so the user sees the keystroke registered
-        // even before the language thread services the event. The
-        // default :eval-buffer handler in events.lisp will follow
-        // up with "[eval] …" once it runs.
         super::log_view::append(&format!(
-            "[ledit] run {} ({} chars)",
+            "[fedit] run {} ({} chars)",
             scope,
             src.chars().count()
         ));
         crate::igui::channels::push(
             crate::igui::channels::IGuiEvent::EvalBuffer { source: src },
         );
-    }
-
-    /// Run only the top-level form the cursor is inside — Emacs's
-    /// `C-M-x`. The standard CL interactive-development action:
-    /// place the cursor anywhere inside a `(defun …)` or
-    /// `(run-foo)` and one keystroke evaluates just that form.
-    ///
-    /// If the cursor is in atmosphere between top-level forms,
-    /// nothing is sent.
-    fn run_form_at_point(&self) {
-        let Some((start, end)) =
-            super::sexp_nav::top_level_form(&self.buffer, self.cursor)
-        else {
-            super::log_view::append(
-                "[ledit] run form: cursor not inside a top-level form",
-            );
-            return;
-        };
-        let cps = self.buffer.slice(start, end);
-        let src = super::rope_buffer::codepoints_to_utf8(&cps);
-        super::log_view::append(&format!(
-            "[ledit] run form ({} chars): {}",
-            src.chars().count(),
-            // Truncate the preview so the log line stays readable.
-            preview_first_line(&src, 60),
-        ));
-        crate::igui::channels::push(
-            crate::igui::channels::IGuiEvent::EvalBuffer { source: src },
-        );
-    }
-
-    /// Splice (unwrap): delete the enclosing parens, leaving the
-    /// inner content. Cursor stays where it was textually.
-    ///
-    ///   (foo |bar baz)  →  foo |bar baz
-    fn splice_enclosing(&mut self) {
-        let Some((open, close)) = super::sexp_nav::enclosing_form(&self.buffer, self.cursor)
-        else {
-            return;
-        };
-        let inner = self.buffer.slice(open + 1, close);
-        // Cursor moves one cp left (the open was deleted before it).
-        let cursor_after = self.cursor.saturating_sub(1);
-        self.do_replace(open, close + 1, inner, cursor_after);
-    }
-
-    /// Raise: replace the enclosing form with the sexp at point.
-    ///
-    ///   (foo |bar baz)  →  |bar
-    fn raise_sexp(&mut self) {
-        let Some((open, close)) = super::sexp_nav::enclosing_form(&self.buffer, self.cursor)
-        else {
-            return;
-        };
-        // Find the sexp at or after the cursor.
-        let Some(sexp_end) = super::sexp_nav::forward_sexp(&self.buffer, self.cursor) else {
-            return;
-        };
-        let sexp_start = super::sexp_nav::backward_sexp(&self.buffer, sexp_end)
-            .unwrap_or(self.cursor);
-        // Clamp to enclosing form bounds.
-        let sexp_start = sexp_start.max(open + 1);
-        let sexp_end = sexp_end.min(close);
-        if sexp_start >= sexp_end {
-            return;
-        }
-        let kept = self.buffer.slice(sexp_start, sexp_end);
-        let cursor_after = open;
-        self.do_replace(open, close + 1, kept, cursor_after);
     }
 
     fn move_left(&mut self, extend: bool) {
@@ -1897,29 +1724,6 @@ impl ReditState {
             self.set_cursor_offset(self.cursor + 1, extend);
         }
         self.pref_col = self.cursor_col();
-    }
-
-    /// Ctrl-Right: jump over the next s-expression. Skips
-    /// whitespace, line comments, and block comments, then either
-    /// over a balanced `(…)`/`[…]`, a `"…"` string, a `#\X`
-    /// character literal, a reader-macro-prefixed form (`'foo`,
-    /// `` `foo``, `,foo`, `,@foo`, `#'foo`), or an atom. No-op if
-    /// already at end of the enclosing sexp (sitting on a `)` or
-    /// at end-of-buffer).
-    fn move_forward_sexp(&mut self, extend: bool) {
-        if let Some(target) = super::sexp_nav::forward_sexp(&self.buffer, self.cursor) {
-            self.set_cursor_offset(target, extend);
-            self.pref_col = self.cursor_col();
-        }
-    }
-
-    /// Ctrl-Left: jump backward over the previous s-expression.
-    /// Symmetric with `move_forward_sexp`.
-    fn move_backward_sexp(&mut self, extend: bool) {
-        if let Some(target) = super::sexp_nav::backward_sexp(&self.buffer, self.cursor) {
-            self.set_cursor_offset(target, extend);
-            self.pref_col = self.cursor_col();
-        }
     }
 
     fn move_up(&mut self, extend: bool) {
@@ -2129,7 +1933,7 @@ impl ReditState {
                 self.update_title();
                 self.invalidate();
             }
-            Err(e) => eprintln!("[ledit] read {path:?} failed: {e}", path = self.file_path),
+            Err(e) => eprintln!("[fedit] read {path:?} failed: {e}", path = self.file_path),
         }
     }
 
@@ -2151,7 +1955,7 @@ impl ReditState {
                 true
             }
             Err(e) => {
-                eprintln!("[ledit] save failed: {e}");
+                eprintln!("[fedit] save failed: {e}");
                 false
             }
         }
@@ -2181,23 +1985,23 @@ impl ReditState {
 
 // ─── Win32 plumbing ──────────────────────────────────────────────────
 
-unsafe extern "system" fn ledit_wnd_proc(
+unsafe extern "system" fn fedit_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_NCCREATE {
-        let state = Box::new(ReditState::new(hwnd));
+        let state = Box::new(FeditState::new(hwnd));
         let raw = Box::into_raw(state) as isize;
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw) };
-        if let Ok(mut slot) = LEDIT_HWND.lock() {
+        if let Ok(mut slot) = FEDIT_HWND.lock() {
             *slot = Some(hwnd.0 as isize);
         }
         return unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) };
     }
 
-    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ReditState;
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut FeditState;
     if state_ptr.is_null() {
         return unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) };
     }
@@ -2313,7 +2117,7 @@ unsafe extern "system" fn ledit_wnd_proc(
             // Drop the heap state. Clear singleton slot if it matches.
             let _ = unsafe { Box::from_raw(state_ptr) };
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-            if let Ok(mut slot) = LEDIT_HWND.lock() {
+            if let Ok(mut slot) = FEDIT_HWND.lock() {
                 if matches!(*slot, Some(h) if h == hwnd.0 as isize) {
                     *slot = None;
                 }
@@ -2330,7 +2134,7 @@ fn shift_down() -> bool {
 
 /// Dispatch an Edit-menu command forwarded from the frame's
 /// WM_COMMAND handler. Returns `true` if we recognised the id.
-fn handle_edit_menu(state: &mut ReditState, cmd_id: u16) -> bool {
+fn handle_edit_menu(state: &mut FeditState, cmd_id: u16) -> bool {
     match cmd_id {
         EDIT_CMD_UNDO => state.undo(),
         EDIT_CMD_REDO => state.redo(),
@@ -2338,41 +2142,24 @@ fn handle_edit_menu(state: &mut ReditState, cmd_id: u16) -> bool {
         EDIT_CMD_COPY => state.copy(),
         EDIT_CMD_PASTE => state.paste(),
         EDIT_CMD_SELECT_ALL => state.select_all(),
-        EDIT_CMD_FORWARD_SEXP => state.move_forward_sexp(false),
-        EDIT_CMD_BACKWARD_SEXP => state.move_backward_sexp(false),
-        EDIT_CMD_SLURP_FORWARD => state.slurp_forward(),
-        EDIT_CMD_BARF_FORWARD => state.barf_forward(),
-        EDIT_CMD_WRAP => state.wrap_sexp(),
-        EDIT_CMD_SPLICE => state.splice_enclosing(),
-        EDIT_CMD_RAISE => state.raise_sexp(),
+        EDIT_CMD_NEXT_WORD => state.move_next_word(false),
+        EDIT_CMD_PREV_WORD => state.move_prev_word(false),
         EDIT_CMD_RUN_BUFFER => state.run_buffer(),
-        EDIT_CMD_RUN_FORM => state.run_form_at_point(),
         _ => return false,
     }
     true
 }
 
-/// Dispatch an Alt-letter chord. Returns `true` if we consumed the
-/// key. Alt-W/S/R are the paredit triad (wrap / splice / raise);
-/// anything else falls through to the default handler.
-fn handle_alt_key(state: &mut ReditState, vk: u32) -> bool {
-    // ASCII letter virtual keys are 'A'=0x41 .. 'Z'=0x5A — the same
-    // codes you'd see in a non-Alt WM_KEYDOWN for those keys.
-    match vk {
-        0x57 => {
-            state.wrap_sexp();
-            true
-        }
-        0x53 => {
-            state.splice_enclosing();
-            true
-        }
-        0x52 => {
-            state.raise_sexp();
-            true
-        }
-        _ => false,
-    }
+/// Dispatch an Alt-letter chord.  Returns `true` if we consumed
+/// the key.  The Lisp version had Alt-W/S/R bound to the paredit
+/// triad (wrap / splice / raise) — irrelevant for Forth where the
+/// only structural unit is the whitespace-delimited token, so
+/// nothing is consumed here today.  Kept as a hook for future
+/// Forth-shaped Alt commands.
+#[allow(unused_variables, dead_code)]
+fn handle_alt_key(state: &mut FeditState, vk: u32) -> bool {
+    let _ = vk;
+    false
 }
 
 fn ctrl_down() -> bool {
@@ -2380,25 +2167,21 @@ fn ctrl_down() -> bool {
     (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as i16) < 0
 }
 
-fn handle_key(state: &mut ReditState, vk: u32) {
+fn handle_key(state: &mut FeditState, vk: u32) {
     let vk16 = vk as u16;
     let extend = shift_down();
     let ctrl = ctrl_down();
     if vk16 == VK_LEFT.0 {
-        if ctrl && extend {
-            // Ctrl-Shift-Left → paredit barf forward
-            state.barf_forward();
-        } else if ctrl {
-            state.move_backward_sexp(extend);
+        if ctrl {
+            // Ctrl-Left / Ctrl-Shift-Left → previous word boundary.
+            state.move_prev_word(extend);
         } else {
             state.move_left(extend);
         }
     } else if vk16 == VK_RIGHT.0 {
-        if ctrl && extend {
-            // Ctrl-Shift-Right → paredit slurp forward
-            state.slurp_forward();
-        } else if ctrl {
-            state.move_forward_sexp(extend);
+        if ctrl {
+            // Ctrl-Right / Ctrl-Shift-Right → next word boundary.
+            state.move_next_word(extend);
         } else {
             state.move_right(extend);
         }
@@ -2425,11 +2208,12 @@ fn handle_key(state: &mut ReditState, vk: u32) {
     } else if vk16 == VK_F5.0 {
         state.run_buffer();
     } else if vk16 == VK_RETURN.0 && ctrl {
-        // Ctrl-Enter: run the top-level form at cursor. Equivalent
-        // of Emacs C-M-x. WM_CHAR would deliver Ctrl+J (0x0A) for
-        // plain Ctrl+Enter via the typical Win32 mapping, but we
-        // catch it at the VK level here to be unambiguous.
-        state.run_form_at_point();
+        // Ctrl-Enter on the Lisp side ran the top-level form at
+        // cursor (Emacs C-M-x).  Forth doesn't have a clean "form
+        // under cursor" — definitions span between `:` and `;` and
+        // a colon-def can be many lines.  Treat Ctrl-Enter as a
+        // synonym for F5 (run whole buffer) for now.
+        state.run_buffer();
     } else if vk16 == VK_F7.0 {
         // F7 — run compile check on the current buffer.
         state.run_check();
@@ -2439,7 +2223,7 @@ fn handle_key(state: &mut ReditState, vk: u32) {
     }
 }
 
-fn handle_char(state: &mut ReditState, c: char) {
+fn handle_char(state: &mut FeditState, c: char) {
     // WM_CHAR delivers control codes (Ctrl+A = 0x01, Ctrl+C = 0x03,
     // Ctrl+V = 0x16, ...) before any further processing. We dispatch
     // shortcuts here because by this point Win32 has already mapped
@@ -2538,25 +2322,25 @@ fn handle_char(state: &mut ReditState, c: char) {
 
 /// Open/Save dialog filter spec. Win32 wants pairs of NUL-
 /// terminated strings (display label, glob), with an extra NUL at
-/// the end of the list. We default to Lisp; users can drop into
-/// "All files" for everything else.
-fn lisp_filter() -> Vec<u16> {
-    let raw = "Lisp source (*.lisp;*.cl;*.lsp)\0*.lisp;*.cl;*.lsp\0\
+/// the end of the list.  We default to Forth; users can drop
+/// into "All files" for everything else.
+fn forth_filter() -> Vec<u16> {
+    let raw = "Forth source (*.f;*.fs;*.4th;*.fth)\0*.f;*.fs;*.4th;*.fth\0\
                Text files (*.txt)\0*.txt\0\
                All files (*.*)\0*.*\0\0";
     raw.encode_utf16().collect()
 }
 
 /// Default extension when the user saves a new file without typing
-/// one. Win32 appends this if the filename has no `.` of its own.
-fn default_ext_lisp() -> Vec<u16> {
-    "lisp\0".encode_utf16().collect()
+/// one.  Win32 appends this if the filename has no `.` of its own.
+fn default_ext_forth() -> Vec<u16> {
+    "f\0".encode_utf16().collect()
 }
 
 fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
     let mut buf = vec![0u16; 1024];
-    let filter = lisp_filter();
-    let def_ext = default_ext_lisp();
+    let filter = forth_filter();
+    let def_ext = default_ext_forth();
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
@@ -2583,8 +2367,8 @@ fn save_file_dialog(owner: HWND, suggested: Option<&std::path::Path>) -> Option<
         let n = s.len().min(buf.len() - 1);
         buf[..n].copy_from_slice(&s[..n]);
     }
-    let filter = lisp_filter();
-    let def_ext = default_ext_lisp();
+    let filter = forth_filter();
+    let def_ext = default_ext_forth();
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
@@ -3005,7 +2789,7 @@ fn clipboard_set(owner: HWND, text: &str) -> bool {
                     }
                 }
             }
-            Err(e) => eprintln!("[ledit] GlobalAlloc failed: {e}"),
+            Err(e) => eprintln!("[fedit] GlobalAlloc failed: {e}"),
         }
         let _ = CloseClipboard();
     }

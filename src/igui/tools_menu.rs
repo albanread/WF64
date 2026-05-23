@@ -1,7 +1,7 @@
 //! Frame-level "Tools" menu and the keyboard accelerator table for
-//! ledit's built-in tool windows.
+//! fedit's built-in tool windows.
 //!
-//! Both `ledit` and `log_view` are always-available editor tools
+//! Both `fedit` and `log_view` are always-available editor tools
 //! that hang off a `Tools` submenu on the frame. Keeping their
 //! menu/accelerator wiring together here means the one-and-only
 //! Tools popup carries every entry, regardless of whether the
@@ -16,17 +16,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::log_view;
-use super::ledit;
+use super::fedit;
 use windows::Win32::UI::WindowsAndMessaging::MF_SEPARATOR;
 
-/// Append an `Edit` submenu to `bar`. The items are routed to the
-/// active MDI child via WM_COMMAND forwarding from the frame
-/// WndProc; ledit recognises the IDs in its own WM_COMMAND handler
-/// and dispatches to the matching method.
+/// Append an `Edit` submenu to `bar`.  Routed to the active MDI
+/// child via WM_COMMAND forwarding from the frame WndProc; fedit
+/// recognises the IDs in its own WM_COMMAND handler and dispatches
+/// to the matching method.
 ///
-/// Keeping these on a top-level menu makes the paredit ops
-/// discoverable — most users have not got the muscle memory for
-/// Ctrl-Shift-Right or Alt-W and would never find them otherwise.
+/// Forth-shaped menu: the sexp ops the Lisp version exposed
+/// (Forward S-expression / Slurp / Barf / Wrap / Splice / Raise)
+/// are gone — replaced by simple word-boundary navigation that
+/// makes sense for whitespace-delimited Forth tokens.  Run-Form
+/// is also gone (no single "form" to run in Forth); Run-Buffer
+/// is kept as F5 → evaluate the whole buffer.
 pub fn append_edit_menu(bar: HMENU) {
     let popup = match unsafe { CreatePopupMenu() } {
         Ok(p) => p,
@@ -37,25 +40,18 @@ pub fn append_edit_menu(bar: HMENU) {
     };
 
     let items: &[(u16, &str)] = &[
-        (ledit::EDIT_CMD_UNDO, "&Undo\tCtrl+Z"),
-        (ledit::EDIT_CMD_REDO, "&Redo\tCtrl+Y"),
+        (fedit::EDIT_CMD_UNDO, "&Undo\tCtrl+Z"),
+        (fedit::EDIT_CMD_REDO, "&Redo\tCtrl+Y"),
         (0, "SEP"),
-        (ledit::EDIT_CMD_CUT, "Cu&t\tCtrl+X"),
-        (ledit::EDIT_CMD_COPY, "&Copy\tCtrl+C"),
-        (ledit::EDIT_CMD_PASTE, "&Paste\tCtrl+V"),
-        (ledit::EDIT_CMD_SELECT_ALL, "Select &All\tCtrl+A"),
+        (fedit::EDIT_CMD_CUT, "Cu&t\tCtrl+X"),
+        (fedit::EDIT_CMD_COPY, "&Copy\tCtrl+C"),
+        (fedit::EDIT_CMD_PASTE, "&Paste\tCtrl+V"),
+        (fedit::EDIT_CMD_SELECT_ALL, "Select &All\tCtrl+A"),
         (0, "SEP"),
-        (ledit::EDIT_CMD_FORWARD_SEXP, "Forward S-expression\tCtrl+\u{2192}"),
-        (ledit::EDIT_CMD_BACKWARD_SEXP, "Backward S-expression\tCtrl+\u{2190}"),
+        (fedit::EDIT_CMD_NEXT_WORD, "Next &Word\tCtrl+\u{2192}"),
+        (fedit::EDIT_CMD_PREV_WORD, "Pre&v Word\tCtrl+\u{2190}"),
         (0, "SEP"),
-        (ledit::EDIT_CMD_SLURP_FORWARD, "&Slurp Forward\tCtrl+Shift+\u{2192}"),
-        (ledit::EDIT_CMD_BARF_FORWARD, "&Barf Forward\tCtrl+Shift+\u{2190}"),
-        (ledit::EDIT_CMD_WRAP, "&Wrap with ( )\tAlt+W"),
-        (ledit::EDIT_CMD_SPLICE, "Spli&ce / Unwrap\tAlt+S"),
-        (ledit::EDIT_CMD_RAISE, "&Raise\tAlt+R"),
-        (0, "SEP"),
-        (ledit::EDIT_CMD_RUN_FORM, "Run Form at &Point\tCtrl+Enter"),
-        (ledit::EDIT_CMD_RUN_BUFFER, "R&un Buffer\tF5"),
+        (fedit::EDIT_CMD_RUN_BUFFER, "R&un Buffer\tF5"),
     ];
 
     for &(id, label) in items {
@@ -81,7 +77,7 @@ pub fn append_edit_menu(bar: HMENU) {
 }
 
 /// Append a `Tools` submenu to `bar` containing every built-in tool
-/// (currently ledit and the log view). Called both from
+/// (currently fedit and the log view). Called both from
 /// `build_default_menu_bar` and from `menu::install_for_frame` so
 /// the tools stay reachable whatever the language thread does.
 pub fn append_tools_menu(bar: HMENU) {
@@ -93,16 +89,16 @@ pub fn append_tools_menu(bar: HMENU) {
         }
     };
 
-    let ledit_item: Vec<u16> = "ledit\tCtrl+Shift+E\0".encode_utf16().collect();
+    let fedit_item: Vec<u16> = "fedit\tCtrl+Shift+E\0".encode_utf16().collect();
     if let Err(e) = unsafe {
         AppendMenuW(
             popup,
             MF_STRING,
-            ledit::MENU_CMD_ID as usize,
-            PCWSTR(ledit_item.as_ptr()),
+            fedit::MENU_CMD_ID as usize,
+            PCWSTR(fedit_item.as_ptr()),
         )
     } {
-        eprintln!("[tools-menu] append ledit: {e}");
+        eprintln!("[tools-menu] append fedit: {e}");
     }
 
     let log_item: Vec<u16> = "Log\tCtrl+Shift+L\0".encode_utf16().collect();
@@ -141,7 +137,7 @@ pub fn build_default_menu_bar() -> Option<HMENU> {
 }
 
 /// Frame-level accelerator table:
-///   Ctrl+Shift+E → ledit
+///   Ctrl+Shift+E → fedit
 ///   Ctrl+Shift+L → log view
 /// Both dispatch via `WM_COMMAND` to their respective MENU_CMD_IDs,
 /// which the frame WndProc routes to the right `open` function.
@@ -150,7 +146,7 @@ pub fn build_accelerator_table() -> Option<HACCEL> {
         ACCEL {
             fVirt: FCONTROL | FSHIFT | FVIRTKEY,
             key: b'E' as u16,
-            cmd: ledit::MENU_CMD_ID,
+            cmd: fedit::MENU_CMD_ID,
         },
         ACCEL {
             fVirt: FCONTROL | FSHIFT | FVIRTKEY,

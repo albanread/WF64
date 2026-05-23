@@ -42,9 +42,8 @@ mod font_metrics;
 pub mod lisp_shims;
 pub mod log_view;
 mod menu;
-pub(crate) mod ledit;
+pub(crate) mod fedit;
 pub(crate) mod rope_buffer;
-pub(crate) mod sexp_nav;
 mod registry;
 mod renderer;
 mod replies;
@@ -53,7 +52,7 @@ pub mod system_colors;
 pub(crate) mod text_view;
 mod window;
 
-pub use ledit::{install_checker, Diagnostic};
+pub use fedit::{install_checker, Diagnostic};
 pub use window::run;
 
 /// Errors surfaced from iGui startup. Phase 1 keeps this lossy on purpose;

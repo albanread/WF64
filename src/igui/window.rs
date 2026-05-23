@@ -346,7 +346,7 @@ where
     }
 
     // Frame-level accelerator table for the built-in tools:
-    // Ctrl+Shift+E opens ledit, Ctrl+Shift+L opens the log view,
+    // Ctrl+Shift+E opens fedit, Ctrl+Shift+L opens the log view,
     // both regardless of which child has focus.
     let accel: Option<HACCEL> = super::tools_menu::build_accelerator_table();
 
@@ -362,7 +362,7 @@ where
             }
             // Frame accelerators run before MDI accel and TranslateMessage:
             // they own the highest-priority shortcuts (Ctrl+Shift+E to
-            // open ledit) regardless of which child has focus.
+            // open fedit) regardless of which child has focus.
             if let Some(h) = accel {
                 if TranslateAcceleratorW(hwnd, h, &mut msg) != 0 {
                     continue;
@@ -463,12 +463,12 @@ unsafe extern "system" fn frame_wnd_proc(
         }
         WM_COMMAND => {
             let cmd_id = (wparam.0 & 0xFFFF) as u16;
-            // Built-in tools (ledit, log view) are wired before the
+            // Built-in tools (fedit, log view) are wired before the
             // user menu so they work even if no language-thread spec
             // has been installed.
-            if cmd_id == super::ledit::MENU_CMD_ID {
+            if cmd_id == super::fedit::MENU_CMD_ID {
                 if mdi.0 as isize != 0 {
-                    super::ledit::open(hwnd, mdi);
+                    super::fedit::open(hwnd, mdi);
                 }
                 return LRESULT(0);
             }
@@ -479,12 +479,12 @@ unsafe extern "system" fn frame_wnd_proc(
                 return LRESULT(0);
             }
             // Edit-menu commands: forward to the active MDI child.
-            // ledit's WndProc recognises these IDs in its own
+            // fedit's WndProc recognises these IDs in its own
             // WM_COMMAND handler and dispatches to the right method.
             // If no child is active or the active child doesn't
             // care about Edit commands, the message is harmless.
-            if cmd_id >= super::ledit::EDIT_CMD_BASE
-                && cmd_id <= super::ledit::EDIT_CMD_END
+            if cmd_id >= super::fedit::EDIT_CMD_BASE
+                && cmd_id <= super::fedit::EDIT_CMD_END
             {
                 if mdi.0 as isize != 0 {
                     let active_raw = unsafe {
