@@ -1263,6 +1263,13 @@ fn write_event(
             // (wf64-ui's worker drains the typed variant directly).
             k = kind::EVAL_BUFFER;
         }
+        IGuiEvent::ReplSubmit { child_id } => {
+            // Reuse EVAL_BUFFER tag for C-ABI consumers.  The wf64-ui
+            // worker reads this via the Rust path and pops the input
+            // through `repl_pane::pop_input(child_id)`.
+            k = kind::EVAL_BUFFER;
+            child = child_id;
+        }
     }
 
     unsafe {

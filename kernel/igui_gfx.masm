@@ -1,0 +1,150 @@
+; ─────────────────────────────────────────────────────────────────────
+; WF64 kernel — iGui graphical-pane primitives.
+;
+; Thin wrappers over the Rust runtime gfx API (rt_gpane_*).  Forth
+; uses these to open a graphical MDI child and draw shapes into it.
+; All ops are batched: gpane-begin opens a batch for a given child,
+; subsequent draws push commands, gpane-present submits to the GUI
+; thread for the next frame.
+;
+; Colours are packed as 0xRRGGBB into a single Forth cell.
+; Coordinates and sizes are signed integer pixels.
+;
+; In the headless `wf64` binary the runtime fns are no-ops, so these
+; primitives are safe to call but produce nothing visible.
+; ─────────────────────────────────────────────────────────────────────
+
+
+; gpane-open  ( w h c-addr u -- id )
+;     Open a new graphical MDI child sized (w × h) with title at
+;     (c-addr, u).  Returns the child_id (non-zero on success) or 0
+;     on failure.
+proc(gpane_open_word)
+    ; Stack: u=TOS, c-addr=[DSP], h=[DSP+cell], w=[DSP+2*cell].
+    mov     rcx, [DSP + 2*cell]                 ; width
+    mov     rdx, [DSP + cell]                   ; height
+    mov     r8,  [DSP]                          ; title_addr
+    mov     r9,  TOS                            ; title_len
+    win64_call(rt_gpane_open)
+    ; Replace top 4 stack cells with the returned id.
+    mov     TOS, rax
+    stk(4, 1)
+    next()
+endp()
+
+
+; gpane-begin  ( id -- )
+;     Begin a draw batch targeting `id`.  Subsequent draw primitives
+;     push commands into the batch on this thread; gpane-present
+;     submits it.
+proc(gpane_begin_word)
+    mov     rcx, TOS                            ; child_id
+    win64_call(rt_gpane_begin)
+    ; Drop id.
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+
+; gpane-present  ( -- )
+;     Submit the current batch to the GUI thread.  Triggers a paint.
+proc(gpane_present_word)
+    win64_call(rt_gpane_present)
+    next()
+endp()
+
+
+; gpane-clear  ( rgb -- )
+;     Clear the current pane's batch with the packed RGB colour.
+proc(gpane_clear_word)
+    mov     rcx, TOS                            ; rgb
+    win64_call(rt_gpane_clear)
+    mov     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+
+; gpane-fill-rect  ( x y w h rgb -- )
+;     Push a filled-rectangle command into the current batch.
+proc(gpane_fill_rect_word)
+    ; Stack: rgb=TOS, h=[DSP], w=[DSP+cell], y=[DSP+2*cell], x=[DSP+3*cell]
+    mov     rcx, [DSP + 3*cell]                 ; x
+    mov     rdx, [DSP + 2*cell]                 ; y
+    mov     r8,  [DSP + cell]                   ; w
+    mov     r9,  [DSP]                          ; h
+    ; 5 args: arg5 goes on the stack at [rsp+32].
+    mov     r12, rsp
+    and     rsp, -16
+    sub     rsp, 48                             ; 32 shadow + 16 for arg5
+    mov     qword ptr [rsp + 32], TOS           ; arg5: rgb
+    call    rt_gpane_fill_rect
+    mov     rsp, r12
+    ; Drop all 5 args.
+    mov     TOS, [DSP + 4*cell]
+    stk(5, 0)
+    next()
+endp()
+
+
+; gpane-stroke-rect  ( x y w h thick rgb -- )
+;     Push a stroked-rectangle command into the current batch.
+proc(gpane_stroke_rect_word)
+    ; Stack: rgb=TOS, thick=[DSP], h=[DSP+cell], w=[DSP+2*cell],
+    ;        y=[DSP+3*cell], x=[DSP+4*cell].
+    mov     rcx, [DSP + 4*cell]                 ; x
+    mov     rdx, [DSP + 3*cell]                 ; y
+    mov     r8,  [DSP + 2*cell]                 ; w
+    mov     r9,  [DSP + cell]                   ; h
+    ; 6 args: arg5 + arg6 on the stack.
+    mov     r13, [DSP]                          ; thick (callee-saved scratch)
+    mov     r12, rsp
+    and     rsp, -16
+    sub     rsp, 48                             ; 32 shadow + 16 for arg5/arg6
+    mov     qword ptr [rsp + 32], r13           ; arg5: thick
+    mov     qword ptr [rsp + 40], TOS           ; arg6: rgb
+    call    rt_gpane_stroke_rect
+    mov     rsp, r12
+    mov     TOS, [DSP + 5*cell]
+    stk(6, 0)
+    next()
+endp()
+
+
+; gpane-line  ( x0 y0 x1 y1 thick rgb -- )
+;     Push a draw-line command into the current batch.
+proc(gpane_line_word)
+    ; Stack: rgb=TOS, thick=[DSP], y1=[DSP+cell], x1=[DSP+2*cell],
+    ;        y0=[DSP+3*cell], x0=[DSP+4*cell].
+    mov     rcx, [DSP + 4*cell]                 ; x0
+    mov     rdx, [DSP + 3*cell]                 ; y0
+    mov     r8,  [DSP + 2*cell]                 ; x1
+    mov     r9,  [DSP + cell]                   ; y1
+    mov     r13, [DSP]                          ; thick
+    mov     r12, rsp
+    and     rsp, -16
+    sub     rsp, 48                             ; 32 shadow + 16 for arg5/arg6
+    mov     qword ptr [rsp + 32], r13           ; arg5: thick
+    mov     qword ptr [rsp + 40], TOS           ; arg6: rgb
+    call    rt_gpane_line
+    mov     rsp, r12
+    mov     TOS, [DSP + 5*cell]
+    stk(6, 0)
+    next()
+endp()
+
+
+; gpane-fill-circle  ( cx cy r rgb -- )
+;     Push a filled-circle command into the current batch.
+proc(gpane_fill_circle_word)
+    ; Stack: rgb=TOS, r=[DSP], cy=[DSP+cell], cx=[DSP+2*cell].
+    mov     rcx, [DSP + 2*cell]                 ; cx
+    mov     rdx, [DSP + cell]                   ; cy
+    mov     r8,  [DSP]                          ; r
+    mov     r9,  TOS                            ; rgb
+    win64_call(rt_gpane_fill_circle)
+    mov     TOS, [DSP + 3*cell]
+    stk(4, 0)
+    next()
+endp()

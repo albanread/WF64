@@ -232,12 +232,23 @@ pub fn install_for_frame(frame: HWND, mdi_client: HWND, spec: &str) -> bool {
             return false;
         }
     };
-    // Always re-append the built-in editor menus (Edit, Tools) so
-    // they stay reachable regardless of what the language thread
-    // set. The Edit menu's items dispatch to whichever editable
-    // child is currently active.
+    // Always re-append the built-in editor menus so they stay
+    // reachable regardless of what the language thread set.
+    // The Edit menu's items dispatch to whichever editable child
+    // is currently active.
+    super::tools_menu::append_file_menu(menu);
     super::tools_menu::append_edit_menu(menu);
-    super::tools_menu::append_tools_menu(menu);
+    super::tools_menu::append_view_menu(menu);
+    super::tools_menu::append_forth_menu(menu);
+    // Demos are re-discovered each time we re-install the menu
+    // (cheap dir scan); ensures user-added demos appear without
+    // an IDE restart if the language thread pushes a new menu.
+    let demo_files = super::window::demo_files_snapshot();
+    let demo_pairs: Vec<(u16, String)> = demo_files
+        .iter()
+        .map(|(id, name, _)| (*id, name.clone()))
+        .collect();
+    super::tools_menu::append_demos_menu(menu, &demo_pairs);
     let set_result = unsafe { SetMenu(frame, Some(menu)) };
     let draw_result = unsafe { DrawMenuBar(frame) };
     eprintln!(

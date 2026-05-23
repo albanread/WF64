@@ -176,6 +176,17 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("at-xy",              "at_xy_word",               0),
     ("bug-rust-panic",     "bug_rust_panic_word",      0),
     ("bug-seh-av",         "bug_seh_av_word",          0),
+    // iGui graphical-pane drawing API.  See kernel/igui_gfx.masm
+    // for the docs.  Colours are packed 0xRRGGBB in one cell;
+    // coordinates and sizes are signed integer pixels.
+    ("gpane-open",         "gpane_open_word",          0),
+    ("gpane-begin",        "gpane_begin_word",         0),
+    ("gpane-present",      "gpane_present_word",       0),
+    ("gpane-clear",        "gpane_clear_word",         0),
+    ("gpane-fill-rect",    "gpane_fill_rect_word",     0),
+    ("gpane-stroke-rect",  "gpane_stroke_rect_word",   0),
+    ("gpane-line",         "gpane_line_word",          0),
+    ("gpane-fill-circle",  "gpane_fill_circle_word",   0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -789,6 +800,94 @@ struct RegisteredFunctionTable {
     entries: Box<[RuntimeFunction]>,
 }
 
+// ── Forth error helpers ───────────────────────────────────────────────────
+
+/// Decorate a raw `"Forth THROW n"` error with a human-readable description
+/// and any output the interpreter had already captured before the throw fired.
+fn annotate_forth_error(e: anyhow::Error, partial_output: &str) -> anyhow::Error {
+    let msg = e.to_string();
+    if let Some(tail) = msg.strip_prefix("Forth THROW ") {
+        if let Ok(code) = tail.trim().parse::<i64>() {
+            let desc = forth_throw_description(code);
+            let pre = partial_output.trim_end_matches('\n');
+            return if pre.is_empty() {
+                anyhow::anyhow!("Forth error ({code}): {desc}")
+            } else {
+                anyhow::anyhow!("Forth error ({code}): {desc}\n{pre}")
+            };
+        }
+    }
+    e // not a structured THROW — pass through unchanged
+}
+
+/// Map an ANS-standard THROW code to a short English description.
+/// Covers the full ANS table (codes −1 .. −58) plus WF64 extensions.
+pub fn forth_throw_description(code: i64) -> &'static str {
+    match code {
+        -1  => "ABORT",
+        -2  => "ABORT\" (with message)",
+        -3  => "stack overflow",
+        -4  => "stack underflow",
+        -5  => "return stack overflow",
+        -6  => "return stack underflow",
+        -7  => "DO-loop nesting too deep",
+        -8  => "dictionary overflow",
+        -9  => "invalid memory address",
+        -10 => "division by zero",
+        -11 => "result out of range",
+        -12 => "argument type mismatch",
+        -13 => "undefined word",
+        -14 => "interpreting a compile-only word",
+        -15 => "invalid FORGET",
+        -16 => "zero-length definition name",
+        -17 => "pictured numeric output string overflow",
+        -18 => "parsed string overflow",
+        -19 => "definition name too long",
+        -20 => "write to a read-only location",
+        -21 => "unsupported operation",
+        -22 => "control structure mismatch",
+        -23 => "address alignment exception",
+        -24 => "invalid numeric argument",
+        -25 => "return stack imbalance",
+        -26 => "loop parameters unavailable",
+        -27 => "invalid recursion",
+        -28 => "user interrupt",
+        -29 => "compiler nesting",
+        -30 => "obsolescent feature",
+        -31 => ">BODY used on a non-CREATEd word",
+        -32 => "invalid name argument (e.g. TO xxx)",
+        -33 => "block read exception",
+        -34 => "block write exception",
+        -35 => "invalid block number",
+        -36 => "invalid file position",
+        -37 => "file I/O exception",
+        -38 => "file not found",
+        -39 => "unexpected end of file",
+        -40 => "invalid BASE for floating-point conversion",
+        -41 => "loss of precision",
+        -42 => "floating-point divide by zero",
+        -43 => "floating-point result out of range",
+        -44 => "floating-point stack overflow",
+        -45 => "floating-point stack underflow",
+        -46 => "floating-point invalid argument",
+        -47 => "compilation word list deleted",
+        -48 => "invalid POSTPONE",
+        -49 => "search-order overflow",
+        -50 => "search-order underflow",
+        -51 => "compilation word list changed",
+        -52 => "control-flow stack overflow",
+        -53 => "exception stack overflow",
+        -54 => "floating-point underflow",
+        -55 => "floating-point unidentified fault",
+        -56 => "QUIT",
+        -57 => "exception in character I/O",
+        -58 => "[IF]/[ELSE]/[THEN] exception",
+        _   => "Forth exception",
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn align_up(addr: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
     (addr + align - 1) & !(align - 1)
@@ -1056,6 +1155,14 @@ impl Wf64Session {
                 "rt_igui_at_xy"         => Some(runtime::rt_igui_at_xy         as *mut c_void),
                 "rt_bug_rust_panic"     => Some(runtime::rt_bug_rust_panic     as *mut c_void),
                 "rt_bug_seh_av"         => Some(runtime::rt_bug_seh_av         as *mut c_void),
+                "rt_gpane_open"         => Some(runtime::rt_gpane_open         as *mut c_void),
+                "rt_gpane_begin"        => Some(runtime::rt_gpane_begin        as *mut c_void),
+                "rt_gpane_present"      => Some(runtime::rt_gpane_present      as *mut c_void),
+                "rt_gpane_clear"        => Some(runtime::rt_gpane_clear        as *mut c_void),
+                "rt_gpane_fill_rect"    => Some(runtime::rt_gpane_fill_rect    as *mut c_void),
+                "rt_gpane_stroke_rect"  => Some(runtime::rt_gpane_stroke_rect  as *mut c_void),
+                "rt_gpane_line"         => Some(runtime::rt_gpane_line         as *mut c_void),
+                "rt_gpane_fill_circle"  => Some(runtime::rt_gpane_fill_circle  as *mut c_void),
                 _ => None,
             }
         }).context("bind_externs failed")?;
@@ -1450,6 +1557,22 @@ impl Wf64Session {
         unsafe { (self.current_dsp as *mut i64).write_unaligned(v); }
     }
 
+    /// Preload `n` zero "cushion" cells onto the data stack.
+    /// Interactive sessions (wf64-ui) call this once at boot so a
+    /// few accidental over-drops at the REPL don't immediately
+    /// crash the worker thread.  Tests skip the cushion so they
+    /// see a truly empty stack.
+    ///
+    /// The cushion cells are real stack cells in every sense —
+    /// `.s`, `depth`, and the stack viewer pane all show them.
+    /// Users can drop them at any time; they regenerate only on
+    /// a fresh boot or Forth → Restart.
+    pub fn push_stack_cushion(&mut self, n: usize) {
+        for _ in 0..n {
+            self.push(0);
+        }
+    }
+
     /// Pop a cell. Panics on underflow — tests should know what's there.
     pub fn pop(&mut self) -> i64 {
         assert!(self.current_dsp < self.dsp_top, "stack underflow in pop()");
@@ -1490,6 +1613,14 @@ impl Wf64Session {
     }
 
     /// Feed text through the REPL (quit). Returns captured stdout.
+    ///
+    /// On a Forth-level error (uncaught `THROW`), returns `Err` with:
+    ///   - a human-readable description of the throw code, and
+    ///   - any output the interpreter captured *before* the throw
+    ///     (e.g. `"FOO ? "` when an unknown word is echoed at interpret
+    ///     time, or partial print output before a `THROW` in a word body).
+    /// This output is attached to the error message so the UI can display
+    /// it without losing context.
     pub fn eval(&mut self, input: &str) -> Result<String> {
         let io = runtime::Io::Buffered {
             input: input.as_bytes().to_vec(),
@@ -1498,16 +1629,22 @@ impl Wf64Session {
             output: Vec::new(),
         };
         let xt_quit = self.xt_of("quit")?;
-        let mut err = Ok(());
+        let mut call_err: Result<()> = Ok(());
         let (_, io_after) = runtime::with_io(io, || {
-            err = self.call_xt(xt_quit);
+            call_err = self.call_xt(xt_quit);
         });
-        err?;
-        match io_after {
+        // Capture output *before* checking for errors — the interpreter
+        // may have written useful context (a "? " marker, partial print
+        // output, etc.) before the THROW fired.
+        let output = match io_after {
             runtime::Io::Buffered { output, .. } => {
-                Ok(String::from_utf8_lossy(&output).into_owned())
+                String::from_utf8_lossy(&output).into_owned()
             }
             runtime::Io::Live { .. } => unreachable!("eval installed Buffered"),
+        };
+        match call_err {
+            Ok(()) => Ok(output),
+            Err(e) => Err(annotate_forth_error(e, &output)),
         }
     }
 

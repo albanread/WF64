@@ -1,61 +1,52 @@
-//! Frame-level "Tools" menu and the keyboard accelerator table for
-//! fedit's built-in tool windows.
+//! Frame-level menu bar and keyboard accelerators.
 //!
-//! Both `fedit` and `log_view` are always-available editor tools
-//! that hang off a `Tools` submenu on the frame. Keeping their
-//! menu/accelerator wiring together here means the one-and-only
-//! Tools popup carries every entry, regardless of whether the
-//! language thread has installed a custom menu.
+//! Layout (standard Windows MDI app convention):
+//!
+//!   File   New, Open…, Save, Save As…, Exit
+//!   Edit   Undo/Redo, Cut/Copy/Paste, Select All, word nav
+//!   View   Console, REPL, Log, Crash dump
+//!   Forth  Restart, Run Buffer
+//!
+//! File commands route to the active fedit child via the
+//! EDIT_CMD forwarding range (so opening from inside fedit Just
+//! Works); File→New / File→Exit are frame-level.
+//!
+//! View commands open or focus a built-in pane (singleton per
+//! pane).  Forth commands fire IGuiEvents the worker drains.
 
 #![cfg(windows)]
 
 use windows::core::PCWSTR;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, ACCEL, FCONTROL, FSHIFT,
-    FVIRTKEY, HACCEL, HMENU, MF_POPUP, MF_STRING,
+    FVIRTKEY, HACCEL, HMENU, MF_POPUP, MF_SEPARATOR, MF_STRING,
 };
 
-use super::log_view;
-use super::fedit;
-use super::fconsole;
 use super::crash_view;
-use windows::Win32::UI::WindowsAndMessaging::MF_SEPARATOR;
+use super::fconsole;
+use super::fedit;
+use super::log_view;
+use super::repl_pane;
+use super::stack_view;
 
-/// Append an `Edit` submenu to `bar`.  Routed to the active MDI
-/// child via WM_COMMAND forwarding from the frame WndProc; fedit
-/// recognises the IDs in its own WM_COMMAND handler and dispatches
-/// to the matching method.
-///
-/// Forth-shaped menu: the sexp ops the Lisp version exposed
-/// (Forward S-expression / Slurp / Barf / Wrap / Splice / Raise)
-/// are gone — replaced by simple word-boundary navigation that
-/// makes sense for whitespace-delimited Forth tokens.  Run-Form
-/// is also gone (no single "form" to run in Forth); Run-Buffer
-/// is kept as F5 → evaluate the whole buffer.
-pub fn append_edit_menu(bar: HMENU) {
-    let popup = match unsafe { CreatePopupMenu() } {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[edit-menu] CreatePopupMenu failed: {e}");
-            return;
-        }
-    };
+/// Frame-level WM_COMMAND id for File → Exit.  Frame-handled.
+pub const FILE_CMD_EXIT: u16 = 0x3050;
 
-    let items: &[(u16, &str)] = &[
-        (fedit::EDIT_CMD_UNDO, "&Undo\tCtrl+Z"),
-        (fedit::EDIT_CMD_REDO, "&Redo\tCtrl+Y"),
-        (0, "SEP"),
-        (fedit::EDIT_CMD_CUT, "Cu&t\tCtrl+X"),
-        (fedit::EDIT_CMD_COPY, "&Copy\tCtrl+C"),
-        (fedit::EDIT_CMD_PASTE, "&Paste\tCtrl+V"),
-        (fedit::EDIT_CMD_SELECT_ALL, "Select &All\tCtrl+A"),
-        (0, "SEP"),
-        (fedit::EDIT_CMD_NEXT_WORD, "Next &Word\tCtrl+\u{2192}"),
-        (fedit::EDIT_CMD_PREV_WORD, "Pre&v Word\tCtrl+\u{2190}"),
-        (0, "SEP"),
-        (fedit::EDIT_CMD_RUN_BUFFER, "R&un Buffer\tF5"),
-    ];
+/// Frame-level WM_COMMAND id for the Forth-Restart menu item.
+/// Living here so all menu IDs sit together.
+pub const FORTH_RESTART_CMD_ID: u16 = 0x3200;
 
+/// Range reserved for auto-assigned Demos menu items.
+/// Up to 4096 demos before we overflow — well past any reasonable
+/// directory size.
+pub const DEMO_CMD_BASE: u16 = 0x4000;
+pub const DEMO_CMD_END:  u16 = 0x4FFF;
+
+// ─── Menu builders ────────────────────────────────────────────────────
+
+/// Append items to a popup.  `id = 0` with label `"SEP"` inserts a
+/// separator; everything else is a normal MF_STRING item.
+fn append_items(popup: HMENU, ctx: &str, items: &[(u16, &str)]) {
     for &(id, label) in items {
         if label == "SEP" {
             let _ = unsafe { AppendMenuW(popup, MF_SEPARATOR, 0, PCWSTR::null()) };
@@ -66,172 +57,149 @@ pub fn append_edit_menu(bar: HMENU) {
         if let Err(e) = unsafe {
             AppendMenuW(popup, MF_STRING, id as usize, PCWSTR(w.as_ptr()))
         } {
-            eprintln!("[edit-menu] append {label:?}: {e}");
+            eprintln!("[{ctx}] append {label:?}: {e}");
         }
-    }
-
-    let title: Vec<u16> = "&Edit\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(bar, MF_POPUP, popup.0 as usize, PCWSTR(title.as_ptr()))
-    } {
-        eprintln!("[edit-menu] append popup: {e}");
     }
 }
 
-/// Append a `Tools` submenu to `bar` containing every built-in tool
-/// (currently fedit and the log view). Called both from
-/// `build_default_menu_bar` and from `menu::install_for_frame` so
-/// the tools stay reachable whatever the language thread does.
-pub fn append_tools_menu(bar: HMENU) {
-    let popup = match unsafe { CreatePopupMenu() } {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[tools-menu] CreatePopupMenu failed: {e}");
-            return;
-        }
+fn append_popup(bar: HMENU, ctx: &str, title: &str, popup: HMENU) {
+    let mut t: Vec<u16> = title.encode_utf16().collect();
+    t.push(0);
+    if let Err(e) = unsafe {
+        AppendMenuW(bar, MF_POPUP, popup.0 as usize, PCWSTR(t.as_ptr()))
+    } {
+        eprintln!("[{ctx}] append popup: {e}");
+    }
+}
+
+/// File menu — New, Open, Save, Save As, Exit.
+pub fn append_file_menu(bar: HMENU) {
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
+        eprintln!("[file-menu] CreatePopupMenu failed");
+        return;
     };
-
-    let fedit_item: Vec<u16> = "fedit\tCtrl+Shift+E\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            popup,
-            MF_STRING,
-            fedit::MENU_CMD_ID as usize,
-            PCWSTR(fedit_item.as_ptr()),
-        )
-    } {
-        eprintln!("[tools-menu] append fedit: {e}");
-    }
-
-    let log_item: Vec<u16> = "Log\tCtrl+Shift+L\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            popup,
-            MF_STRING,
-            log_view::MENU_CMD_ID as usize,
-            PCWSTR(log_item.as_ptr()),
-        )
-    } {
-        eprintln!("[tools-menu] append log: {e}");
-    }
-
-    let console_item: Vec<u16> = "Console\tCtrl+Shift+R\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            popup,
-            MF_STRING,
-            fconsole::MENU_CMD_ID as usize,
-            PCWSTR(console_item.as_ptr()),
-        )
-    } {
-        eprintln!("[tools-menu] append console: {e}");
-    }
-
-    let crash_item: Vec<u16> = "Crash dump\tCtrl+Shift+X\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            popup,
-            MF_STRING,
-            crash_view::MENU_CMD_ID as usize,
-            PCWSTR(crash_item.as_ptr()),
-        )
-    } {
-        eprintln!("[tools-menu] append crash: {e}");
-    }
-
-    let title: Vec<u16> = "&Tools\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            bar,
-            MF_POPUP,
-            popup.0 as usize,
-            PCWSTR(title.as_ptr()),
-        )
-    } {
-        eprintln!("[tools-menu] append popup: {e}");
-    }
+    append_items(popup, "file-menu", &[
+        (fedit::MENU_CMD_ID,       "&New\tCtrl+N"),
+        (fedit::EDIT_CMD_OPEN,     "&Open…\tCtrl+O"),
+        (0,                        "SEP"),
+        (fedit::EDIT_CMD_SAVE,     "&Save\tCtrl+S"),
+        (fedit::EDIT_CMD_SAVE_AS,  "Save &As…\tCtrl+Shift+S"),
+        (0,                        "SEP"),
+        (FILE_CMD_EXIT,            "E&xit\tAlt+F4"),
+    ]);
+    append_popup(bar, "file-menu", "&File", popup);
 }
 
-/// Frame-level WM_COMMAND id for the Forth-Restart menu item.
-/// Living in tools_menu so all menu IDs sit together.
-pub const FORTH_RESTART_CMD_ID: u16 = 0x3200;
+/// Edit menu — Undo, Redo, Cut, Copy, Paste, Select All, word nav.
+pub fn append_edit_menu(bar: HMENU) {
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
+        eprintln!("[edit-menu] CreatePopupMenu failed");
+        return;
+    };
+    append_items(popup, "edit-menu", &[
+        (fedit::EDIT_CMD_UNDO,       "&Undo\tCtrl+Z"),
+        (fedit::EDIT_CMD_REDO,       "&Redo\tCtrl+Y"),
+        (0,                          "SEP"),
+        (fedit::EDIT_CMD_CUT,        "Cu&t\tCtrl+X"),
+        (fedit::EDIT_CMD_COPY,       "&Copy\tCtrl+C"),
+        (fedit::EDIT_CMD_PASTE,      "&Paste\tCtrl+V"),
+        (fedit::EDIT_CMD_SELECT_ALL, "Select &All\tCtrl+A"),
+        (0,                          "SEP"),
+        (fedit::EDIT_CMD_NEXT_WORD,  "Next &Word\tCtrl+\u{2192}"),
+        (fedit::EDIT_CMD_PREV_WORD,  "Pre&v Word\tCtrl+\u{2190}"),
+    ]);
+    append_popup(bar, "edit-menu", "&Edit", popup);
+}
 
-/// Append a `Forth` submenu to `bar` carrying the language-thread
-/// lifecycle commands.  Currently just Restart; Reload-core and
-/// Trace toggles will join later.
+/// View menu — the built-in panes.  Each entry focuses an
+/// existing singleton or creates a new one.
+pub fn append_view_menu(bar: HMENU) {
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
+        eprintln!("[view-menu] CreatePopupMenu failed");
+        return;
+    };
+    append_items(popup, "view-menu", &[
+        (fconsole::MENU_CMD_ID,    "&Console\tCtrl+Shift+R"),
+        (repl_pane::MENU_CMD_ID,   "&REPL\tCtrl+Shift+P"),
+        (stack_view::MENU_CMD_ID,  "&Stack\tCtrl+Shift+K"),
+        (log_view::MENU_CMD_ID,    "&Log\tCtrl+Shift+L"),
+        (crash_view::MENU_CMD_ID,  "Crash &Dump\tCtrl+Shift+X"),
+    ]);
+    append_popup(bar, "view-menu", "&View", popup);
+}
+
+/// Demos menu — one entry per discovered `.f` file in `demos/`.
+/// `demos` is a slice of `(menu_id, display_name)` pairs.  Silently
+/// skipped when empty (no menu shown), so the bar stays clean when
+/// the user installed wf64 without the demos directory.
+pub fn append_demos_menu(bar: HMENU, demos: &[(u16, String)]) {
+    if demos.is_empty() {
+        return;
+    }
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
+        eprintln!("[demos-menu] CreatePopupMenu failed");
+        return;
+    };
+    for (id, name) in demos {
+        let mut w: Vec<u16> = name.encode_utf16().collect();
+        w.push(0);
+        if let Err(e) = unsafe {
+            AppendMenuW(popup, MF_STRING, *id as usize, PCWSTR(w.as_ptr()))
+        } {
+            eprintln!("[demos-menu] append {name:?}: {e}");
+        }
+    }
+    append_popup(bar, "demos-menu", "&Demos", popup);
+}
+
+/// Forth menu — language-thread lifecycle and buffer evaluation.
 pub fn append_forth_menu(bar: HMENU) {
-    let popup = match unsafe { CreatePopupMenu() } {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[forth-menu] CreatePopupMenu failed: {e}");
-            return;
-        }
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
+        eprintln!("[forth-menu] CreatePopupMenu failed");
+        return;
     };
-
-    let restart_item: Vec<u16> = "&Restart\tCtrl+Shift+F5\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            popup,
-            MF_STRING,
-            FORTH_RESTART_CMD_ID as usize,
-            PCWSTR(restart_item.as_ptr()),
-        )
-    } {
-        eprintln!("[forth-menu] append restart: {e}");
-    }
-
-    let title: Vec<u16> = "&Forth\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(bar, MF_POPUP, popup.0 as usize, PCWSTR(title.as_ptr()))
-    } {
-        eprintln!("[forth-menu] append popup: {e}");
-    }
+    append_items(popup, "forth-menu", &[
+        (FORTH_RESTART_CMD_ID,        "&Restart\tCtrl+Shift+F5"),
+        (0,                           "SEP"),
+        (fedit::EDIT_CMD_RUN_BUFFER,  "R&un Buffer\tF5"),
+    ]);
+    append_popup(bar, "forth-menu", "Fo&rth", popup);
 }
 
-/// Build a stand-alone menu bar containing the Edit, Forth, and
-/// Tools submenus.  Used at frame startup when no language-thread
-/// menu has been set.
-pub fn build_default_menu_bar() -> Option<HMENU> {
+/// Build the default frame menu bar: File, Edit, View, Forth,
+/// [Demos].  `demos` carries `(id, display_name)` pairs from the
+/// frame's demo-discovery pass; pass an empty slice for no Demos
+/// menu.
+pub fn build_default_menu_bar(demos: &[(u16, String)]) -> Option<HMENU> {
     let bar = unsafe { CreateMenu() }.ok()?;
+    append_file_menu(bar);
     append_edit_menu(bar);
+    append_view_menu(bar);
     append_forth_menu(bar);
-    append_tools_menu(bar);
+    append_demos_menu(bar, demos);
     Some(bar)
 }
 
-/// Frame-level accelerator table:
-///   Ctrl+Shift+E → fedit
-///   Ctrl+Shift+L → log view
-/// Both dispatch via `WM_COMMAND` to their respective MENU_CMD_IDs,
-/// which the frame WndProc routes to the right `open` function.
+/// Frame-level accelerator table.  Mirrors the visible menu
+/// shortcuts so power-users get the same keystrokes regardless of
+/// whether the menu is open.
 pub fn build_accelerator_table() -> Option<HACCEL> {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_F5;
     let entries = [
-        ACCEL {
-            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
-            key: b'E' as u16,
-            cmd: fedit::MENU_CMD_ID,
-        },
-        ACCEL {
-            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
-            key: b'L' as u16,
-            cmd: log_view::MENU_CMD_ID,
-        },
-        ACCEL {
-            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
-            key: b'R' as u16,
-            cmd: fconsole::MENU_CMD_ID,
-        },
-        ACCEL {
-            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
-            key: VK_F5.0,
-            cmd: FORTH_RESTART_CMD_ID,
-        },
-        ACCEL {
-            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
-            key: b'X' as u16,
-            cmd: crash_view::MENU_CMD_ID,
-        },
+        // File
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,          key: b'N' as u16, cmd: fedit::MENU_CMD_ID },
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,          key: b'O' as u16, cmd: fedit::EDIT_CMD_OPEN },
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,          key: b'S' as u16, cmd: fedit::EDIT_CMD_SAVE },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'S' as u16, cmd: fedit::EDIT_CMD_SAVE_AS },
+        // View
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'R' as u16, cmd: fconsole::MENU_CMD_ID },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'P' as u16, cmd: repl_pane::MENU_CMD_ID },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'K' as u16, cmd: stack_view::MENU_CMD_ID },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'L' as u16, cmd: log_view::MENU_CMD_ID },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'X' as u16, cmd: crash_view::MENU_CMD_ID },
+        // Forth
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: VK_F5.0,     cmd: FORTH_RESTART_CMD_ID },
+        ACCEL { fVirt: FVIRTKEY,                     key: VK_F5.0,     cmd: fedit::EDIT_CMD_RUN_BUFFER },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }
         .ok()

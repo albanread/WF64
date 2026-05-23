@@ -132,6 +132,13 @@ pub const EDIT_CMD_PREV_WORD: u16 = 0x3121;
 /// `EvalBuffer` event.  The wf64-ui main loop hands it to
 /// `Wf64Session::eval` and writes the result to the log overlay.
 pub const EDIT_CMD_RUN_BUFFER: u16 = 0x3140;
+/// File-menu Save / Save-as / Open routed to the active fedit
+/// child via the same EDIT_CMD forwarding path.  Save uses the
+/// existing path (or prompts if none); Save-as always prompts.
+/// Open prompts and replaces the buffer in the active fedit.
+pub const EDIT_CMD_SAVE: u16 = 0x3150;
+pub const EDIT_CMD_SAVE_AS: u16 = 0x3151;
+pub const EDIT_CMD_OPEN: u16 = 0x3152;
 
 const FEDIT_CLASS: PCWSTR = w!("WF64.iGui.Fedit");
 const TITLE_NEW: PCWSTR = w!("\u{2234} fedit \u{2014} untitled");
@@ -2160,6 +2167,25 @@ fn handle_edit_menu(state: &mut FeditState, cmd_id: u16) -> bool {
         EDIT_CMD_NEXT_WORD => state.move_next_word(false),
         EDIT_CMD_PREV_WORD => state.move_prev_word(false),
         EDIT_CMD_RUN_BUFFER => state.run_buffer(),
+        EDIT_CMD_OPEN => {
+            if let Some(p) = open_file_dialog(state.hwnd) {
+                state.load_from(p);
+            }
+        }
+        EDIT_CMD_SAVE => {
+            if let Some(p) = state.file_path.clone() {
+                state.save_to(p);
+            } else if let Some(p) =
+                save_file_dialog(state.hwnd, state.file_path.as_deref())
+            {
+                state.save_to(p);
+            }
+        }
+        EDIT_CMD_SAVE_AS => {
+            if let Some(p) = save_file_dialog(state.hwnd, state.file_path.as_deref()) {
+                state.save_to(p);
+            }
+        }
         _ => return false,
     }
     true
@@ -2742,6 +2768,18 @@ fn looks_like_number(word: &str) -> bool {
     let start = if bytes[0] == b'-' || bytes[0] == b'+' { 1 } else { 0 };
     if start >= bytes.len() { return false; }
     let body = &word[start..];
+    // Hex literal: `0x…` / `0X…` / `$…`.  Mirror the kernel's
+    // `number?` recogniser so the highlighter and parser agree.
+    if let Some(rest) = body
+        .strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
+    {
+        return !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    if let Some(rest) = body.strip_prefix('$') {
+        return !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_hexdigit());
+    }
     // Plain integer.
     if body.bytes().all(|b| b.is_ascii_digit()) {
         return true;

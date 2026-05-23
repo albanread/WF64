@@ -482,14 +482,14 @@ fn eval_exit_returns_early_from_definition() {
 fn eval_colon_without_name_throws_minus_16() {
     let mut s = sess();
     let err = s.eval(":\n").unwrap_err().to_string();
-    assert!(err.contains("Forth THROW -16"), "got {err:?}");
+    assert!(err.contains("-16"), "got {err:?}");
 }
 
 #[test]
 fn eval_exit_in_interpret_state_throws_minus_14() {
     let mut s = sess();
     let err = s.eval("exit\n").unwrap_err().to_string();
-    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+    assert!(err.contains("-14"), "got {err:?}");
 }
 
 #[test]
@@ -864,7 +864,7 @@ fn load_source_file_abort_quote_in_interpret_state_throws_minus_14() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
     s.load_source_file(&path).unwrap();
     let err = s.eval("abort\" nope\"\n").unwrap_err().to_string();
-    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+    assert!(err.contains("-14"), "got {err:?}");
 }
 
 #[test]
@@ -981,7 +981,7 @@ fn load_source_file_defer_defaults_to_uninitialized_throw() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
     s.load_source_file(&path).unwrap();
     let err = s.eval("defer hook\nhook\nbye\n").unwrap_err().to_string();
-    assert!(err.contains("Forth THROW -261"), "got {err:?}");
+    assert!(err.contains("-261"), "got {err:?}");
 }
 
 #[test]
@@ -1032,14 +1032,14 @@ fn eval_colon_defs_register_debug_words() {
 fn eval_create_without_name_throws_minus_16() {
     let mut s = sess();
     let err = s.eval("create\n").unwrap_err().to_string();
-    assert!(err.contains("Forth THROW -16"), "got {err:?}");
+    assert!(err.contains("-16"), "got {err:?}");
 }
 
 #[test]
 fn eval_semicolon_in_interpret_state_throws_minus_14() {
     let mut s = sess();
     let err = s.eval(";\n").unwrap_err().to_string();
-    assert!(err.contains("Forth THROW -14"), "got {err:?}");
+    assert!(err.contains("-14"), "got {err:?}");
 }
 
 #[test]

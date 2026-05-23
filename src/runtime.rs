@@ -1704,6 +1704,192 @@ thread_local! {
         std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
 }
 
+// ─── Forth-callable graphical pane API ───────────────────────────────
+//
+// Thin layer over `window::open_child` + `batch::push/finish/submit`.
+// Forth opens a graphical MDI child, calls `gpane-begin id`, then any
+// number of draw primitives, then `gpane-present`.  Colours are packed
+// as 0xRRGGBB into a single Forth cell; coordinates are signed cells
+// (pixels).
+//
+// All draw primitives operate on the worker thread's current batch
+// (`batch::push` is thread-local).  The actual paint happens on the
+// GUI thread after `submit` posts a fresh PaneBatch + invalidates.
+
+/// Open a graphical MDI child sized `width x height` with the given
+/// UTF-8 title (read from `title_addr..title_addr+title_len`).
+/// Returns the child_id (positive i64) on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn rt_gpane_open(
+    width: u64,
+    height: u64,
+    title_addr: u64,
+    title_len: u64,
+) -> u64 {
+    #[cfg(windows)]
+    {
+        let title = unsafe {
+            std::slice::from_raw_parts(title_addr as *const u8, title_len as usize)
+        };
+        let title = std::str::from_utf8(title).unwrap_or("∴ gpane");
+        match crate::igui::window::open_child_sized(
+            title,
+            width as i32,
+            height as i32,
+        ) {
+            Some(id) => id as u64,
+            None => 0,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (width, height, title_addr, title_len);
+        0
+    }
+}
+
+/// Begin a draw batch targeting `child_id`.  Replaces any in-progress
+/// batch on this thread.  Pair with `rt_gpane_present`.
+#[no_mangle]
+pub extern "C" fn rt_gpane_begin(child_id: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        crate::igui::batch::begin(child_id as i64);
+    }
+    let _ = child_id;
+    0
+}
+
+/// Submit the current batch to the GUI thread; paints next frame.
+/// No-op if no batch is in progress.
+#[no_mangle]
+pub extern "C" fn rt_gpane_present() -> u64 {
+    #[cfg(windows)]
+    {
+        if let Some(batch) = crate::igui::batch::finish() {
+            crate::igui::batch::submit(batch);
+        }
+    }
+    0
+}
+
+/// Decode a 24-bit packed RGB cell (0xRRGGBB) into the float RGBA the
+/// surface batch expects.  Alpha is always 1.0.
+#[cfg(windows)]
+fn rgb_to_rgba(packed: u64) -> crate::igui::batch::Rgba {
+    let r = ((packed >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((packed >> 8) & 0xFF) as f32 / 255.0;
+    let b = (packed & 0xFF) as f32 / 255.0;
+    crate::igui::batch::Rgba { r, g, b, a: 1.0 }
+}
+
+/// Clear the pane with `rgb` (packed 0xRRGGBB).
+#[no_mangle]
+pub extern "C" fn rt_gpane_clear(rgb: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        crate::igui::batch::push(
+            crate::igui::batch::SurfaceCmd::Clear {
+                color: rgb_to_rgba(rgb),
+            },
+        );
+    }
+    let _ = rgb;
+    0
+}
+
+/// Fill a rectangle at (x, y) with size (w × h).
+#[no_mangle]
+pub extern "C" fn rt_gpane_fill_rect(
+    x: u64, y: u64, w: u64, h: u64, rgb: u64,
+) -> u64 {
+    #[cfg(windows)]
+    {
+        let (x, y, w, h) = (x as i64 as f32, y as i64 as f32,
+                            w as i64 as f32, h as i64 as f32);
+        crate::igui::batch::push(
+            crate::igui::batch::SurfaceCmd::FillRect {
+                rect: crate::igui::batch::Rect {
+                    x0: x, y0: y, x1: x + w, y1: y + h,
+                },
+                corner_radius: 0.0,
+                color: rgb_to_rgba(rgb),
+            },
+        );
+    }
+    let _ = (x, y, w, h, rgb);
+    0
+}
+
+/// Stroke a rectangle.  `thick` is the line thickness in pixels.
+#[no_mangle]
+pub extern "C" fn rt_gpane_stroke_rect(
+    x: u64, y: u64, w: u64, h: u64, thick: u64, rgb: u64,
+) -> u64 {
+    #[cfg(windows)]
+    {
+        let (x, y, w, h) = (x as i64 as f32, y as i64 as f32,
+                            w as i64 as f32, h as i64 as f32);
+        let thick = thick as i64 as f32;
+        crate::igui::batch::push(
+            crate::igui::batch::SurfaceCmd::StrokeRect {
+                rect: crate::igui::batch::Rect {
+                    x0: x, y0: y, x1: x + w, y1: y + h,
+                },
+                corner_radius: 0.0,
+                half_thickness: thick / 2.0,
+                color: rgb_to_rgba(rgb),
+            },
+        );
+    }
+    let _ = (x, y, w, h, thick, rgb);
+    0
+}
+
+/// Draw a line from (x0,y0) to (x1,y1) with thickness `thick`.
+#[no_mangle]
+pub extern "C" fn rt_gpane_line(
+    x0: u64, y0: u64, x1: u64, y1: u64, thick: u64, rgb: u64,
+) -> u64 {
+    #[cfg(windows)]
+    {
+        let x0 = x0 as i64 as f32; let y0 = y0 as i64 as f32;
+        let x1 = x1 as i64 as f32; let y1 = y1 as i64 as f32;
+        let thick = thick as i64 as f32;
+        crate::igui::batch::push(
+            crate::igui::batch::SurfaceCmd::DrawLine {
+                p0: crate::igui::batch::Point { x: x0, y: y0 },
+                p1: crate::igui::batch::Point { x: x1, y: y1 },
+                half_thickness: thick / 2.0,
+                color: rgb_to_rgba(rgb),
+            },
+        );
+    }
+    let _ = (x0, y0, x1, y1, thick, rgb);
+    0
+}
+
+/// Fill a circle centered at (cx,cy) with radius `r`.
+#[no_mangle]
+pub extern "C" fn rt_gpane_fill_circle(
+    cx: u64, cy: u64, r: u64, rgb: u64,
+) -> u64 {
+    #[cfg(windows)]
+    {
+        let cx = cx as i64 as f32; let cy = cy as i64 as f32;
+        let r = r as i64 as f32;
+        crate::igui::batch::push(
+            crate::igui::batch::SurfaceCmd::FillCircle {
+                center: crate::igui::batch::Point { x: cx, y: cy },
+                radius: r,
+                color: rgb_to_rgba(rgb),
+            },
+        );
+    }
+    let _ = (cx, cy, r, rgb);
+    0
+}
+
 /// Compile-mode helper for `S$"`.  Allocates a LITERAL slot,
 /// allocates a fresh `String` GC object copying `len` bytes from
 /// `src_addr`, stores the tagged pointer into the literal slot,

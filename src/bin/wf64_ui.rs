@@ -154,6 +154,9 @@ fn run_forth_worker() {
                 return;
             }
         };
+        // Publish the initial (empty) stack so the stack viewer
+        // shows "depth: 0" instead of stale data from a previous run.
+        wf64::igui::stack_view::publish(session.stack());
         // catch_unwind takes ownership of session — on panic it
         // gets dropped here, freeing the Wf64Session's heap/kernel
         // arena.  On clean exit (Ok(())) we return from the worker.
@@ -199,6 +202,7 @@ fn run_drain_loop(mut session: wf64::Wf64Session) {
                     format_args!("eval ({} bytes) took {}us",
                         source.len(), teval.elapsed().as_micros()),
                 );
+                wf64::igui::stack_view::publish(session.stack());
                 // Deferred-panic check: `bug-rust-panic` from
                 // Forth set this flag during the eval; panic NOW,
                 // in pure-Rust context, so unwinding is sound
@@ -217,6 +221,37 @@ fn run_drain_loop(mut session: wf64::Wf64Session) {
                 match boot_session(false) {
                     Some(s) => session = s,
                     None => return,
+                }
+                wf64::igui::stack_view::publish(session.stack());
+            }
+            IGuiEvent::ReplSubmit { child_id } => {
+                use wf64::igui::repl_pane::{self, AppendKind};
+                let Some(source) = repl_pane::pop_input(child_id) else {
+                    continue;
+                };
+                match session.eval(&source) {
+                    Ok(output) => {
+                        let trimmed = output.trim_end_matches('\n');
+                        if !trimmed.is_empty() {
+                            repl_pane::append(
+                                child_id,
+                                trimmed.to_string(),
+                                AppendKind::Output,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Include any output captured before the throw
+                        // (may be empty; the trim below handles that).
+                        let msg = e.to_string();
+                        repl_pane::append(child_id, msg, AppendKind::Error);
+                    }
+                }
+                wf64::igui::stack_view::publish(session.stack());
+                if wf64::runtime::BUG_PANIC_PENDING.swap(
+                    false, std::sync::atomic::Ordering::SeqCst,
+                ) {
+                    panic!("bug-rust-panic triggered from Forth — testing crash recovery");
                 }
             }
             IGuiEvent::FrameClose => {
@@ -298,6 +333,15 @@ fn boot_session(intro: bool) -> Option<wf64::Wf64Session> {
         Ok(()) => fconsole::append(&format!("∴ loaded {}", core_path.display())),
         Err(e) => fconsole::append(&format!("∴ core.f load failed: {e}")),
     }
+    // Preload a cushion of zeros so a couple of accidental
+    // over-drops at the REPL don't immediately crash the worker.
+    // Eight cells = one cache line; enough to recover from a
+    // typo, not so many that `.s` looks cluttered.
+    const STACK_CUSHION: usize = 8;
+    session.push_stack_cushion(STACK_CUSHION);
+    fconsole::append(&format!(
+        "∴ {STACK_CUSHION} cushion cells preloaded (drop them or ignore)"
+    ));
     // No manual " ok" — the include itself emits one through the
     // captured IO stream when it succeeds.
     fconsole::append("");
@@ -326,18 +370,51 @@ fn handle_eval(session: &mut wf64::Wf64Session, source: &str) {
     }
     match session.eval(source) {
         Ok(output) => {
-            // The Forth interpreter itself emits ` ok\n` at the end
-            // of a successful eval — DON'T add another one here, or
-            // you'll see "ok ok" on every prompt.
+            // The kernel emits ` ok\n` after every successful eval.
+            // Strip it: when the eval also produced user output, the
+            // trailing "ok" is just noise (especially for the multi-
+            // line demos that fill the screen).  On an empty success
+            // we still show a faint "ok" so the user knows the eval
+            // ran (e.g. ` : foo 1 2 + ; ` defines a word and prints
+            // nothing else).
             let trimmed = output.trim_end_matches('\n');
-            if !trimmed.is_empty() {
-                for line in trimmed.lines() {
+            let body = trimmed
+                .strip_suffix(" ok")
+                .map(|s| s.trim_end_matches('\n'))
+                .unwrap_or(trimmed);
+            if body.is_empty() {
+                fconsole::append("ok");
+            } else {
+                for line in body.lines() {
                     fconsole::append(line);
                 }
             }
         }
         Err(e) => {
-            fconsole::append(&format!("{e}"));
+            // First line: ⚠ + human-readable error description.
+            // Remaining lines: output captured before the throw fired
+            // (e.g. interpreter's "FOO ? " marker, partial print output).
+            let msg = e.to_string();
+            let mut lines = msg.lines();
+            if let Some(first) = lines.next() {
+                fconsole::append(&format!("⚠ {first}"));
+            }
+            for ln in lines {
+                if !ln.is_empty() {
+                    fconsole::append(&format!("  {ln}"));
+                }
+            }
+            // Show the surviving stack so the user can see what's left.
+            let stk = session.stack();
+            if !stk.is_empty() {
+                let items: Vec<String> = stk.iter().map(|v| v.to_string()).collect();
+                fconsole::append(&format!(
+                    "  stack ({} item{}): {}  ← TOS",
+                    stk.len(),
+                    if stk.len() == 1 { "" } else { "s" },
+                    items.join("  "),
+                ));
+            }
         }
     }
 }

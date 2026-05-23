@@ -107,6 +107,83 @@ static MDICLIENT_ORIG_PROC: OnceLock<isize> = OnceLock::new();
 /// Was LAMBDA_BRUSH_RAW (lisp wallpaper) before the Forth port.
 static LOGO_BRUSH_RAW: OnceLock<isize> = OnceLock::new();
 
+/// Discovered demo files: (menu_id, display_name, absolute_path).
+/// Populated by `discover_demos` at frame creation; the WM_COMMAND
+/// handler looks up entries here when the user clicks a Demos item.
+static DEMO_FILES: OnceLock<Vec<(u16, String, std::path::PathBuf)>> = OnceLock::new();
+
+/// Snapshot of the demos table for menu rebuilds.  Returns an
+/// empty Vec if discovery hasn't run yet (e.g. before
+/// `run()` populated DEMO_FILES).
+pub(crate) fn demo_files_snapshot() -> Vec<(u16, String, std::path::PathBuf)> {
+    DEMO_FILES.get().cloned().unwrap_or_default()
+}
+
+/// Scan for `demos/*.f` files and return `(menu_id, display_name, path)`
+/// triples sorted by filename.
+///
+/// Search order (first non-empty hit wins):
+///   1. `<exe>/demos/`            — what we'd ship in an installer
+///   2. `<exe>/../../demos/`      — `target/release/demos/` → repo root
+///   3. `CARGO_MANIFEST_DIR/demos/` — fallback for `cargo run` from anywhere
+///
+/// Display name = filename stem with `-`/`_` turned into spaces and each
+/// word title-cased.  `stack-tour.f` → `"Stack Tour"`.
+fn discover_demos() -> Vec<(u16, String, std::path::PathBuf)> {
+    use super::tools_menu::{DEMO_CMD_BASE, DEMO_CMD_END};
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join("demos"));
+            if let Some(repo) = exe.ancestors().nth(3) {
+                candidates.push(repo.join("demos"));
+            }
+        }
+    }
+    candidates.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demos"));
+
+    for dir in &candidates {
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("f"))
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            continue;
+        }
+        return files
+            .into_iter()
+            .enumerate()
+            .take((DEMO_CMD_END - DEMO_CMD_BASE + 1) as usize)
+            .map(|(i, path)| {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                let pretty = stem
+                    .split(|c: char| c == '-' || c == '_')
+                    .map(|w| {
+                        let mut ch = w.chars();
+                        match ch.next() {
+                            Some(f) => f.to_uppercase().collect::<String>() + ch.as_str(),
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (DEMO_CMD_BASE + i as u16, pretty, path)
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
 // ── ∴ logo wallpaper brush ─────────────────────────────────────────────────
 
 /// Color helpers: COLORREF = R | (G<<8) | (B<<16).
@@ -476,12 +553,23 @@ where
     channels::install();
     super::system_colors::sample();
 
+    // Discover demo files (`demos/*.f`) so the Demos menu shows
+    // one entry per file.  Populates the DEMO_FILES static; the
+    // WM_COMMAND handler later uses it to read+run the right
+    // file when the user clicks an entry.
+    let demo_files = discover_demos();
+    let demo_name_ids: Vec<(u16, String)> = demo_files
+        .iter()
+        .map(|(id, name, _)| (*id, name.clone()))
+        .collect();
+    let _ = DEMO_FILES.set(demo_files);
+
     // Install a default Tools menu so the built-in editor and log
     // view are reachable even before any language-thread code runs.
     // `iGui.SetMenu` from CP will replace this, but
     // `menu::install_for_frame` always re-appends the tools so they
     // stay available.
-    if let Some(default_menu) = super::tools_menu::build_default_menu_bar() {
+    if let Some(default_menu) = super::tools_menu::build_default_menu_bar(&demo_name_ids) {
         let _ = unsafe {
             windows::Win32::UI::WindowsAndMessaging::SetMenu(hwnd, Some(default_menu))
         };
@@ -650,11 +738,103 @@ unsafe extern "system" fn frame_wnd_proc(
                 }
                 return LRESULT(0);
             }
+            if cmd_id == super::repl_pane::MENU_CMD_ID {
+                if mdi.0 as isize != 0 {
+                    super::repl_pane::open(mdi);
+                }
+                return LRESULT(0);
+            }
+            if cmd_id == super::stack_view::MENU_CMD_ID {
+                if mdi.0 as isize != 0 {
+                    super::stack_view::open(hwnd, mdi);
+                }
+                return LRESULT(0);
+            }
             if cmd_id == super::tools_menu::FORTH_RESTART_CMD_ID {
                 // Pipe into the same mailbox the worker drains; it
                 // tears down the session and brings up a fresh one.
                 super::channels::push(super::channels::IGuiEvent::ForthRestart);
                 return LRESULT(0);
+            }
+            // ── Demos menu ──────────────────────────────────────
+            // Look up the file by id, push the source as an
+            // EvalBuffer event with an appended `<stem>` call so
+            // the worker both defines the words AND invokes the
+            // entry point.  Errors come back through the normal
+            // eval-output path into the console pane.
+            if cmd_id >= super::tools_menu::DEMO_CMD_BASE
+                && cmd_id <= super::tools_menu::DEMO_CMD_END
+            {
+                if let Some(demos) = DEMO_FILES.get() {
+                    if let Some((_, name, path)) =
+                        demos.iter().find(|(id, _, _)| *id == cmd_id)
+                    {
+                        match std::fs::read_to_string(path) {
+                            Ok(text) => {
+                                let stem = path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("");
+                                // Convention: the entry-point word
+                                // is the file stem.  The demo file
+                                // defines it; we append a call so
+                                // it runs immediately.
+                                let banner = format!(
+                                    "\\ === running demo: {} ===\n",
+                                    name
+                                );
+                                let source =
+                                    format!("{banner}{text}\n{stem}\n");
+                                channels::push(IGuiEvent::EvalBuffer { source });
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[demos] cannot read {}: {}",
+                                    path.display(), e,
+                                );
+                            }
+                        }
+                    }
+                }
+                return LRESULT(0);
+            }
+            if cmd_id == super::tools_menu::FILE_CMD_EXIT {
+                // File → Exit: close the frame.  WM_CLOSE on the
+                // frame fires the FrameClose event chain so the
+                // worker shuts down cleanly.
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(hwnd),
+                        windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                };
+                return LRESULT(0);
+            }
+            // File → Open with no active editor: spin up a fresh
+            // fedit first, then forward the OPEN command to it.
+            // (Save/Save-As without an active editor are no-ops —
+            // there's nothing to save, so we just drop them.)
+            if cmd_id == super::fedit::EDIT_CMD_OPEN {
+                if mdi.0 as isize != 0 {
+                    let active_raw = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                            mdi,
+                            windows::Win32::UI::WindowsAndMessaging::WM_MDIGETACTIVE,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(0)),
+                        )
+                    };
+                    if active_raw.0 == 0 {
+                        // No active child — create the editor, then
+                        // forward.  fedit::open is a singleton-style
+                        // open that focuses an existing fedit or
+                        // creates a new one.
+                        super::fedit::open(hwnd, mdi);
+                    }
+                    // Fall through to EDIT_CMD_BASE forwarding below.
+                }
             }
             // Edit-menu commands: forward to the active MDI child.
             // fedit's WndProc recognises these IDs in its own

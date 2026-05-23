@@ -42,6 +42,8 @@ mod font_metrics;
 pub mod lisp_shims;
 pub mod log_view;
 pub mod fconsole;
+pub mod repl_pane;
+pub mod stack_view;
 pub mod crash_view;
 pub mod crash_handler;
 mod menu;
@@ -53,7 +55,7 @@ mod replies;
 mod tools_menu;
 pub mod system_colors;
 pub(crate) mod text_view;
-mod window;
+pub(crate) mod window;
 
 pub use fedit::{install_checker, Diagnostic};
 pub use window::run;

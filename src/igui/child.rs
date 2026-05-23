@@ -1588,6 +1588,8 @@ pub fn register_classes() -> Result<(), IGuiError> {
     super::fedit::register_class()?;
     super::log_view::register_class()?;
     super::fconsole::register_class()?;
+    super::repl_pane::register_class()?;
+    super::stack_view::register_class()?;
     super::crash_view::register_class()?;
     super::text_view::register_class()?;
 

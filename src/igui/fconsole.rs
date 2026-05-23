@@ -50,7 +50,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT,
-    VK_RETURN, VK_RIGHT, VK_UP,
+    VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DefMDIChildProcW, GetClientRect, GetWindowLongPtrW, IsWindow, LoadCursorW,
@@ -92,6 +92,9 @@ const SCROLLBACK_CAP: usize = 8192;
 const LINE_MAX: usize = 4096;
 const HISTORY_CAP: usize = 1024;
 const PROMPT: &str = "> ";
+/// Continuation prompt for multi-line input (e.g. mid colon-def).
+/// Same width as `PROMPT` so the input column stays aligned.
+const CONT_PROMPT: &str = ". ";
 
 const CLASS_NAME: PCWSTR = w!("WF64.iGui.Fconsole");
 const TITLE: PCWSTR = w!("\u{2234} console");
@@ -526,52 +529,96 @@ impl ConsoleWindowState {
             (state.lines.clone(), input_str, state.cursor)
         });
 
-        // Char-wrap: each logical line (scrollback row OR the
-        // active prompt+input) expands to one or more visual rows
-        // of at most `cols_per_row` chars.  We flatten everything,
-        // then take the bottom `visible_rows - scroll_offset`.
         let cols_per_row = ((w - pad_x * 2.0) / self.cell_w)
             .floor()
             .max(1.0) as usize;
         let prompt_chars = PROMPT.chars().count();
 
-        // Build a flat Vec of visual rows via the wrap_* helpers
-        // (the row struct lives below as VRowOpaque).
-        let mut rows: Vec<VRowOpaque> = Vec::with_capacity(lines.len() + 4);
+        // Build the prompt rows separately and pin them to the
+        // bottom of the client area — they don't scroll.  The
+        // scrollback area above scrolls independently via
+        // `scroll_offset`, which is now correctly clamped to the
+        // post-wrap visual row count.
+        let mut prompt_rows: Vec<VRowOpaque> = Vec::with_capacity(4);
+        wrap_prompt_block(
+            &input_str,
+            cursor_idx,
+            prompt_chars,
+            cols_per_row,
+            &mut prompt_rows,
+        );
+        let prompt_row_count = prompt_rows.len().max(1);
+        // Reserve `prompt_row_count` rows at the bottom for the
+        // prompt + a 1-row gap separator above it.
+        let reserved_rows = prompt_row_count + 1;
+        let scrollback_rows = visible_rows.saturating_sub(reserved_rows);
 
-        // Scrollback first.
+        // Wrap scrollback into visual rows.
+        let mut rows: Vec<VRowOpaque> = Vec::with_capacity(lines.len() + 4);
         for line in &lines {
-            wrap_into_rows(line, cols_per_row, false, None, &mut rows);
+            wrap_into_rows(line, cols_per_row, None, None, &mut rows);
         }
 
-        // Prompt row: prompt chars + input chars, with caret at
-        // (prompt_chars + cursor_idx) chars in.
-        let caret_abs = prompt_chars + cursor_idx;
-        let promptline_chars = prompt_chars + input_str.chars().count();
-        let prompt_payload: String = input_str.clone();
-        wrap_prompt_row(
-            &prompt_payload,
-            prompt_chars,
-            promptline_chars,
-            caret_abs,
-            cols_per_row,
-            &mut rows,
-        );
+        // Clamp scroll_offset against the post-wrap row count, NOT
+        // against the logical-line count.  Pre-fix, the clamp used
+        // `lines.len() + 1`, which meant a console full of
+        // wrap-heavy demo output (long lines that span 3–5 visual
+        // rows each) capped you well short of the real top.
+        let max_scroll = rows.len().saturating_sub(scrollback_rows);
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
+        }
 
-        let stream_len = rows.len();
-        let bottom_idx = stream_len.saturating_sub(self.scroll_offset); // exclusive
-        let top_idx = bottom_idx.saturating_sub(visible_rows);
-
+        let bottom_idx = rows.len().saturating_sub(self.scroll_offset);
+        let top_idx = bottom_idx.saturating_sub(scrollback_rows);
         for (row_screen, idx) in (top_idx..bottom_idx).enumerate() {
             let y = pad_y + row_screen as f32 * cell_h;
             let row = &rows[idx];
-            // Prompt prefix (amber) on the head row only.
-            let text_x = if row.is_prompt_head {
+            // Scrollback rows never have a prompt head (those are
+            // the live input rows, painted separately below).
+            let text_x = pad_x;
+            if !row.text.is_empty() {
                 draw_text(
                     dw_factory,
                     &target,
                     &format,
-                    PROMPT,
+                    &row.text,
+                    text_x,
+                    y,
+                    w - text_x - pad_x,
+                    cell_h,
+                    fg.as_ref(),
+                );
+            }
+        }
+
+        // "Scrolled-up" hint: when not anchored to the bottom,
+        // show a faint marker on the separator row so the user
+        // knows they're not seeing live output.
+        let sep_row = scrollback_rows;
+        let sep_y = pad_y + sep_row as f32 * cell_h;
+        if self.scroll_offset > 0 {
+            let hint = format!(
+                "── scrolled up: {} row(s) below — End / wheel-down to return ──",
+                self.scroll_offset,
+            );
+            draw_text(
+                dw_factory, &target, &format,
+                &hint, pad_x, sep_y, w - pad_x * 2.0, cell_h,
+                prompt_brush.as_ref(),
+            );
+        }
+
+        // Prompt rows — pinned to the bottom of the visible area.
+        let prompt_top_row = scrollback_rows + 1;
+        for (i, row) in prompt_rows.iter().enumerate() {
+            let y = pad_y + (prompt_top_row + i) as f32 * cell_h;
+            let text_x = if let Some(prompt) = row.prompt_head {
+                draw_text(
+                    dw_factory,
+                    &target,
+                    &format,
+                    prompt,
                     pad_x,
                     y,
                     self.cell_w * prompt_chars as f32 + 4.0,
@@ -614,32 +661,99 @@ impl ConsoleWindowState {
     }
 
     fn submit_input(&mut self) {
-        let (line_to_send, echo) = with_console(|state| {
-            let line: String = state.input.iter().collect();
+        let (line_to_send, echo_lines) = with_console(|state| {
+            let source: String = state.input.iter().collect();
             state.input.clear();
             state.cursor = 0;
             state.history_idx = None;
             state.history_draft = None;
-            let echo = format!("{PROMPT}{line}");
-            if !line.is_empty() {
-                if state.history.last().map(|s| s.as_str()) != Some(line.as_str()) {
+            // Echo: first logical line gets PROMPT, continuation
+            // lines get CONT_PROMPT so it reads as a single block.
+            let echo_lines: Vec<String> = if source.is_empty() {
+                vec![PROMPT.to_string()]
+            } else {
+                source
+                    .split('\n')
+                    .enumerate()
+                    .map(|(i, line)| {
+                        format!(
+                            "{}{}",
+                            if i == 0 { PROMPT } else { CONT_PROMPT },
+                            line,
+                        )
+                    })
+                    .collect()
+            };
+            if !source.is_empty() {
+                if state.history.last().map(|s| s.as_str()) != Some(source.as_str()) {
                     if state.history.len() >= HISTORY_CAP {
                         state.history.remove(0);
                     }
-                    state.history.push(line.clone());
+                    state.history.push(source.clone());
                 }
             }
-            (line, echo)
+            (source, echo_lines)
         });
-        // Push the echo and dispatch.  Empty input still echoes
+        // Push each echoed logical line.  Empty input still echoes
         // (matches REPL convention — blank line shows the prompt
         // again) but is not sent to the worker.
-        append(&echo);
+        for line in &echo_lines {
+            append(line);
+        }
         if line_to_send.is_empty() {
             return;
         }
         super::channels::push(super::channels::IGuiEvent::EvalBuffer {
             source: line_to_send,
+        });
+        self.scroll_offset = 0;
+    }
+
+    /// Try to move the cursor up (`dir = -1`) or down (`dir = +1`)
+    /// one logical line within the input buffer, preserving the
+    /// column.  Returns `true` if a vertical move was possible (i.e.
+    /// there is another logical line in that direction); `false`
+    /// otherwise, in which case the caller falls back to a history
+    /// walk so simple single-line input keeps its old behaviour.
+    fn move_cursor_vertical(&mut self, dir: i32) -> bool {
+        let moved = with_console(|state| {
+            let line_start = logical_line_start(&state.input, state.cursor);
+            let col = state.cursor - line_start;
+            if dir < 0 {
+                if line_start == 0 {
+                    return false;
+                }
+                // Cursor moves to col within the previous logical
+                // line; clamp to its length.
+                let prev_end = line_start - 1; // index of the '\n'
+                let prev_start = logical_line_start(&state.input, prev_end);
+                let prev_len = prev_end - prev_start;
+                state.cursor = prev_start + col.min(prev_len);
+                true
+            } else {
+                // Down: find the '\n' after current line.
+                let cur_end = logical_line_end(&state.input, state.cursor);
+                if cur_end == state.input.len() {
+                    return false;
+                }
+                let next_start = cur_end + 1;
+                let next_end = logical_line_end(&state.input, next_start);
+                let next_len = next_end - next_start;
+                state.cursor = next_start + col.min(next_len);
+                true
+            }
+        });
+        moved
+    }
+
+    fn insert_newline(&mut self) {
+        with_console(|state| {
+            state.history_idx = None;
+            state.history_draft = None;
+            if state.input.len() < LINE_MAX {
+                state.input.insert(state.cursor, '\n');
+                state.cursor += 1;
+            }
         });
         self.scroll_offset = 0;
     }
@@ -666,9 +780,24 @@ impl ConsoleWindowState {
         let vk16 = vk as u16;
         let ctrl = (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as i16) < 0;
 
+        let shift = (unsafe { GetKeyState(VK_SHIFT.0 as i32) } as i16) < 0;
         let mut needs_repaint = true;
         if vk16 == VK_RETURN.0 {
-            self.submit_input();
+            // Shift+Enter always inserts a newline so users can
+            // type multi-line input even when the form scanner
+            // would otherwise see it as complete.  Plain Enter
+            // submits when the input is a complete Forth form
+            // (balanced colon-def, no unclosed paren-comment or
+            // string) and inserts a newline otherwise.
+            if shift {
+                self.insert_newline();
+            } else {
+                let snapshot: String = with_console(|s| s.input.iter().collect());
+                match super::repl_pane::form_complete(&snapshot) {
+                    super::repl_pane::FormStatus::Complete => self.submit_input(),
+                    _ => self.insert_newline(),
+                }
+            }
         } else if vk16 == VK_BACK.0 {
             with_console(|state| {
                 state.history_idx = None;
@@ -701,15 +830,51 @@ impl ConsoleWindowState {
                 }
             });
         } else if vk16 == VK_HOME.0 {
-            with_console(|state| state.cursor = 0);
+            // Ctrl+Home → start of full input.  Plain Home → start
+            // of the current logical line (after the prompt).
+            if ctrl {
+                with_console(|state| state.cursor = 0);
+            } else {
+                with_console(|state| {
+                    state.cursor = logical_line_start(&state.input, state.cursor);
+                });
+            }
         } else if vk16 == VK_END.0 {
-            with_console(|state| state.cursor = state.input.len());
+            if ctrl {
+                // Ctrl+End — jump to the live tail of the
+                // transcript AND to the end of the input buffer.
+                // Reads naturally: "go to the end of everything."
+                with_console(|state| state.cursor = state.input.len());
+                self.scroll_offset = 0;
+            } else {
+                with_console(|state| {
+                    state.cursor = logical_line_end(&state.input, state.cursor);
+                });
+            }
         } else if vk16 == VK_UP.0 {
-            self.history_walk(-1);
+            // Move up one logical line if there is one; otherwise
+            // walk history backwards.  Keeps simple single-line
+            // input feeling identical, while multi-line input
+            // behaves like an editor.
+            if !self.move_cursor_vertical(-1) {
+                self.history_walk(-1);
+            }
             self.scroll_offset = 0;
         } else if vk16 == VK_DOWN.0 {
-            self.history_walk(1);
+            if !self.move_cursor_vertical(1) {
+                self.history_walk(1);
+            }
             self.scroll_offset = 0;
+        } else if vk16 == VK_PRIOR.0 {
+            // PageUp — scroll back through the transcript.  Does
+            // NOT touch the input buffer or cursor; the prompt
+            // stays pinned to the bottom.
+            self.page_scroll(1);
+            needs_repaint = false; // page_scroll invalidates itself
+        } else if vk16 == VK_NEXT.0 {
+            // PageDown — scroll forward (towards the live tail).
+            self.page_scroll(-1);
+            needs_repaint = false;
         } else if ctrl && vk == 'L' as u32 {
             with_console(|state| state.lines.clear());
             self.scroll_offset = 0;
@@ -776,14 +941,36 @@ impl ConsoleWindowState {
     fn handle_wheel(&mut self, delta: i16) {
         let steps = (delta as i32 / WHEEL_DELTA as i32).abs().max(1) as usize;
         if delta > 0 {
+            // Wheel-up = scroll back (older content).  Final clamp
+            // against the post-wrap row count happens in paint(),
+            // since only paint knows the wrap width.
             self.scroll_offset = self.scroll_offset.saturating_add(steps * 3);
-            let stream_len = with_console(|s| s.lines.len() + 1);
-            if self.scroll_offset > stream_len {
-                self.scroll_offset = stream_len;
-            }
         } else {
             self.scroll_offset = self.scroll_offset.saturating_sub(steps * 3);
         }
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+    }
+
+    /// Page up by roughly half a screen.  Pure scroll adjustment;
+    /// final clamp against the wrap-row count happens in paint().
+    fn page_scroll(&mut self, dir: i32) {
+        // Estimate "half a screen" from the current client height.
+        let half = ((self.client_h as f32) / (self.cell_h * 2.0))
+            .floor()
+            .max(1.0) as usize;
+        if dir > 0 {
+            self.scroll_offset = self.scroll_offset.saturating_add(half);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(half);
+        }
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        if self.scroll_offset == 0 {
+            return;
+        }
+        self.scroll_offset = 0;
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
     }
 
@@ -808,6 +995,29 @@ impl ConsoleWindowState {
     }
 }
 
+/// Codepoint index of the first char on the logical line that
+/// contains `cursor` within the multi-line `input`.  Equivalent to
+/// "skip backwards over non-newline chars, stop just after the
+/// previous `\n` or at index 0".
+fn logical_line_start(input: &[char], cursor: usize) -> usize {
+    let mut i = cursor.min(input.len());
+    while i > 0 && input[i - 1] != '\n' {
+        i -= 1;
+    }
+    i
+}
+
+/// Codepoint index of the last char on the logical line that
+/// contains `cursor` (i.e. position of the next `\n`, or
+/// `input.len()` if none).
+fn logical_line_end(input: &[char], cursor: usize) -> usize {
+    let mut i = cursor.min(input.len());
+    while i < input.len() && input[i] != '\n' {
+        i += 1;
+    }
+    i
+}
+
 /// Visual-row builder for scrollback lines.  Split `line` into
 /// chunks of at most `cols` chars, push each as a `VRow`.  The
 /// VRow type is private to `paint`; we re-declare a parallel
@@ -815,15 +1025,15 @@ impl ConsoleWindowState {
 fn wrap_into_rows(
     line: &str,
     cols: usize,
-    is_prompt_head: bool,
+    prompt_head: Option<&'static str>,
     caret_at: Option<usize>,
     out: &mut Vec<VRowOpaque>,
 ) {
     if line.is_empty() {
         out.push(VRowOpaque {
             text: String::new(),
-            is_prompt_head,
-            caret_col: if is_prompt_head { caret_at } else { None },
+            prompt_head,
+            caret_col: if prompt_head.is_some() { caret_at } else { None },
         });
         return;
     }
@@ -831,22 +1041,22 @@ fn wrap_into_rows(
     let mut start = 0usize;
     let mut row_start_char = 0usize; // absolute char index of row's first char
     let mut char_count = 0usize;
-    let mut head = is_prompt_head;
+    let mut head = prompt_head;
     for (i, _ch) in line.char_indices() {
         if col == cols {
             let caret_col = caret_at.and_then(|abs| {
                 if abs >= row_start_char && abs < row_start_char + col {
-                    Some(abs - row_start_char + if head { 0 } else { 0 })
+                    Some(abs - row_start_char)
                 } else {
                     None
                 }
             });
             out.push(VRowOpaque {
                 text: line[start..i].to_string(),
-                is_prompt_head: head,
+                prompt_head: head,
                 caret_col,
             });
-            head = false;
+            head = None;
             row_start_char += col;
             start = i;
             col = 0;
@@ -865,24 +1075,26 @@ fn wrap_into_rows(
         });
         out.push(VRowOpaque {
             text: line[start..].to_string(),
-            is_prompt_head: head,
+            prompt_head: head,
             caret_col,
         });
     }
     let _ = char_count;
 }
 
-/// Wrap the active prompt + input line into one or more visual
-/// rows.  The first sub-row gets `is_prompt_head = true` so the
-/// painter knows to draw the amber `> ` on the left.  The
+/// Wrap one logical prompt + input line into one or more visual
+/// rows.  The first sub-row gets `prompt_head = Some(prompt_str)`
+/// so the painter knows to draw the amber prompt on the left.
 /// `caret_abs` is measured from the start of the LOGICAL line
-/// (including the prompt chars), so 0 = before the `>`, 2 = at
-/// the start of input.
+/// (including the prompt chars), so 0 = before the prompt and
+/// `prompt_chars` = at the start of input.  Pass `None` to mark
+/// "caret not in this logical line" (e.g. when the cursor is on
+/// a different logical line of the multi-line input).
 fn wrap_prompt_row(
     input: &str,
+    prompt_str: &'static str,
     prompt_chars: usize,
-    total_chars: usize,
-    caret_abs: usize,
+    caret_abs: Option<usize>,
     cols: usize,
     out: &mut Vec<VRowOpaque>,
 ) {
@@ -893,12 +1105,17 @@ fn wrap_prompt_row(
     if cols <= prompt_chars {
         out.push(VRowOpaque {
             text: String::new(),
-            is_prompt_head: true,
-            caret_col: if caret_abs <= prompt_chars { Some(caret_abs) } else { None },
+            prompt_head: Some(prompt_str),
+            caret_col: caret_abs.filter(|&abs| abs <= prompt_chars),
         });
         // The input then wraps on subsequent rows, no head flag.
-        wrap_into_rows(input, cols, false, caret_at_for_remainder(caret_abs, prompt_chars), out);
-        let _ = total_chars;
+        wrap_into_rows(
+            input,
+            cols,
+            None,
+            caret_abs.and_then(|abs| caret_at_for_remainder(abs, prompt_chars)),
+            out,
+        );
         return;
     }
     let first_cap = cols - prompt_chars;
@@ -906,22 +1123,18 @@ fn wrap_prompt_row(
     if chars.is_empty() {
         out.push(VRowOpaque {
             text: String::new(),
-            is_prompt_head: true,
-            caret_col: Some(caret_abs.min(cols)),
+            prompt_head: Some(prompt_str),
+            caret_col: caret_abs.map(|abs| abs.min(cols)),
         });
         return;
     }
     // First visual row: prompt + first_cap input chars.
     let head_end = first_cap.min(chars.len());
     let head_text: String = chars[..head_end].iter().collect();
-    let head_caret_col = if caret_abs <= prompt_chars + head_end {
-        Some(caret_abs)
-    } else {
-        None
-    };
+    let head_caret_col = caret_abs.filter(|&abs| abs <= prompt_chars + head_end);
     out.push(VRowOpaque {
         text: head_text,
-        is_prompt_head: true,
+        prompt_head: Some(prompt_str),
         caret_col: head_caret_col,
     });
     if head_end == chars.len() {
@@ -934,12 +1147,55 @@ fn wrap_prompt_row(
     // within the REMAINDER, plus its visual offset (which is the
     // remainder's char index, since we don't have a prompt prefix
     // on cont rows).
-    let rest_caret = if caret_abs > prompt_chars + head_end {
-        Some(caret_abs - prompt_chars - head_end)
-    } else {
-        None
-    };
-    wrap_into_rows(&rest, cols, false, rest_caret, out);
+    let rest_caret = caret_abs
+        .filter(|&abs| abs > prompt_chars + head_end)
+        .map(|abs| abs - prompt_chars - head_end);
+    wrap_into_rows(&rest, cols, None, rest_caret, out);
+}
+
+/// Wrap the entire multi-line input buffer (split on `\n`) into
+/// visual rows.  First logical line gets `PROMPT` on its head row;
+/// subsequent logical lines get `CONT_PROMPT`.  `cursor_idx` is
+/// the codepoint offset into the raw input buffer (including its
+/// embedded `\n`s); we resolve which logical line owns the caret
+/// and pass the right `caret_abs` down to that single sub-call.
+fn wrap_prompt_block(
+    input: &str,
+    cursor_idx: usize,
+    prompt_chars: usize,
+    cols: usize,
+    out: &mut Vec<VRowOpaque>,
+) {
+    // Walk by chars, splitting on '\n', tracking each logical
+    // line's starting char index so we can place the caret.
+    let chars: Vec<char> = input.chars().collect();
+    if chars.is_empty() {
+        // Single empty prompt row with caret at column prompt_chars.
+        wrap_prompt_row("", PROMPT, prompt_chars, Some(prompt_chars), cols, out);
+        return;
+    }
+    let mut logical_idx = 0usize;
+    let mut line_start = 0usize;
+    let mut i = 0usize;
+    while i <= chars.len() {
+        if i == chars.len() || chars[i] == '\n' {
+            let line: String = chars[line_start..i].iter().collect();
+            let prompt = if logical_idx == 0 { PROMPT } else { CONT_PROMPT };
+            // Caret belongs to this logical line iff
+            // line_start <= cursor_idx <= i.  Equality with `i`
+            // (i.e. just before the '\n') puts the caret at the
+            // end of THIS line, not the start of the next.
+            let caret_abs = if cursor_idx >= line_start && cursor_idx <= i {
+                Some(prompt_chars + (cursor_idx - line_start))
+            } else {
+                None
+            };
+            wrap_prompt_row(&line, prompt, prompt_chars, caret_abs, cols, out);
+            logical_idx += 1;
+            line_start = i + 1;
+        }
+        i += 1;
+    }
 }
 
 fn caret_at_for_remainder(caret_abs: usize, prompt_chars: usize) -> Option<usize> {
@@ -953,9 +1209,18 @@ fn caret_at_for_remainder(caret_abs: usize, prompt_chars: usize) -> Option<usize
 /// Opaque visual-row mirror of the private `VRow` inside `paint`.
 /// Public-to-the-module so the helpers above can push into the
 /// same Vec the paint loop reads.
+///
+/// `prompt_head`:
+///   - `None` — pure scrollback or input continuation (after
+///     wrap) row.  No prompt prefix is drawn; text starts at the
+///     left margin.
+///   - `Some(s)` — head row for a logical input line.  The
+///     painter draws `s` in amber at the left margin (currently
+///     `PROMPT` for the first logical line of the input and
+///     `CONT_PROMPT` for subsequent logical lines).
 struct VRowOpaque {
     text: String,
-    is_prompt_head: bool,
+    prompt_head: Option<&'static str>,
     caret_col: Option<usize>,
 }
 

@@ -145,11 +145,28 @@ proc(number_q)
 .check_dollar:
     movzx   rax, byte ptr [rsi]
     cmp     al, '$'
-    jne     .digits
+    jne     .check_0x
     mov     rdi, 16             ; force hex for this literal
     add     rsi, 1
     sub     rcx, 1
     jz      .invalid            ; "$" or "-$" alone is not a number
+    jmp     .digits
+
+    ; Optional 0x / 0X prefix (forces hex base, may follow -).
+    ; C-family convention alongside the Forth `$` prefix above.
+.check_0x:
+    cmp     rcx, 2              ; need at least two chars for "0x..."
+    jb      .digits
+    cmp     al, '0'             ; al still holds the first byte
+    jne     .digits
+    movzx   rdx, byte ptr [rsi + 1]
+    or      dl, 0x20            ; fold 'X' (0x58) -> 'x' (0x78)
+    cmp     dl, 'x'
+    jne     .digits
+    mov     rdi, 16             ; force hex
+    add     rsi, 2
+    sub     rcx, 2
+    jz      .invalid            ; "0x" or "-0x" alone is not a number
 
 .digits:
     test    rcx, rcx

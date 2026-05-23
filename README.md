@@ -10,48 +10,65 @@ The bring up is from source direct to memory.
 
 Its open source its nice to just change it and run, without compile/link/crash/repeat rituals.
 
-In theory as it is a compiler it can also be adapted to compile an exe.
+In theory as it is a compiler it can also be adapted to compile an exe but it would lose features
 
-LLVM is used in the core, when FORTH is built, the FORTH compiler is not using LLVM.
+LLVM is used in the core, after FORTH is built, the FORTH compiler is not using LLVM.
 
-Here is the story: writing the FORTH compiler in rust like other compilers here, was not satisfying at all, FORTH does not fit well there.
+The FORTH compiler here is based on the WF32 STC compiler.
 
-The shape is much better to write FORTH in MASM. (This is our own JASM tool)
+-----------------------
 
-The first step is to use the LLVM MCJIT MASM flavoured assembler, and the add a parser to create a useful macro-assembler.
-That can read .masm files and generate the FORTH kernel.
+Here is the story: writing the FORTH compiler in rust like other compilers here, was not satisfying at all, FORTH does not fit well there. 
+
+The shape is much better if we write FORTH in masm.  
+
+For this we build a macro assembler, all we need are the macros, the first step is to use the LLVM MCJIT MASM flavoured assembler, and then add a parser to create a useful macro-assembler.
+That assembler can read .masm files and generate the FORTH kernel.
 
 This allows the FORTH kernel to be implemented in assembly language (See JASM project), to do this I borrowed the WF32 kernel and ported it, using quite a lot of automated extraction and testing.
 
-The primitives from WF32 and its STC compiler are excellent, over the top of that we overlay ANSI Forth.
+The primitives from WF32 and its STC compiler are excellent, over the top of that we overlay a port of ANSI Forth.
 
-Over that we overlay the WF32 helpers and utilites.
 
-This does lead to some strict layers
+This does lead to some layers
 
 ----------------------------------------
-MASM kernel - assembly langage
+MASM kernel - assembly language
 Can invoke windows API also
 ----------------------------------------
 ANSI Forth Core, some MASM, some high level
 ----------------------------------------
 ANSI Forth in Forth
 ----------------------------------------
-WF32 user land features
+Escape hatch - CODE uses MASM
+----------------------------------------
+Escape hatch - LET infix expressions
+----------------------------------------
+Paged garbage collector
+----------------------------------------
+New strings
 ----------------------------------------
 Interactive forth REPL
 ----------------------------------------
 User application
 -----------------------------------------
 
-All of this is jitted then forth compiled from source to running app.
-So you can add to the MASM layer, but it has to be added to that layer.
-If you need to call windows, you may as well add the call there, since MASM has invoke already.
-It would be a bit pointless to add an assembler to FORTH. Adding a trapdoor back to MASM might work if we want to blend assembler in everywhere, but it does tie you to LLVM.
+Apart from lets say 'implementation details' this is a very conventional FORTH right up to the ANS layer.
+
+If we wanted to bootstrap a ANS FORTH we could do; we could create an exe at 'ANSI Forth in Forth' level.
+
+This is a true and normal FORTH, right until the first escape hatch which allows FORTH to define new
+CODE words using the same very powerful macro assembler the kernel uses.
+
+After that the LET infix operator is a fast dense floating point expression evaluator, used to accelerate
+floating point, and lets be honest simplify it.
+
+The paged GC, is my own GC that I also use with Lisp, Dylan etc this gives us a managed heap for data.
+It creates data outside the dictionary for us.
+
+The GC allows us to add New strings, which is a powerful dynamic strings library.
+
+The way I look at this is, its normal FORTH with extensions, similar to my other compilers.
 
 
 
-Runtime options
-
-You can make the runtime huge, using rust.
-Or Tiny using invoke windows API.

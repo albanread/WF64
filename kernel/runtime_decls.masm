@@ -70,3 +70,15 @@
 @extern rt_igui_at_xy(2)        ; (col, row) — record cursor pos for the next emit
 @extern rt_bug_rust_panic(0)    ; () — deliberately Rust-panic (Phase 3a test)
 @extern rt_bug_seh_av(0)        ; () — deliberately NULL-deref (Phase 3b SEH test)
+
+; ── Graphical pane API: each fn wraps the iGui batch system.
+;    Coords are signed-integer pixels, colours are 24-bit RGB
+;    packed as 0xRRGGBB into a single Forth cell.
+@extern rt_gpane_open(4)        ; (width, height, title_addr, title_len) -> child_id (0 on fail)
+@extern rt_gpane_begin(1)       ; (child_id) -> 0
+@extern rt_gpane_present(0)     ; () -> 0
+@extern rt_gpane_clear(1)       ; (rgb) -> 0
+@extern rt_gpane_fill_rect(5)   ; (x, y, w, h, rgb) -> 0
+@extern rt_gpane_stroke_rect(6) ; (x, y, w, h, thick, rgb) -> 0
+@extern rt_gpane_line(6)        ; (x0, y0, x1, y1, thick, rgb) -> 0
+@extern rt_gpane_fill_circle(4) ; (cx, cy, r, rgb) -> 0

@@ -137,6 +137,13 @@ pub enum IGuiEvent {
     /// Any user-defined words from the previous session are
     /// gone; the GC heap is re-initialised.
     ForthRestart,
+    /// "User pressed Enter on a complete form in the REPL pane."  The
+    /// worker pops the input via `repl_pane::pop_input(child_id)`,
+    /// evaluates it, and calls `repl_pane::append(child_id, …)` to
+    /// push output/error back to the transcript.
+    ReplSubmit {
+        child_id: i64,
+    },
 }
 
 struct Mailbox {
@@ -249,6 +256,7 @@ fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
         | IGuiEvent::Resize { child_id, .. }
         | IGuiEvent::Close { child_id }
         | IGuiEvent::DpiChange { child_id, .. }
+        | IGuiEvent::ReplSubmit { child_id }
         | IGuiEvent::Tick { child_id, .. } => filter.contains(child_id),
     }
 }
@@ -267,6 +275,7 @@ fn matches_target(ev: &IGuiEvent, target: i64) -> bool {
         | IGuiEvent::Resize { child_id, .. }
         | IGuiEvent::Close { child_id }
         | IGuiEvent::DpiChange { child_id, .. }
+        | IGuiEvent::ReplSubmit { child_id }
         | IGuiEvent::Tick { child_id, .. } => *child_id == target,
     }
 }
