@@ -478,6 +478,38 @@ fn eval_exit_returns_early_from_definition() {
     assert_eq!(out, " ok\n1  ok\n");
 }
 
+/// Test the {: word compiles one local and open-locals works
+#[test]
+fn eval_locals_one_local_compiles() {
+    let mut s = sess();
+    let out = s.eval(": tloc {: x :} x . ;\n5 tloc\nbye\n").unwrap();
+    assert_eq!(out, " ok\n5  ok\n");
+}
+
+/// Verify {: and to are findable in the current search order
+#[test]
+fn eval_locals_words_findable() {
+    let mut s = sess();
+    // Check several words that should be in the FORTH wordlist
+    let out = s.eval(
+        "s\" {:\" find-name nip .\
+         \ns\" to\" find-name nip .\
+         \ns\" locals#!\" find-name nip .\
+         \nbye\n"
+    ).unwrap();
+    // Should print -1 for each found word
+    assert_eq!(out, "-1  ok\n-1  ok\n-1  ok\n");
+}
+
+/// Minimal sanity check: {: with one local
+#[test]
+fn eval_locals_basic_fetch() {
+    let mut s = sess();
+    // Single local, defined and called on the same line.
+    let out = s.eval(": tl1 {: a :} a . ; 42 tl1\nbye\n").unwrap();
+    assert_eq!(out, "42  ok\n");
+}
+
 #[test]
 fn eval_colon_without_name_throws_minus_16() {
     let mut s = sess();

@@ -139,7 +139,12 @@ forth-wordlist set-current
 
 \ TO: parse next name; in interpret state store, in compile state compile a store.
 : to
-    parse-name find-name dup 0= if drop throw_namereqd throw then
+    parse-name
+    state @ locals# and if          \ inside a compiled definition with active locals?
+        2dup check-local-store       \ try locals table first
+        if exit then                 \ found: inline store emitted; done
+    then
+    find-name dup 0= if drop throw_namereqd throw then
     drop
     name>interpret >body
     state @ if postpone literal ['] ! compile, else ! then
@@ -418,7 +423,7 @@ forth-wordlist set-current
 \         x y z + + ;
 \
 \ At run time `c` goes into z (highest offset), `b` into y, `a` into x.
-\ Locals are read-only in this version.
+\ TO localname writes to a local; uninitialized locals via the | section.
 \
 \ Design: locals are compile-time-only -- they never become dictionary
 \ entries.  Each local name + byte-offset is recorded in a 16-slot
@@ -463,46 +468,57 @@ variable ls-len
     ls-idx @ cells  ls-idx @ locals-slot 16 + ! ;  \ byte-offset
 
 : locals-closer?  ( c-addr u -- flag )  s" :}" str= ;
+: locals-pipe?    ( c-addr u -- flag )  1 = swap c@ [char] | = and ;
+: locals-arrow?   ( c-addr u -- flag )  s" --" str= ;
+: locals-skip-to-end ( -- )
+    begin parse-name locals-closer? until ;
 
 forth-wordlist set-current
 
 : {:
-    0                                       ( cell-offset )
+    0 0 0                               \ ( n-init after-pipe n-total )
     begin
         parse-name dup 0= if
             2drop refill drop false
         else
-            2dup locals-closer?
-            if
+            2dup locals-closer? if          \ :} — done
                 2drop true
+            else 2dup locals-pipe? if       \ | — subsequent locals are uninitialized
+                2drop
+                swap drop -1 swap           \ set after-pipe flag
+                false
+            else 2dup locals-arrow? if      \ -- starts output-comment; skip to :}
+                2drop locals-skip-to-end
+                true
             else
-                ( cell-offset c-addr u )
-                \ Overflow guard: the table has 16 slots (idx
-                \ 0..15) before it runs into user_TOOLS_WID at
-                \ +0x200.  Stop at the 17th name and throw -29
-                \ (compiler nesting) rather than silently
-                \ corrupting the TOOLS wordlist.
+                ( n-init after-pipe n-total c-addr u )
+                \ Overflow guard: 16 slots (idx 0..15) before user_TOOLS_WID.
                 2 pick 15 > if
                     2drop  -29 throw
                 then
-                2 pick -rot                  ( offset offset c-addr u )
-                locals-set                   ( offset )
-                1+ false
-            then
+                2 pick -rot locals-set      \ register at slot index n-total
+                1+                          \ n-total++
+                over 0= if                  \ if not after-pipe: n-init++ too
+                    rot 1+ -rot
+                then
+                false
+            then then then
         then
     until
-    ( N )
+    ( n-init after-pipe n-total )
 
-    dup locals#!                              \ tell ; how many to release
+    nip                                     \ drop after-pipe → ( n-init n-total )
+    dup locals#!                            \ tell ; how many slots to release
 
-    \ Compile `N (open-locals)` to allocate the frame on entry.
+    \ Compile n-total (open-locals) — allocates all slots including uninitialized.
     dup postpone literal postpone (open-locals)
 
-    \ Compile pop sequence: TOS → highest offset first.
+    \ Compile (local!) only for n-init stack-initialized locals.
+    swap                                    \ ( n-total n-init )
     dup 0 ?do
         dup 1- i - cells postpone literal postpone (local!)
     loop
-    drop ; immediate
+    2drop ; immediate
 
 \ ── Console / terminal (Facility) ─────────────────────────────────────────
 \ Implemented via ANSI escape sequences. Modern Windows terminals

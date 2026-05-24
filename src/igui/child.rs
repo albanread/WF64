@@ -18,8 +18,10 @@
 
 #![cfg(windows)]
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use std::sync::OnceLock;
 
 use windows::core::{w, Error, PCWSTR};
 use windows_numerics::Vector2;
@@ -29,7 +31,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1HwndRenderTarget, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL,
+    ID2D1HwndRenderTarget, ID2D1SolidColorBrush, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL,
     D2D1_ELLIPSE, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
     D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE,
@@ -65,6 +67,48 @@ use super::IGuiError;
 
 pub(crate) const MDI_CHILD_CLASS: PCWSTR = w!("NewCL.iGui.Child");
 pub(crate) const RENDER_HOST_CLASS: PCWSTR = w!("NewCL.iGui.Render");
+
+fn verbose_ui_batch_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("WF64_IGUI_BATCH_LOG_VERBOSE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+    })
+}
+
+fn pack_rgba(color: &batch_mod::Rgba) -> u128 {
+    ((color.r.to_bits() as u128) << 96)
+        | ((color.g.to_bits() as u128) << 64)
+        | ((color.b.to_bits() as u128) << 32)
+        | (color.a.to_bits() as u128)
+}
+
+fn cached_solid_brush(
+    target: &ID2D1HwndRenderTarget,
+    cache: &mut HashMap<u128, ID2D1SolidColorBrush>,
+    color: &batch_mod::Rgba,
+) -> Result<ID2D1SolidColorBrush, IGuiError> {
+    let key = pack_rgba(color);
+    if let Some(brush) = cache.get(&key) {
+        return Ok(brush.clone());
+    }
+    let brush = unsafe {
+        target.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: color.r,
+                g: color.g,
+                b: color.b,
+                a: color.a,
+            },
+            None,
+        )
+    }
+    .map_err(|e| IGuiError::D2D(format!("CreateSolidColorBrush failed: {e}")))?;
+    cache.insert(key, brush.clone());
+    Ok(brush)
+}
 
 // ─── ChildState lives on the render host ─────────────────────────────
 
@@ -218,6 +262,8 @@ fn execute_d2d_batch(
     target: &ID2D1HwndRenderTarget,
     batch: &batch_mod::PaneBatch,
 ) -> Result<(), IGuiError> {
+    let mut brush_cache: HashMap<u128, ID2D1SolidColorBrush> = HashMap::new();
+
     for cmd in &batch.cmds {
         match cmd {
             SurfaceCmd::Clear { color } => unsafe {
@@ -234,18 +280,7 @@ fn execute_d2d_batch(
                 corner_radius,
                 color,
             } => {
-                let brush = unsafe {
-                    target.CreateSolidColorBrush(
-                        &D2D1_COLOR_F {
-                            r: color.r,
-                            g: color.g,
-                            b: color.b,
-                            a: color.a,
-                        },
-                        None,
-                    )
-                }
-                .map_err(|e| IGuiError::D2D(format!("CreateSolidColorBrush failed: {e}")))?;
+                let brush = cached_solid_brush(target, &mut brush_cache, color)?;
                 let d2d_rect = D2D_RECT_F {
                     left: rect.x0,
                     top: rect.y0,
@@ -273,18 +308,7 @@ fn execute_d2d_batch(
                 half_thickness,
                 color,
             } => {
-                let brush = unsafe {
-                    target.CreateSolidColorBrush(
-                        &D2D1_COLOR_F {
-                            r: color.r,
-                            g: color.g,
-                            b: color.b,
-                            a: color.a,
-                        },
-                        None,
-                    )
-                }
-                .map_err(|e| IGuiError::D2D(format!("CreateSolidColorBrush failed: {e}")))?;
+                let brush = cached_solid_brush(target, &mut brush_cache, color)?;
                 let d2d_rect = D2D_RECT_F {
                     left: rect.x0,
                     top: rect.y0,
@@ -315,18 +339,7 @@ fn execute_d2d_batch(
                 half_thickness,
                 color,
             } => {
-                let brush = unsafe {
-                    target.CreateSolidColorBrush(
-                        &D2D1_COLOR_F {
-                            r: color.r,
-                            g: color.g,
-                            b: color.b,
-                            a: color.a,
-                        },
-                        None,
-                    )
-                }
-                .map_err(|e| IGuiError::D2D(format!("CreateSolidColorBrush failed: {e}")))?;
+                let brush = cached_solid_brush(target, &mut brush_cache, color)?;
                 unsafe {
                     target.DrawLine(
                         Vector2 { X: p0.x, Y: p0.y },
@@ -646,7 +659,6 @@ fn run_hit_test_point(request_id: u32, run: &batch_mod::TextRun, point: batch_mo
 // ─── Phase 5: composition stacks + paths ────────────────────────────
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 thread_local! {
     static OFFSET_STACK: RefCell<Vec<windows_numerics::Matrix3x2>> =
@@ -1063,6 +1075,9 @@ fn log_ui_batch(child_id: i64, batch: &batch_mod::PaneBatch) {
         batch.flags,
         batch.cmds.len(),
     );
+    if !verbose_ui_batch_logging_enabled() {
+        return;
+    }
     for (index, cmd) in batch.cmds.iter().enumerate() {
         match cmd {
             SurfaceCmd::Clear { color } => eprintln!(

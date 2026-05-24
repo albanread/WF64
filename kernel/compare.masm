@@ -12,6 +12,15 @@
 ; collapses CF to all-ones (-1) or all-zeros (0) in one instruction.
 ; ─────────────────────────────────────────────────────────────────────
 
+; ─────────────────────────────────────────────────────────────────────
+; REMINDER: RAX is the cached TOS (top of data stack).
+; Any instruction that writes RAX (mov, xor, shl, add, lea, mul, div,
+; rep movsb's implicit clobbers, etc.) destroys the user's TOS unless
+; it has been spilled to [DSP - cell] first. When scratching, prefer
+; RCX/RDX/R8-R11. Save the original TOS in another register at the
+; function prologue if any later branch needs it back.
+; ─────────────────────────────────────────────────────────────────────
+
 ; 0=  ( n -- flag )
 ;     `sub rax, 1; sbb rax, rax` — if rax was 0, sub borrows (CF=1),
 ;     sbb produces -1; otherwise CF=0, sbb produces 0.

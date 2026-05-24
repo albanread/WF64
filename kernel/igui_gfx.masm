@@ -14,6 +14,15 @@
 ; primitives are safe to call but produce nothing visible.
 ; ─────────────────────────────────────────────────────────────────────
 
+; ─────────────────────────────────────────────────────────────────────
+; REMINDER: RAX is the cached TOS (top of data stack).
+; Any instruction that writes RAX (mov, xor, shl, add, lea, mul, div,
+; rep movsb's implicit clobbers, etc.) destroys the user's TOS unless
+; it has been spilled to [DSP - cell] first. When scratching, prefer
+; RCX/RDX/R8-R11. Save the original TOS in another register at the
+; function prologue if any later branch needs it back.
+; ─────────────────────────────────────────────────────────────────────
+
 
 ; gpane-open  ( w h c-addr u -- id )
 ;     Open a new graphical MDI child sized (w × h) with title at
@@ -228,5 +237,83 @@ proc(gpane_next_event_word)
     mov     rax, [UP + user_PAD + 32]           ; p4
     mov     [DSP + 3*cell], rax
     mov     TOS, [UP + user_PAD + 0]            ; kind → TOS
+    next()
+endp()
+
+
+; fractal-iter  ( maxiter -- n )  ( F: z0x z0y cx cy -- )
+;
+;     General Mandelbrot / Julia inner-loop kernel. Pops z₀ = (z0x, z0y)
+;     and c = (cx, cy) from the WF64 FP stack (pushed in order z0x z0y cx cy,
+;     so cy is FP-TOS on entry). Takes maxiter from the data stack TOS.
+;     Returns the escape-iteration count; equals maxiter for interior points.
+;
+;     Algorithm:  z ← z² + c  where  new_zx = zx²−zy²+cx,
+;                                     new_zy = 2·zx·zy+cy.
+;     Bail when |z|² ≥ 4.
+;
+;     Uses only caller-saved XMM0–XMM5; user_FP_TMP is a safe scratch cell
+;     (the float parser stores there only during interpretation, never during
+;     runtime computation).  No callee-saved XMMs touched; no RSP juggling.
+;
+;     XMM roles:  0=zx  1=zy  2=cy  3=cx  4=4.0  5=scratch/new_zy
+;     GPR scratch: r8 (bit pattern for 4.0), r9 (remaining iter budget), r10 (count)
+proc(fractal_iter_word)
+    ; ── pop 4 doubles from the WF64 FP stack ────────────────────────────
+    ; Stack layout (grows down; FP-TOS at lowest address):
+    ;   [FSP+ 0] = cy    [FSP+ 8] = cx
+    ;   [FSP+16] = z0y   [FSP+24] = z0x
+    mov     rcx, [UP + user_FSP]
+    movsd   xmm0, qword ptr [rcx + 24]     ; zx  ← z0x
+    movsd   xmm1, qword ptr [rcx + 16]     ; zy  ← z0y
+    movsd   xmm3, qword ptr [rcx + 8]      ; cx
+    movsd   xmm2, qword ptr [rcx]          ; cy
+    add     rcx, 32
+    mov     [UP + user_FSP], rcx            ; pop all 4 floats
+
+    ; ── load 4.0 into xmm4 via integer bits ─────────────────────────────
+    mov     r8,  0x4010000000000000          ; IEEE-754 double: 4.0
+    movq    xmm4, r8
+
+    ; ── iteration setup ──────────────────────────────────────────────────
+    mov     r9,  TOS                         ; r9  = maxiter (data TOS)
+    xor     r10, r10                         ; r10 = iter count = 0
+
+.iter:
+    test    r9,  r9
+    jz      .done                            ; budget exhausted → interior
+
+    ; ── new_zy = 2·zx·zy + cy  (computed first so old zx, zy are intact) ──
+    movsd   xmm5, xmm0
+    mulsd   xmm5, xmm1                      ; xmm5 = zx·zy
+    addsd   xmm5, xmm5                      ; xmm5 = 2·zx·zy
+    addsd   xmm5, xmm2                      ; xmm5 = new_zy
+    movsd   [UP + user_FP_TMP], xmm5       ; stash new_zy (one double)
+
+    ; ── square z (destroys old zx, zy — both already consumed above) ─────
+    mulsd   xmm1, xmm1                      ; xmm1 = zy²
+    mulsd   xmm0, xmm0                      ; xmm0 = zx²
+
+    ; ── escape test: |z|² = zx² + zy² ≥ 4? ─────────────────────────────
+    movsd   xmm5, xmm0
+    addsd   xmm5, xmm1                      ; xmm5 = |z|²
+    ucomisd xmm5, xmm4
+    jae     .done                            ; escaped
+
+    ; ── new_zx = zx² − zy² + cx  (xmm0 = zx², xmm1 = zy²) ─────────────
+    subsd   xmm0, xmm1                      ; xmm0 = zx² − zy²
+    addsd   xmm0, xmm3                      ; xmm0 = new_zx  (ready for next iter)
+
+    ; ── retrieve new_zy ──────────────────────────────────────────────────
+    movsd   xmm1, [UP + user_FP_TMP]       ; xmm1 = new_zy  (ready for next iter)
+
+    inc     r10
+    dec     r9
+    jmp     .iter
+
+.done:
+    ; Replace data TOS (maxiter) with the escape count.
+    ; Stack effect ( maxiter -- n ) is balanced: stk(1,1) → no adjustment.
+    mov     TOS, r10
     next()
 endp()

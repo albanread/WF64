@@ -193,6 +193,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("gpane-line",         "gpane_line_word",          0),
     ("gpane-fill-circle",  "gpane_fill_circle_word",   0),
     ("gpane-next-event",   "gpane_next_event_word",    0),
+    ("fractal-iter",       "fractal_iter_word",        0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -463,7 +464,8 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("(local!)",       "local_store_word",        0),
     ("locals#",        "locals_count_word",       0),
     ("locals#!",       "locals_count_store_word", 0),
-    ("check-local-emit","check_local_emit_word", 0),
+    ("check-local-emit", "check_local_emit_word",  0),
+    ("check-local-store","check_local_store_word", 0),
     ("(inline,)",      "inline_comma_word",       0),
     // Parse & dict
     ("evaluate",   "evaluate_word", 0),
@@ -681,7 +683,7 @@ pub const PRIVATE_WORDS: &[&str] = &[
     "(comp-cons)", "(comp-2cons)", "(comp-fconst)", "(comp-val)", "(comp-only)",
     // Locals stack
     "(open-locals)", "(close-locals)", "(local@)", "(local!)",
-    "check-local-emit", "locals#", "locals#!",
+    "check-local-emit", "check-local-store", "locals#", "locals#!",
     "lp@", "lp0@", "lp-limit", "lp-smoke",
     // Control-flow assembly internals
     "mark>", ">resolve", "<resolve", "?pairs",
@@ -1278,6 +1280,25 @@ impl Wf64Session {
         // point on, the kernel's view of HERE/LATEST is the only one
         // we have — Rust knows nothing about the header layout.
         session.bootstrap_dictionary()?;
+
+        // Load the standard source library (lib/core.f) *before* taking
+        // the boot snapshot.  This ensures that reset() rolls back only
+        // to the post-core.f state, so source-defined words like `{:`,
+        // `to`, `if`, `then`, `begin`, `while`, etc. are always present
+        // without having to re-load them per test.  main.rs and wf64-ui
+        // no longer need to call load_source_file("lib/core.f") because
+        // with_kernel() / new() now does it.
+        let core_path = kernel_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(Path::new("."))
+            .join("lib")
+            .join("core.f");
+        if core_path.exists() {
+            session.load_source_file(&core_path)
+                .with_context(|| format!("boot: load {}", core_path.display()))?;
+        }
+
         session.boot_here   = session.here();
         session.boot_latest = session.latest();
         session.boot_latestxt = session.user_u64(USER_LATESTXT_VAR);

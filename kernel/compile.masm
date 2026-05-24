@@ -13,6 +13,15 @@
 ; the 12-byte indirect path.
 ; ─────────────────────────────────────────────────────────────────────
 
+; ─────────────────────────────────────────────────────────────────────
+; REMINDER: RAX is the cached TOS (top of data stack).
+; Any instruction that writes RAX (mov, xor, shl, add, lea, mul, div,
+; rep movsb's implicit clobbers, etc.) destroys the user's TOS unless
+; it has been spilled to [DSP - cell] first. When scratching, prefer
+; RCX/RDX/R8-R11. Save the original TOS in another register at the
+; function prologue if any later branch needs it back.
+; ─────────────────────────────────────────────────────────────────────
+
 ; do_lit  ( -- n )   [runtime helper, never user-callable]
 ;     Compiled by `literal` as: call do_lit ; .quad N
 ;     The caller's return slot points at the 8-byte literal sitting

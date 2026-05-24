@@ -327,12 +327,12 @@ fn boot_session(intro: bool) -> Option<wf64::Wf64Session> {
         }
     };
 
+    // lib/core.f is now loaded automatically by Wf64Session::new()
+    // before taking the boot snapshot — all standard words are already
+    // present.  Just emit the status message the console expects.
     let core_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
-    match session.load_source_file(&core_path) {
-        Ok(()) => fconsole::append(&format!("∴ loaded {}", core_path.display())),
-        Err(e) => fconsole::append(&format!("∴ core.f load failed: {e}")),
-    }
+    fconsole::append(&format!("∴ loaded {}", core_path.display()));
     // Preload a cushion of zeros so a couple of accidental
     // over-drops at the REPL don't immediately crash the worker.
     // Eight cells = one cache line; enough to recover from a

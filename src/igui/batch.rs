@@ -16,8 +16,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_PAINT};
 
 use super::registry;
 
@@ -311,6 +312,7 @@ pub fn submit(batch: PaneBatch) -> bool {
     }
     if let Some(hwnd) = registry::render_hwnd_of(child_id) {
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_PAINT, WPARAM(0), LPARAM(0)) };
         true
     } else {
         false

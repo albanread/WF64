@@ -9,6 +9,15 @@
 ; `(set-xt)` and optionally `(set-flags)`.
 ; ─────────────────────────────────────────────────────────────────────
 
+; ─────────────────────────────────────────────────────────────────────
+; REMINDER: RAX is the cached TOS (top of data stack).
+; Any instruction that writes RAX (mov, xor, shl, add, lea, mul, div,
+; rep movsb's implicit clobbers, etc.) destroys the user's TOS unless
+; it has been spilled to [DSP - cell] first. When scratching, prefer
+; RCX/RDX/R8-R11. Save the original TOS in another register at the
+; function prologue if any later branch needs it back.
+; ─────────────────────────────────────────────────────────────────────
+
 proc(init_dictionary_overlay)
     mov     r8, [UP + user_DICT_END]
     mov     [UP + user_INDEX_HERE], r8
