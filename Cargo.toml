@@ -3,6 +3,15 @@ name = "wf64"
 version = "0.1.0"
 edition = "2021"
 description = "A 64-bit STC Forth, JIT-compiled via the JASM assembler"
+build = "build.rs"
+
+[features]
+default = []
+# Builds wf64-ui as a Windows GUI subsystem app (no console window
+# pops up when launched from Explorer).  Release packaging always
+# enables this; dev builds leave it off so eprintln traces remain
+# visible in the cargo-run terminal.
+gui_subsystem = []
 
 [dependencies]
 # Path dep on JASM while both projects co-evolve. Flip to a git or
@@ -12,6 +21,11 @@ newgc-core = { path = "../NewGC/crates/newgc-core" }
 anyhow = "1"
 # libloading — runtime DLL loading for factor.dll (NewFactor IDE).
 libloading = "0.8"
+
+[build-dependencies]
+# Embeds the Win32 application manifest (DPI awareness, common
+# controls v6, UTF-8 active code page) into wf64-ui.exe.
+embed-resource = "3"
 
 # iGui — Windows MDI front-end, ported from NewCormanLisp's iGui
 # (which in turn borrows the renderer architecture from NewCP).
@@ -75,3 +89,15 @@ debug = 1
 
 [profile.release]
 lto = "thin"
+
+# `release-ship` is the profile used by the packaging script
+# (tools/build-release.ps1).  Builds the smallest, fastest binary
+# we can ship: full LTO, single codegen unit, stripped symbols,
+# abort-on-panic.  Slower to build than plain release; we only
+# use it when assembling release/wf64/.
+[profile.release-ship]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

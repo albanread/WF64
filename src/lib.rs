@@ -52,6 +52,44 @@ pub mod newfactor;
 
 pub const KERNEL_ENTRY: &str = "kernel/main.masm";
 
+/// Locate `kernel/main.masm` for `Wf64Session::new()`.
+///
+/// Search order — first existing path wins:
+///   1. `<exe_dir>/kernel/main.masm` — production layout shipped
+///      by `tools/build-release.ps1` (binary + kernel/ + lib/
+///      sit side-by-side under `release/wf64/`).
+///   2. `<exe_dir>/../../kernel/main.masm` — `cargo run` from any
+///      directory while the binary lives under `target/release/`
+///      or `target/debug/`.
+///   3. `CARGO_MANIFEST_DIR/kernel/main.masm` — repo root fallback
+///      (developer-launched `cargo test` etc.).
+///   4. `kernel/main.masm` — relative to CWD; matches the
+///      historical behaviour and is what users typing
+///      `cargo run --bin wf64` from the repo root see.
+pub fn default_kernel_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let p = exe_dir.join("kernel").join("main.masm");
+            if p.exists() {
+                return p;
+            }
+            if let Some(repo) = exe.ancestors().nth(3) {
+                let p = repo.join("kernel").join("main.masm");
+                if p.exists() {
+                    return p;
+                }
+            }
+        }
+    }
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("kernel")
+        .join("main.masm");
+    if p.exists() {
+        return p;
+    }
+    PathBuf::from(KERNEL_ENTRY)
+}
+
 /// (forth_name, asm_symbol, flags). Insertion order = scan order:
 /// most-recently-inserted is matched first by `find-name`.
 ///
@@ -1056,7 +1094,7 @@ unsafe impl Send for Wf64Session {}
 
 impl Wf64Session {
     pub fn new() -> Result<Self> {
-        Self::with_kernel(KERNEL_ENTRY)
+        Self::with_kernel(default_kernel_path())
     }
 
     pub fn with_kernel(kernel_path: impl AsRef<Path>) -> Result<Self> {
@@ -1946,8 +1984,7 @@ unsafe fn write_u64(base: *mut c_void, off: u64, v: u64) {
     ptr.write_unaligned(v);
 }
 
-/// Helper used by `main.rs` so the binary doesn't need to know the
-/// kernel path constant directly.
-pub fn default_kernel_path() -> PathBuf {
-    PathBuf::from(KERNEL_ENTRY)
-}
+// `default_kernel_path` lives at the top of this file alongside
+// KERNEL_ENTRY — the historical stub here was a single
+// `PathBuf::from(KERNEL_ENTRY)` line; the real impl with exe-dir
+// fallback search supersedes it for release-packaged binaries.

@@ -1,3 +1,13 @@
+// Release builds ship as a Windows GUI-subsystem app: no console
+// window pops up when the user launches the IDE from Explorer.
+// Dev / debug builds keep the console attached so `eprintln!` traces
+// are visible in the cargo-run terminal.  Controlled by the
+// `gui_subsystem` Cargo feature (enabled by tools/build-release.ps1).
+#![cfg_attr(
+    all(windows, feature = "gui_subsystem"),
+    windows_subsystem = "windows"
+)]
+
 //! `wf64-ui` — the WF64 Forth IDE front-end.
 //!
 //! Phase 2b: spawns a worker thread that owns a `Wf64Session`,
@@ -329,9 +339,14 @@ fn boot_session(intro: bool) -> Option<wf64::Wf64Session> {
 
     // lib/core.f is now loaded automatically by Wf64Session::new()
     // before taking the boot snapshot — all standard words are already
-    // present.  Just emit the status message the console expects.
-    let core_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("lib").join("core.f");
+    // present.  Resolve the same path the session would have used so
+    // the status banner reports the actual file (release-packaged
+    // binaries find it next to the exe; dev runs find it in the repo).
+    let core_path = wf64::default_kernel_path()
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("lib").join("core.f"))
+        .unwrap_or_else(|| Path::new("lib").join("core.f"));
     fconsole::append(&format!("∴ loaded {}", core_path.display()));
     // Preload a cushion of zeros so a couple of accidental
     // over-drops at the REPL don't immediately crash the worker.
