@@ -155,8 +155,7 @@ arithmetic, etc.
 **Done when:** anstests64 emits no `WRONG NUMBER OF RESULTS` or
 `INCORRECT RESULT` lines.
 
-**Completed:** `cargo test` is green, including `m7_ans_core_tests_pass`
-and the current 219-test suite.
+**Completed:** `cargo test` is green, including `m7_ans_core_tests_pass`.
 Key fixes made:
 - `$` hex prefix added to `number_q` (number.masm)
 - Hayes tester rewritten to use `BEGIN`/`WHILE`/`REPEAT` (no DO/LOOP)

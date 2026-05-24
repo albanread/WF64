@@ -178,7 +178,7 @@ When you encounter an oddity or bug, fix it in WF64 and document the local reaso
 ```powershell
 cd E:\WF64
 cargo build
-cargo test                                   # currently 219 tests total (27 unit + 192 harness)
+cargo test                                   # full suite — Rust unit tests + harness tests + data-driven .t/.in/.out
 cargo test --test harness -- --nocapture     # show PASS / FAIL / NYIMP summary
 cargo run                                    # interactive REPL — type `2 3 + . bye`
 cargo run --bin port-wf32 -- '+'             # optional legacy translator helper
@@ -225,7 +225,7 @@ cargo run --bin port-wf32 -- '+'             # optional legacy translator helper
 | M6 | File loading (`INCLUDE`) | ✅ |
 | M7 | ANS Forth core test suite passes | ✅ |
 
-**`cargo test` is green: 219 tests total (27 Rust unit tests + 192 harness tests).**
+**`cargo test` is green. The suite covers Rust unit tests, the harness, and the data-driven `tests/data/` runners — run it to see the current count.**
 
 ---
 

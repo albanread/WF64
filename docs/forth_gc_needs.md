@@ -146,7 +146,7 @@ pattern with a single `rt_gc_auto_step(UP)` extern that gates on
 `collect_auto` does the minor-vs-major decision internally.
 
 `heap.collect_auto` re-exported as `gc::collect_auto` in
-`src/gc/heap.rs`.  Suite still 271/271 after the refactor —
+`src/gc/heap.rs`.  Suite still green after the refactor —
 behavioural equivalence preserved.
 
 ---

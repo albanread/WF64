@@ -1,33 +1,31 @@
 # WF64
 
-A Forth in LLVM/custom MASM- under development
+A Forth in LLVM/custom MASM — under development.
 
 
-This is an application level FORTH, rather than an embedded systems FORTH, it should be quite suitable for writing windows programs.
+This is an application-level Forth rather than an embedded-systems Forth, aimed at writing Windows programs.
 
-Like my other compilers exe generation is not a priority for me, native code generation is.
-The bring up is from source direct to memory.
+Like my other compilers, exe generation is not a priority; native code generation is. The bring-up is from source direct to memory.
 
-Its open source its nice to just change it and run, without compile/link/crash/repeat rituals.
+It's open source, so it's nice to just change it and run, without compile/link/crash/repeat rituals.
 
-In theory as it is a compiler it can also be adapted to compile an exe but it would lose features
+In theory, as a compiler, it can also be adapted to emit an exe — but it would lose features.
 
-LLVM is used in the core, after FORTH is built, the FORTH compiler is not using LLVM.
+LLVM is used in the core. After Forth is built, the Forth compiler itself does not use LLVM.
 
-The FORTH compiler here is based on the WF32 STC compiler.
+The Forth compiler here is based on the WF32 STC compiler.
 
 -----------------------
 
-Here is the story: writing the FORTH compiler in rust like other compilers here, was not satisfying at all, FORTH does not fit well there. 
+Here is the story: writing the Forth compiler in Rust, like the other compilers here, was not satisfying — Forth does not fit well there.
 
-The shape is much better if we write FORTH in masm.  
+The shape is much better if we write Forth in masm.
 
-For this we build a macro assembler, all we need are the macros, the first step is to use the LLVM MCJIT MASM flavoured assembler, and then add a parser to create a useful macro-assembler.
-That assembler can read .masm files and generate the FORTH kernel.
+For this we build a macro assembler. All we need are the macros: the first step is to use the LLVM MCJIT MASM-flavoured assembler, then add a parser on top to make it a useful macro assembler. That assembler can read `.masm` files and generate the Forth kernel.
 
-This allows the FORTH kernel to be implemented in assembly language (See JASM project), to do this I borrowed the WF32 kernel and ported it, using quite a lot of automated extraction and testing.
+This lets the Forth kernel be implemented in assembly (see the JASM project). The kernel was ported from WF32 with a fair amount of automated extraction and testing.
 
-The primitives from WF32 and its STC compiler are excellent, over the top of that we overlay a port of ANSI Forth.
+The WF32 primitives and STC compiler are the starting point; on top of that we overlay a port of ANS Forth.
 
 
 This does lead to some layers
@@ -57,11 +55,12 @@ Apart from lets say 'implementation details' this is a very conventional FORTH r
 
 If we wanted to bootstrap a ANS FORTH we could do; we could create an exe at 'ANSI Forth in Forth' level.
 
-This is a true and normal FORTH, right until the first escape hatch which allows FORTH to define new
-CODE words using the same very powerful macro assembler the kernel uses.
+This is a conventional Forth, up to the first escape hatch — `CODE` — which lets Forth define new
+primitives using the same macro assembler the kernel uses.
 
-After that the LET infix operator is a fast dense floating point expression evaluator, used to accelerate
-floating point, and lets be honest simplify it.
+After that the LET infix operator is a dense floating-point expression evaluator. Its main purpose is
+to make the floating-point code shorter and easier to read; emitting register-allocated SSE that LLVM
+or libm could plausibly produce is the side benefit.
 
 The paged GC, is my own GC that I also use with Lisp, Dylan etc this gives us a managed heap for data.
 It creates data outside the dictionary for us.
