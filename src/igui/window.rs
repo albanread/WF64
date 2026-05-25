@@ -892,27 +892,17 @@ unsafe extern "system" fn frame_wnd_proc(
                 open_docs();
                 return LRESULT(0);
             }
-            // File → Open: if no active editor, show the dialog and
-            // open the chosen file in a new fedit directly.  If there
-            // is an active fedit, fall through to forward the command
-            // to it — the fedit WndProc will show its own dialog and
-            // open the file in a new window.
+            // File → Open: always create a new fedit pane and load the
+            // chosen file into it, regardless of which MDI child is
+            // currently active.  Never forward to the active child —
+            // WM_MDIGETACTIVE returns any active child (console, log,
+            // etc.), so forwarding silently drops the command when a
+            // non-fedit pane has focus.
             if cmd_id == super::fedit::EDIT_CMD_OPEN {
                 if mdi.0 as isize != 0 {
-                    let active_raw = unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                            mdi,
-                            windows::Win32::UI::WindowsAndMessaging::WM_MDIGETACTIVE,
-                            Some(WPARAM(0)),
-                            Some(LPARAM(0)),
-                        )
-                    };
-                    if active_raw.0 == 0 {
-                        super::fedit::open_with_dialog(hwnd, mdi);
-                        return LRESULT(0);
-                    }
-                    // Fall through to EDIT_CMD_BASE forwarding below.
+                    super::fedit::open_with_dialog(hwnd, mdi);
                 }
+                return LRESULT(0);
             }
             // Edit-menu commands: forward to the active MDI child.
             // fedit's WndProc recognises these IDs in its own
