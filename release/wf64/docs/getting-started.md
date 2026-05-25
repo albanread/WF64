@@ -4,24 +4,7 @@
 
 ### GUI IDE (recommended)
 
-```powershell
-cd E:\WF64
-cargo run --bin wf64-ui
-```
-
-This opens the MDI frame with the Console pane and REPL pane. The Forth worker loads `lib/core.f` automatically before dropping into the interactive loop.
-
-### Headless REPL
-
-```powershell
-cargo run
-```
-
-Prints to stdout, reads from stdin. Useful for scripting or when you want minimal overhead. Same `lib/core.f` startup sequence.
-
-### Pre-built binary
-
-If `wf64-ui.exe` has already been built (`cargo build --release --bin wf64-ui`), you can launch it directly from `target/release/wf64-ui.exe` or place it anywhere on your `PATH`.
+Double-click **`wf64-ui.exe`**. The MDI frame opens with the Console pane already active and the `>` prompt waiting for input. The Forth system loads `lib/core.f` automatically before the prompt appears — all standard words are available immediately.
 
 ---
 

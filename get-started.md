@@ -33,12 +33,12 @@ WF64 produces a single Rust binary (`cargo run`) that:
 
 1. Loads the assembled kernel into MCJIT at process start.
 2. `VirtualAlloc2`s a 128 MB region within ±2 GB of the kernel (so all `call rel32`s fit) and carves it into data stack / return stack / user area / dictionary heap.
-3. Bootstraps the dictionary by calling JITed `(create)` / `(set-xt)` / `(set-flags)` once per primitive.
+3. Bootstraps the dictionary by calling JITed `(create)` / `(set-xt)` / `(set-comp)` / `(set-flags)` once per primitive.
 4. Drops into the REPL (`quit`) — `>` prompt, line-buffered stdin, and startup source loading.
 
 ```
 E:\WF64\
-├── Cargo.toml                  depends on wfasm via path = "../JASM/rust"
+├── Cargo.toml                  depends on wfasm (path = "../JASM/rust") and newgc-core (path = "../NewGC/newgc-core")
 ├── README.md                   public-facing intro
 ├── get-started.md              this file
 ├── docs/MILESTONES.md          M1–M7 roadmap with status
@@ -71,7 +71,7 @@ E:\WF64\
 │   ├── number.masm             . / number?
 │   ├── io.masm                 emit, type, cr, bye
 │   ├── parse.masm              parse-name, accept
-│   ├── dict.masm               find-name, (create), (set-xt), (set-flags)
+│   ├── dict.masm               find-name, (create), (set-xt), (set-comp), (set-flags)
 │   ├── execute.masm            execute
 │   ├── compile.masm            do_lit, compile,, literal, :, ;
 │   ├── interp.masm             quit (the REPL loop)

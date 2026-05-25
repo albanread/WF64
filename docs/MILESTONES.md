@@ -34,7 +34,7 @@ call, print exit code.
 - `src/runtime.rs` — `extern "C" fn rt_emit(ch: u64) -> u64` writes
   `ch as u8` to stdout
 - In `main.rs`: register `rt_emit` via `Jit::define_extern_fn`
-- Update `KERNEL_PROCS` to include all the new primitive names
+- Update `PRIMITIVES` (in `src/lib.rs`) to include all the new primitive names
 
 **Done when:** `$ cargo run` prints `5 ` and exits 0.
 

@@ -202,7 +202,7 @@ Example:
 
 | Word | Stack effect | Description |
 |---|---|---|
-| `create` | `( "name" -- )` | Create a headerless data entry |
+| `create` | `( "name" -- )` | Create a dictionary entry with no defined behavior; body follows `here` |
 | `variable` | `( "name" -- )` | Allocate a cell variable |
 | `2variable` | `( "name" -- )` | Allocate a double-cell variable |
 | `constant` | `( n "name" -- )` | Compile-time constant |
@@ -219,6 +219,40 @@ counter @ .           \ prints 1
 42 constant answer
 answer .              \ prints 42
 ```
+
+---
+
+## File I/O
+
+| Word | Stack effect | Description |
+|---|---|---|
+| `open-file` | `( addr u fam -- fd ior )` | Open file by name; fam: 0=read, 1=write, 2=read/write |
+| `create-file` | `( addr u fam -- fd ior )` | Create or truncate file |
+| `close-file` | `( fd -- ior )` | Close file descriptor |
+| `read-file` | `( addr u fd -- u2 ior )` | Read up to `u` bytes |
+| `read-line` | `( addr u fd -- u2 flag ior )` | Read one line |
+| `write-file` | `( addr u fd -- ior )` | Write `u` bytes |
+| `write-line` | `( addr u fd -- ior )` | Write line + newline |
+| `flush-file` | `( fd -- ior )` | Flush write buffers |
+| `file-position` | `( fd -- ud ior )` | Current position |
+| `reposition-file` | `( ud fd -- ior )` | Seek to position |
+| `file-size` | `( fd -- ud ior )` | File size in bytes |
+| `delete-file` | `( addr u -- ior )` | Delete file by name |
+| `rename-file` | `( addr u addr2 u2 -- ior )` | Rename file |
+| `include` | `( "filename" -- )` | Load and evaluate a source file |
+| `included` | `( addr u -- )` | Load and evaluate by address/length |
+
+`ior` is 0 on success, non-zero on error (maps to a Windows error code).
+
+---
+
+## Dynamic memory
+
+| Word | Stack effect | Description |
+|---|---|---|
+| `allocate` | `( u -- addr ior )` | Allocate `u` bytes on the heap |
+| `free` | `( addr -- ior )` | Free a heap allocation |
+| `resize` | `( addr u -- addr2 ior )` | Resize a heap allocation |
 
 ---
 

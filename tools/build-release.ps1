@@ -104,24 +104,47 @@ foreach ($dir in @('kernel', 'lib', 'demos')) {
     }
 }
 
-# Docs - copy the few markdown files we ship, not the whole repo.
-$docFiles = @('README.md', 'MANIFESTO.md', 'get-started.md')
+# Docs - copy only the user-facing docs, not developer/internal files.
+$userDocFiles = @(
+    'index.md',
+    'getting-started.md',
+    'forth-tutorial.md',
+    'forth-reference.md',
+    'ide-guide.md',
+    'keyboard-shortcuts.md'
+)
 $docDest = Join-Path $OutDir 'docs'
 New-Item -ItemType Directory -Force -Path $docDest | Out-Null
-foreach ($f in $docFiles) {
-    $src = Join-Path $repo $f
+$repoDocs = Join-Path $repo 'docs'
+foreach ($f in $userDocFiles) {
+    $src = Join-Path $repoDocs $f
     if (Test-Path $src) {
         Copy-Item $src $docDest
         Write-Host "[release] staged docs/$f"
+    } else {
+        Write-Warning "[release] docs/$f not found - skipping"
     }
 }
-# If there's a docs/ tree in the repo, copy its contents alongside.
-$repoDocs = Join-Path $repo 'docs'
-if (Test-Path $repoDocs) {
-    Get-ChildItem $repoDocs -File | ForEach-Object {
-        Copy-Item $_.FullName $docDest
+
+# DocCrate - the help-viewer executable.  Look next to the wf64-ui binary
+# first (trimmed/custom build), then fall back to the standard install path.
+$docCrateCandidates = @(
+    (Join-Path $buildDir 'doc-crate.exe'),
+    'E:\DocCrate\target\release\doc-crate.exe',
+    'E:\DocCrate\target\release-ship\doc-crate.exe'
+)
+$docCrateFound = $false
+foreach ($candidate in $docCrateCandidates) {
+    if (Test-Path $candidate) {
+        Copy-Item $candidate (Join-Path $OutDir 'doc-crate.exe')
+        $sizeMB = [math]::Round((Get-Item $candidate).Length / 1MB, 2)
+        Write-Host "[release] staged doc-crate.exe ($sizeMB MB) from $candidate"
+        $docCrateFound = $true
+        break
     }
-    Write-Host "[release] merged docs/ tree"
+}
+if (-not $docCrateFound) {
+    Write-Warning "[release] doc-crate.exe not found - Help menu will not open docs. Build DocCrate first (E:\DocCrate\)"
 }
 
 # End-user quickstart.
@@ -131,28 +154,37 @@ WF64 - 64-bit STC Forth IDE
 
 Quick start
 -----------
-Double-click wf64-ui.exe.  The IDE opens straight to a Forth
-console pane.  Type at the > prompt and press Enter:
+Double-click wf64-ui.exe.  The IDE opens to a Forth console pane.
+Type at the > prompt and press Enter:
 
-    : square dup * ;
+    : square  dup * ;
     7 square .
 
-The Demos menu loads small programs you can play with.  Tools
-menu opens the editor, the data-stack viewer, and the log pane.
+Should print 7 ok and 49 ok.
+
+The Demos menu loads ready-to-run example programs.
+View menu opens the stack viewer (Ctrl+Shift+K), log pane
+(Ctrl+Shift+L), and additional REPL panes (Ctrl+Shift+P).
+File -> New (Ctrl+N) opens the Forth source editor.
+
+Help -> Documentation (F1) opens the full user guide in the
+DocCrate viewer.  Requires doc-crate.exe in this folder.
 
 Layout
 ------
     wf64-ui.exe   - the IDE binary (drag a shortcut to your desktop)
+    doc-crate.exe - documentation viewer (needed for Help -> Docs)
+    LLVM-C.dll    - LLVM runtime (must stay alongside wf64-ui.exe)
     kernel\       - JIT-assembled Forth primitives (loaded at boot)
     lib\          - Forth standard library (core.f)
     demos\        - sample programs reachable via the Demos menu
-    docs\         - README, manifesto, get-started
+    docs\         - user guide and reference (opened by DocCrate)
 
 Where things live at runtime
 ----------------------------
-The IDE looks for kernel\ and lib\ next to wf64-ui.exe first,
-then falls back to the original repo layout.  You can move the
-folder anywhere as long as the layout above stays intact.
+The IDE looks for kernel\ and lib\ next to wf64-ui.exe first.
+You can move the whole folder anywhere as long as the layout
+above stays intact.
 "@
 Set-Content -Encoding UTF8 (Join-Path $OutDir 'README.txt') $readme
 Write-Host "[release] wrote README.txt"

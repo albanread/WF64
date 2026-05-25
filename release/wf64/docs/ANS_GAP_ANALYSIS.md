@@ -1,7 +1,7 @@
 # WF64 ANS Forth Gap Analysis
 
-**Date:** 2026-05-22  
-**Current status:** M5, M6, and M7 are complete; `cargo test` is green.  
+**Date:** 2026-05-25  
+**Current status:** M1–M7 complete; `cargo test` is green.  
 **Definitive source of truth:** `src/lib.rs` `PRIMITIVES`, `lib/core.f`, and the active tests under `tests/`.
 
 ---
@@ -94,68 +94,64 @@ This section is intentionally narrower than the old document. It lists words and
 
 ### 3.1 Small Language-Surface Gaps
 
-These are the most obvious still-missing ANS-facing words.
-
 | Word | Status | Notes |
 |---|---|---|
-| `2value` | missing | Not present; `to` remains single-cell oriented in the current implementation. |
+| `2value` | **present** | Defined in `lib/core.f`; `2to` is also present. |
 | `environment?` | partial | Present only as a stub returning `false`. Good enough for current tests, not a real environment query database. |
 
 ### 3.2 FILE Wordset
 
-WF64 now supports source loading via `included` / `include`, but that is not the same as implementing the ANS FILE wordset.
+The ANS FILE wordset is **substantially implemented** as kernel primitives (registered in `src/lib.rs`). Most file-handle words are present.
 
-Still missing as user-visible words:
+| Word | Status |
+|---|---|
+| `open-file` | **present** (kernel primitive) |
+| `create-file` | **present** (kernel primitive) |
+| `close-file` | **present** (kernel primitive) |
+| `read-file` | **present** (kernel primitive) |
+| `read-line` | **present** (source-defined in `lib/core.f`) |
+| `write-file` | **present** (kernel primitive) |
+| `write-line` | **present** (kernel primitive) |
+| `flush-file` | **present** (kernel primitive) |
+| `file-position` | **present** (kernel primitive) |
+| `reposition-file` | **present** (kernel primitive) |
+| `file-size` | **present** (kernel primitive) |
+| `delete-file` | **present** (kernel primitive) |
+| `rename-file` | **present** (kernel primitive) |
+| `include-file` | partial — `include` / `included` via Rust helper slurp |
+| `resize-file` | missing |
+| `file-status` | missing |
+| `require` / `required` | missing |
 
-- `open-file`
-- `create-file`
-- `close-file`
-- `read-file`
-- `read-line`
-- `write-file`
-- `write-line`
-- `flush-file`
-- `file-position`
-- `reposition-file`
-- `resize-file`
-- `file-size`
-- `file-status`
-- `delete-file`
-- `rename-file`
-- `include-file`
-- `require`
-- `required`
-
-Current M6 implementation note:
-
-- `include` / `included` are source-defined in `lib/core.f`
-- file bytes are loaded by Rust runtime helpers (`rt_slurp_file`, `rt_slurp_len`, `rt_slurp_pop`)
-- evaluation is routed back through `evaluate`
-
-So: source loading exists, but the general FILE API does not.
+Source loading (`include` / `included`) is source-defined in `lib/core.f` using Rust runtime helpers (`rt_slurp_file`, `rt_slurp_len`, `rt_slurp_pop`) routed through `evaluate`. Direct handle-based file I/O (open, read, write, close) is available as kernel primitives.
 
 ### 3.3 MEMORY Wordset
 
-Still missing:
+The MEMORY wordset is **fully implemented** as kernel primitives (registered in `src/lib.rs`):
 
-- `allocate`
-- `free`
-- `resize`
-
-These would need host heap bindings and a stable pointer/error contract.
+- `allocate` — **present**
+- `free` — **present**
+- `resize` — **present**
 
 ### 3.4 FLOAT / FLOAT-EXT Gaps
 
-Core float arithmetic is present, but many ANS float extras are still absent.
+Core float arithmetic and transcendental math are both present as kernel primitives. Gaps are now in formatting and parsing only.
 
-Most obvious missing groups:
+**Present:**
 
-- float formatting: `f.`, `fe.`, `fs.`
-- precision control: `precision`, `set-precision`, `represent`
-- parsing/conversion extras: `>float`, `float`
-- approximate compare: `f~`
-- rounding helpers beyond the current source-defined truncation path
-- transcendental math (`fsin`, `fcos`, `ftan`, `fln`, `fexp`, `fsqrt`, etc.)
+- arithmetic: `f+`, `f-`, `f*`, `f/`, `fnegate`, `fabs`, `fmax`, `fmin`
+- transcendentals: `fsin`, `fcos`, `ftan`, `fln`, `fexp`, `fsqrt` (all kernel primitives)
+- float formatting: `f.` (source-defined in `lib/core.f`)
+- comparison: `f<`, `f>`, `f=`, `0f=`, `0f<`
+- conversion: `s>f`, `f>s`, `float+`, `floats`
+
+**Still missing:**
+
+- `fe.` / `fs.` (engineering/scientific notation output)
+- `precision` / `set-precision` / `represent`
+- `>float` (string-to-float parsing)
+- `f~` (approximate float comparison)
+- `falign` / `faligned`
 
 ### 3.5 TOOLS Gaps
 
@@ -205,29 +201,27 @@ If the goal is to keep closing real ANS gaps with good cost/benefit, the next se
 1. real `environment?`
    Reason: current stub is acceptable for tests but not a real implementation.
 
-2. `2value`
-   Reason: the value/to family is otherwise present; this is the most obvious remaining hole in that area.
+2. `fe.` / `fs.` / `represent`
+   Reason: `f.` exists; adding engineering and scientific notation output rounds out the float-printing surface.
 
-3. FILE wordset subset
-   Reason: `include` exists already; exposing actual file handles and read/write operations is the next coherent step.
+3. `>float`
+   Reason: string-to-float parsing is the main remaining conversion gap.
 
-4. MEMORY wordset (`allocate` / `free` / `resize`)
-   Reason: small, well-bounded host interop task.
+4. `file-status` / `require` / `required`
+   Reason: the file-handle core is done; these are the next small layer on top.
 
-5. float text I/O (`f.` / `fe.` / `fs.`)
-   Reason: current float arithmetic is strong, but human-facing float tooling is still thin.
+5. `see`
+   Reason: the TOOLS wordset is otherwise present; a decompiler/disassembler is the obvious remaining gap.
 
 ---
 
 ## 6. Bottom Line
 
-WF64 is no longer missing lots of core ANS words. The current gaps are concentrated in:
+WF64 covers the CORE and CORE-EXT wordsets well, with the FILE wordset (handle-based I/O), MEMORY wordset (allocate/free/resize), and core FLOAT-EXT (including all transcendentals and `f.`) all now implemented. The remaining gaps are narrow:
 
-- `2value`
-- real `environment?`
-- the general FILE wordset
-- the MEMORY wordset
-- float formatting / FLOAT-EXT breadth
-- `see`
+- real `environment?` (current stub returns false)
+- `fe.` / `fs.` / `represent` / `>float` (float formatting / parsing)
+- `file-status` / `require` / `required` (thin layer above existing file I/O)
+- `see` (TOOLS decompiler)
 
-Anything that still lists `c"`, `roll`, `to`, `value`, `defer`, `include`, `dump`, `words`, comments, or the basic numeric output family as missing should be treated as outdated.
+Anything that still lists `2value`, `allocate`, `free`, `resize`, `open-file`, `close-file`, `read-file`, `write-file`, `fsin`, `fcos`, `fsqrt`, or `f.` as missing is outdated.

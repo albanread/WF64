@@ -6,7 +6,7 @@ WF64 is a 64-bit subroutine-threaded Forth for Windows x86-64, built on the JASM
 
 - **Direct-call threading (STC).** Every word is a native machine-code procedure. Calling one word from another is a plain `call rel32` — no inner interpreter, no threaded-code dispatch table.
 - **JASM kernel.** The primitives are written in MASM-flavoured assembly using the JASM macro assembler, which expands into LLVM-MC object code at process start. Editing a primitive means editing a `.masm` file and running `cargo run` — no separate assembler invocation, no `link` step.
-- **ANS Forth surface, with gaps.** The CORE and CORE-EXT wordsets are largely in place; control flow, source loading, and the ANS core test suite run and pass. The FILE and MEMORY wordsets and parts of FLOAT-EXT are still absent. See [ANS Gap Analysis](ANS_GAP_ANALYSIS.md) for the current accounting. `lib/core.f` provides the higher-level vocabulary built from primitives at startup.
+- **ANS Forth surface.** The CORE, CORE-EXT, FILE, and MEMORY wordsets are largely in place; transcendental float math (fsin, fcos, fsqrt, …) and `f.` are implemented. Remaining gaps are narrow: float formatting extras (`fe.`/`fs.`), `>float`, `see`, and a real `environment?`. See [ANS Gap Analysis](ANS_GAP_ANALYSIS.md) for the current accounting. `lib/core.f` provides the higher-level vocabulary built from primitives at startup.
 - **Windows MDI GUI.** The IDE is a Win32 MDI application rendered with Direct2D and DirectWrite. Each pane — REPL, stack, log, crash dump — is an independent MDI child you can tile, maximise, or close.
 - **Crash recovery.** A vectored exception handler (VEH) intercepts SEH faults in the Forth worker thread, captures a register snapshot and stack listing, and presents them in the crash-dump pane. The rest of the IDE stays up; close the dump and restart to continue.
 - **Paged GC and managed strings.** A page-heap garbage collector (shared with NCL and NewOpenDylan) provides a managed heap for dynamic data outside the dictionary. The managed-string library is built on top of it.
@@ -28,16 +28,17 @@ WF64 is a 64-bit subroutine-threaded Forth for Windows x86-64, built on the JASM
 | Page | What |
 |---|---|
 | [Getting Started](getting-started.md) | Running WF64, first REPL session, basic workflow |
+| [Forth Tutorial](forth-tutorial.md) | Learning Forth with WF64 — stack model, words, control flow |
 | [Forth Reference](forth-reference.md) | Core word reference with stack effects |
 | [IDE Guide](ide-guide.md) | REPL pane, log view, crash dump, editor, menus |
 | [Keyboard Shortcuts](keyboard-shortcuts.md) | Complete shortcut table for all panes |
 
 ## Quick start
 
-```powershell
-cd E:\WF64
-cargo run --bin wf64-ui        # GUI IDE
-cargo run                      # headless REPL (stdout only)
+Double-click **`wf64-ui.exe`**. Type at the `>` prompt and press Enter:
+
+```forth
+2 3 + .
 ```
 
-Type `2 3 + . cr` at the `>` prompt to confirm the kernel is working.
+Should print `5 ok`. The [Getting Started](getting-started.md) guide walks through the first session from there.
