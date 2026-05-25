@@ -3,25 +3,34 @@
 
 Quick start
 -----------
-Double-click wf64-ui.exe.  The IDE opens straight to a Forth
-console pane.  Type at the > prompt and press Enter:
+Double-click wf64-ui.exe.  The IDE opens to a Forth console pane.
+Type at the > prompt and press Enter:
 
-    : square dup * ;
+    : square  dup * ;
     7 square .
 
-The Demos menu loads small programs you can play with.  Tools
-menu opens the editor, the data-stack viewer, and the log pane.
+Should print 7 ok and 49 ok.
+
+The Demos menu loads ready-to-run example programs.
+View menu opens the stack viewer (Ctrl+Shift+K), log pane
+(Ctrl+Shift+L), and additional REPL panes (Ctrl+Shift+P).
+File -> New (Ctrl+N) opens the Forth source editor.
+
+Help -> Documentation (F1) opens the full user guide in the
+DocCrate viewer.  Requires doc-crate.exe in this folder.
 
 Layout
 ------
     wf64-ui.exe   - the IDE binary (drag a shortcut to your desktop)
+    doc-crate.exe - documentation viewer (needed for Help -> Docs)
+    LLVM-C.dll    - LLVM runtime (must stay alongside wf64-ui.exe)
     kernel\       - JIT-assembled Forth primitives (loaded at boot)
     lib\          - Forth standard library (core.f)
     demos\        - sample programs reachable via the Demos menu
-    docs\         - README, manifesto, get-started
+    docs\         - user guide and reference (opened by DocCrate)
 
 Where things live at runtime
 ----------------------------
-The IDE looks for kernel\ and lib\ next to wf64-ui.exe first,
-then falls back to the original repo layout.  You can move the
-folder anywhere as long as the layout above stays intact.
+The IDE looks for kernel\ and lib\ next to wf64-ui.exe first.
+You can move the whole folder anywhere as long as the layout
+above stays intact.
