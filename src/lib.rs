@@ -1688,6 +1688,11 @@ impl Wf64Session {
     /// This output is attached to the error message so the UI can display
     /// it without losing context.
     pub fn eval(&mut self, input: &str) -> Result<String> {
+        // Always start in interpret mode.  A previous eval that ended
+        // mid-definition (`:` without `;`) would otherwise leave STATE=1,
+        // causing every subsequent call to compile rather than interpret.
+        self.write_user_u64(USER_STATE_VAR, 0);
+
         let io = runtime::Io::Buffered {
             input: input.as_bytes().to_vec(),
             in_cursor: 0,
@@ -1708,6 +1713,22 @@ impl Wf64Session {
             }
             runtime::Io::Live { .. } => unreachable!("eval installed Buffered"),
         };
+
+        // If STATE is still 1 after the eval, a `:` was opened but `;`
+        // was never reached.  Roll back the incomplete definition so the
+        // dictionary doesn't contain a word with no EXIT at its tail.
+        if self.user_u64(USER_STATE_VAR) != 0 {
+            let _ = self.call("forget_last_word");
+            self.write_user_u64(USER_STATE_VAR, 0);
+            let base = match call_err {
+                Ok(()) => anyhow::anyhow!("incomplete definition — ':' without ';'"),
+                Err(e) => anyhow::anyhow!(
+                    "incomplete definition — ':' without ';' (also: {e})"
+                ),
+            };
+            return Err(annotate_forth_error(base, &output));
+        }
+
         match call_err {
             Ok(()) => Ok(output),
             Err(e) => Err(annotate_forth_error(e, &output)),
