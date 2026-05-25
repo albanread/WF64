@@ -892,10 +892,11 @@ unsafe extern "system" fn frame_wnd_proc(
                 open_docs();
                 return LRESULT(0);
             }
-            // File → Open with no active editor: spin up a fresh
-            // fedit first, then forward the OPEN command to it.
-            // (Save/Save-As without an active editor are no-ops —
-            // there's nothing to save, so we just drop them.)
+            // File → Open: if no active editor, show the dialog and
+            // open the chosen file in a new fedit directly.  If there
+            // is an active fedit, fall through to forward the command
+            // to it — the fedit WndProc will show its own dialog and
+            // open the file in a new window.
             if cmd_id == super::fedit::EDIT_CMD_OPEN {
                 if mdi.0 as isize != 0 {
                     let active_raw = unsafe {
@@ -907,11 +908,8 @@ unsafe extern "system" fn frame_wnd_proc(
                         )
                     };
                     if active_raw.0 == 0 {
-                        // No active child — create the editor, then
-                        // forward.  fedit::open is a singleton-style
-                        // open that focuses an existing fedit or
-                        // creates a new one.
-                        super::fedit::open(hwnd, mdi);
+                        super::fedit::open_with_dialog(hwnd, mdi);
+                        return LRESULT(0);
                     }
                     // Fall through to EDIT_CMD_BASE forwarding below.
                 }

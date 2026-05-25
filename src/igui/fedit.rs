@@ -27,10 +27,10 @@
 //!   - **F5 → run buffer** — sends the buffer to the Forth REPL
 //!     on the worker thread for evaluation (Phase 2b wiring).
 //!
-//! Architecture: a single-instance MDI child with its own WndProc
-//! that handles WM_PAINT (Direct2D + DirectWrite, fixed grid) and
-//! all input directly. State is heap-allocated on first
-//! `WM_NCCREATE` and stored in `GWLP_USERDATA`.
+//! Architecture: MDI child with its own WndProc that handles
+//! WM_PAINT (Direct2D + DirectWrite, fixed grid) and all input
+//! directly. Multiple windows can exist simultaneously. State is
+//! heap-allocated on first `WM_NCCREATE` and stored in `GWLP_USERDATA`.
 //!
 //! R1 scope:
 //!   - open / save (Win32 common dialogs)
@@ -71,7 +71,7 @@ use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Controls::Dialogs::{
@@ -90,13 +90,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 /// we use the well-known winuser.h value directly.
 const MK_LBUTTON: u32 = 0x0001;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, DefMDIChildProcW, GetClientRect, GetWindowLongPtrW, IsWindow, LoadCursorW,
+    DefMDIChildProcW, GetClientRect, GetParent, GetWindowLongPtrW, LoadCursorW, PostMessageW,
     RegisterClassExW, SendMessageW, SetWindowLongPtrW, CW_USEDEFAULT, GWLP_USERDATA, IDC_IBEAM,
     MDICREATESTRUCTW, WHEEL_DELTA, WM_CHAR, WM_COMMAND, WM_DPICHANGED_AFTERPARENT, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MDIACTIVATE, WM_MDICREATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
-    WNDCLASSEXW, WNDCLASS_STYLES,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WNDCLASSEXW,
+    WNDCLASS_STYLES, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use super::renderer;
@@ -143,9 +142,9 @@ pub const EDIT_CMD_OPEN: u16 = 0x3152;
 const FEDIT_CLASS: PCWSTR = w!("WF64.iGui.Fedit");
 const TITLE_NEW: PCWSTR = w!("\u{2234} fedit \u{2014} untitled");
 
-/// HWND of the singleton ledit MDI child, if one exists. Used to
-/// activate the existing instance instead of creating a second one.
-static FEDIT_HWND: Mutex<Option<isize>> = Mutex::new(None);
+/// Posted to a newly-created fedit HWND to load a file into it.
+/// lParam is a `Box<PathBuf>` heap pointer; the WndProc owns it.
+const WM_FEDIT_LOAD_PATH: u32 = 0x0401; // WM_USER + 1
 
 // ─── Compile-check injection point ──────────────────────────────────
 //
@@ -215,31 +214,46 @@ pub fn register_class() -> Result<(), super::IGuiError> {
 // The Tools menu and frame accelerator table now live in
 // `tools_menu`, which knows about both ledit and the log view.
 
-/// Open the ledit child, or activate it if already open. Called from
-/// the frame WndProc when the user picks the menu item or hits the
-/// shortcut. UI-thread only.
-pub fn open(frame: HWND, mdi_client: HWND) {
-    if let Some(raw) = *FEDIT_HWND.lock().expect("FEDIT_HWND poisoned") {
-        let hwnd = HWND(raw as *mut _);
-        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-            unsafe {
-                SendMessageW(
-                    mdi_client,
-                    windows::Win32::UI::WindowsAndMessaging::WM_MDIACTIVATE,
-                    Some(WPARAM(hwnd.0 as usize)),
-                    Some(LPARAM(0)),
-                )
-            };
-            let _ = unsafe { BringWindowToTop(hwnd) };
-            return;
-        }
-    }
 
+/// Open a blank fedit MDI child. Creates a new window every call.
+/// UI-thread only (File → New).
+pub fn open(frame: HWND, mdi_client: HWND) {
+    create_fedit_window(frame, mdi_client);
+}
+
+/// Open a new fedit MDI child and load `path` into it. Creates a new
+/// window every call; posts WM_FEDIT_LOAD_PATH to trigger the load
+/// after the window is fully created. UI-thread only.
+pub fn open_file(frame: HWND, mdi_client: HWND, path: PathBuf) {
+    let new_hwnd = create_fedit_window(frame, mdi_client);
+    if new_hwnd.0.is_null() {
+        return;
+    }
+    let boxed = Box::into_raw(Box::new(path)) as isize;
+    if unsafe {
+        PostMessageW(Some(new_hwnd), WM_FEDIT_LOAD_PATH, WPARAM(0), LPARAM(boxed))
+    }
+    .is_err()
+    {
+        let _ = unsafe { Box::from_raw(boxed as *mut PathBuf) };
+    }
+}
+
+/// Show an open-file dialog, then open the chosen file in a new fedit
+/// window.  Cancelling the dialog is a no-op. UI-thread only (File → Open).
+pub fn open_with_dialog(frame: HWND, mdi_client: HWND) {
+    if let Some(path) = open_file_dialog(frame) {
+        open_file(frame, mdi_client, path);
+    }
+}
+
+/// Shared WM_MDICREATE logic. Returns the new HWND (null on failure).
+fn create_fedit_window(frame: HWND, mdi_client: HWND) -> HWND {
     let h_instance = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => windows::Win32::Foundation::HANDLE(h.0),
         Err(e) => {
             eprintln!("[fedit] GetModuleHandleW: {e}");
-            return;
+            return HWND(std::ptr::null_mut());
         }
     };
     let create = MDICREATESTRUCTW {
@@ -263,9 +277,23 @@ pub fn open(frame: HWND, mdi_client: HWND) {
     };
     if result.0 == 0 {
         eprintln!("[fedit] WM_MDICREATE returned 0");
-        return;
+        return HWND(std::ptr::null_mut());
     }
-    let _ = frame; // reserved for future use
+    let _ = frame;
+    HWND(result.0 as *mut _)
+}
+
+/// Returns the `demos/` directory next to the running exe, if it exists.
+fn exe_demos_dir() -> Option<std::path::PathBuf> {
+    let hmod = unsafe { GetModuleHandleW(None) }.ok();
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(hmod, &mut buf) } as usize;
+    if n == 0 {
+        return None;
+    }
+    let exe = std::path::PathBuf::from(OsString::from_wide(&buf[..n]));
+    let demos = exe.parent()?.join("demos");
+    if demos.is_dir() { Some(demos) } else { None }
 }
 
 // ─── State ───────────────────────────────────────────────────────────
@@ -2017,9 +2045,6 @@ unsafe extern "system" fn fedit_wnd_proc(
         let state = Box::new(FeditState::new(hwnd));
         let raw = Box::into_raw(state) as isize;
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw) };
-        if let Ok(mut slot) = FEDIT_HWND.lock() {
-            *slot = Some(hwnd.0 as isize);
-        }
         return unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) };
     }
 
@@ -2135,15 +2160,14 @@ unsafe extern "system" fn fedit_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_FEDIT_LOAD_PATH => {
+            let path = unsafe { Box::from_raw(lparam.0 as *mut PathBuf) };
+            state.load_from(*path);
+            LRESULT(0)
+        }
         WM_NCDESTROY => {
-            // Drop the heap state. Clear singleton slot if it matches.
             let _ = unsafe { Box::from_raw(state_ptr) };
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-            if let Ok(mut slot) = FEDIT_HWND.lock() {
-                if matches!(*slot, Some(h) if h == hwnd.0 as isize) {
-                    *slot = None;
-                }
-            }
             unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) }
         }
         _ => unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) },
@@ -2169,7 +2193,9 @@ fn handle_edit_menu(state: &mut FeditState, cmd_id: u16) -> bool {
         EDIT_CMD_RUN_BUFFER => state.run_buffer(),
         EDIT_CMD_OPEN => {
             if let Some(p) = open_file_dialog(state.hwnd) {
-                state.load_from(p);
+                let mdi_client = unsafe { GetParent(state.hwnd) }.unwrap_or_default();
+                let frame = unsafe { GetParent(mdi_client) }.unwrap_or_default();
+                open_file(frame, mdi_client, p);
             }
         }
         EDIT_CMD_SAVE => {
@@ -2281,9 +2307,11 @@ fn handle_char(state: &mut FeditState, c: char) {
             return;
         }
         0x0F => {
-            // Ctrl+O — open.
+            // Ctrl+O — open file in a new fedit window.
             if let Some(p) = open_file_dialog(state.hwnd) {
-                state.load_from(p);
+                let mdi_client = unsafe { GetParent(state.hwnd) }.unwrap_or_default();
+                let frame = unsafe { GetParent(mdi_client) }.unwrap_or_default();
+                open_file(frame, mdi_client, p);
             }
             return;
         }
@@ -2383,6 +2411,18 @@ fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
     let mut buf = vec![0u16; 1024];
     let filter = forth_filter();
     let def_ext = default_ext_forth();
+
+    // Default the dialog to the demos/ folder next to the exe, if present.
+    let initial_dir_wide: Option<Vec<u16>> = exe_demos_dir().map(|d| {
+        let mut w: Vec<u16> = d.as_os_str().encode_wide().collect();
+        w.push(0);
+        w
+    });
+    let initial_dir_pcwstr = initial_dir_wide
+        .as_ref()
+        .map(|v| PCWSTR(v.as_ptr()))
+        .unwrap_or(PCWSTR::null());
+
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
@@ -2391,6 +2431,7 @@ fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
         lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
         lpstrDefExt: PCWSTR(def_ext.as_ptr()),
+        lpstrInitialDir: initial_dir_pcwstr,
         Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY,
         ..Default::default()
     };
