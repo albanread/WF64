@@ -692,17 +692,34 @@ forth-wordlist set-current
 \ Usage:
 \     : square dup * ; inline
 \
-\ WARNING: only safe for LEAF words (no internal CALLs in the body).
-\ A non-leaf body's rel32 offsets break when copied. We don't detect
-\ this -- the user is responsible for using `inline` only on words
-\ whose bodies contain no CALL instructions.
+\ Only LEAF words are inlined.  A body that contains a relative CALL
+\ (0xE8) or JMP (0xE9) cannot be copied verbatim — the rel32 displacement
+\ is position-relative, so the copy would branch to the wrong address and
+\ crash.  `inline` now DETECTS such bodies and refuses (leaves dh_ofa = 0),
+\ so the word falls back to a normal CALL.  This makes `inline` safe to
+\ apply to any word: leaf bodies are inlined, non-leaf bodies aren't.
 \
 \ user_LATEST is at base+16; dh_xtptr at header+16; dh_ofa at header+42;
 \ dh_comp at header+24.
 
+\ (inline-leaf?) ( xt len -- flag )
+\ True iff the body [xt, xt+len) contains no relative CALL/JMP byte, i.e.
+\ it is safe to copy verbatim.  Heuristic but conservative: a spurious
+\ 0xE8/0xE9 inside an immediate only costs a missed inline (safe CALL).
+: (inline-leaf?)  ( xt len -- flag )
+    over + swap                          ( end xt )
+    begin 2dup u> while                  ( end xt )
+        dup c@  dup $E8 = swap $E9 = or
+        if 2drop false exit then
+        1+
+    repeat 2drop true ;
+
 : inline  ( -- )
     base 16 + @                              ( latest )
     here over 16 + @ - 1-                    ( latest length )  \ HERE - xt - 1
+    over 16 + @ over (inline-leaf?) 0= if    ( latest length )  \ non-leaf?
+        drop 0                               ( latest 0 )        \ refuse -> CALL
+    then
     dup $FFFF u> if drop 0 then              ( latest length )  \ clamp; 0 == disable
     over 42 + w!                              ( latest )          \ store dh_ofa
     ['] (inline,) swap 24 + ! ;              ( )                 \ store dh_comp

@@ -867,19 +867,31 @@ s" Inline" testing
 \ header base, then dh_ofa is at +42.
 : ofa-of  ( xt -- ofa )  dup cell - @ + 8 - 42 + w@ ;
 
-\ Define a leaf word and mark it inline; behaviour must be unchanged.
-: my-double  dup + ;  inline
-T{  3 my-double                          -> 6 }T
-T{  10 my-double                         -> 20 }T
+\ Define a LEAF word and mark it inline.  `5 +` folds to an immediate
+\ `add rax, 5` (no CALL), so the body is safe to copy verbatim.
+: add5  5 + ;  inline
+T{  3 add5                               -> 8 }T
+T{  10 add5                              -> 15 }T
 
-\ inline set dh_ofa to the body length (non-zero).
-T{  ' my-double ofa-of  0>               -> -1 }T
+\ inline set dh_ofa to the body length (non-zero) for this leaf word.
+T{  ' add5 ofa-of  0>                    -> -1 }T
 
-\ A second word that REFERENCES my-double should now compile inlined
-\ copies of my-double's body, not CALLs to it. Verifies correctness.
-: quad-via-inline  my-double my-double ;
-T{  3 quad-via-inline                    -> 12 }T
-T{  -2 quad-via-inline                   -> -8 }T
+\ A second word that REFERENCES add5 now compiles inlined copies of its
+\ body, not CALLs to it. Verifies the inline copy is correct.
+: add10-via-inline  add5 add5 ;
+T{  3 add10-via-inline                   -> 13 }T
+T{  -2 add10-via-inline                  -> 8 }T
+
+\ A NON-leaf word marked inline must be REFUSED (dh_ofa stays 0) because
+\ its body contains a relative `call +` that can't be copied verbatim.
+\ It falls back to a normal CALL, so referencing it is still correct and
+\ never crashes (regression guard for the inline-of-non-leaf bug).
+: nonleaf-double  dup + ;  inline
+T{  ' nonleaf-double ofa-of              -> 0 }T
+T{  3 nonleaf-double                     -> 6 }T
+: use-nonleaf  nonleaf-double nonleaf-double ;
+T{  3 use-nonleaf                        -> 12 }T
+T{  -2 use-nonleaf                       -> -8 }T
 
 \ A word with dh_ofa = 0 falls back to CALL, so calling via (inline,)
 \ on an unmarked word still works.

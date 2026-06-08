@@ -56,6 +56,7 @@
 @include "dict.masm"
 @include "execute.masm"
 @include "compile.masm"
+@include "oop.masm"
 @include "gc.masm"
 @include "strings_managed.masm"
 @include "igui.masm"

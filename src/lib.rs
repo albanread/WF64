@@ -232,6 +232,7 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     ("gpane-fill-circle",  "gpane_fill_circle_word",   0),
     ("gpane-next-event",   "gpane_next_event_word",    0),
     ("fractal-iter",       "fractal_iter_word",        0),
+    ("canvas-blit",        "canvas_blit_word",         0),
     ("do",         "do_word",    1),
     ("?do",        "qdo_control_word", 1),
     ("loop",       "loop_control_word", 1),
@@ -541,6 +542,11 @@ pub const PRIMITIVES: &[(&str, &str, u8)] = &[
     (">body",      "to_body",    0),
     ("latestxt",   "latestxt",   0),
     ("forget_last", "forget_last_word", 0),
+    // Object system — dispatch hot path (see docs/oop_design.md).
+    // The class/object DSL itself lives in lib/oop.f.
+    ("self",       "self_word",     0),
+    ("(send)",     "send_word",     0),
+    ("(send-xt)",  "send_xt_word",  0),
     ("largest",    "largest",    0),
     ("number?",    "number_q",   0),
     ("accept",     "accept",     0),
@@ -695,6 +701,14 @@ const USER_PRIVATE_WID:  u64 = 0x17D0;  // wid of PRIVATE wordlist
 // runtime module can read them when servicing rt_gc_collect.
 pub(crate) const USER_HEAPPTR_NEXT:  u64 = 0x17E0;  // bump pointer (abs addr)
 pub(crate) const USER_LITERAL_NEXT:  u64 = 0x17E8;  // bump pointer for LITERAL region
+// OOP early-binding receiver hint (lib/oop.f). Cleared on reset so a stale
+// HERE value can never trigger a false early-bind after HERE rewinds.
+pub(crate) const USER_OOP_RECV_CLASS: u64 = 0x17F8;
+pub(crate) const USER_OOP_RECV_HERE:  u64 = 0x1800;
+// wid of the per-class ivar wordlist (lib/oop.f). Its bucket array is
+// snapshotted at boot and restored on reset so scoped ivar entries added
+// during a test don't dangle (same treatment as forth/tools/private).
+pub(crate) const USER_OOP_IVARS_WID:  u64 = 0x1808;
 pub(crate) const USER_HEAPPTR_BASE:  u64 = 0x2000;  // first slot of the region
 pub(crate) const HEAPPTR_REGION_SIZE: u64 = 0x1000; // 4 KB = 512 slots
 pub(crate) const USER_LITERAL_BASE:  u64 = 0x3000;  // first slot of LITERAL region
@@ -1081,6 +1095,7 @@ pub struct Wf64Session {
     boot_wl_buckets: Vec<u64>,
     boot_tools_buckets: Vec<u64>,
     boot_private_buckets: Vec<u64>,
+    boot_ivars_buckets: Vec<u64>,
 }
 
 // SAFETY: Wf64Session holds raw LLVM pointers via `Jit` that aren't
@@ -1209,6 +1224,10 @@ impl Wf64Session {
                 "rt_gpane_stroke_rect"  => Some(runtime::rt_gpane_stroke_rect  as *mut c_void),
                 "rt_gpane_line"         => Some(runtime::rt_gpane_line         as *mut c_void),
                 "rt_gpane_fill_circle"  => Some(runtime::rt_gpane_fill_circle  as *mut c_void),
+                "rt_canvas_blit"        => Some(runtime::rt_canvas_blit        as *mut c_void),
+                "rt_doc_open"           => Some(runtime::rt_doc_open           as *mut c_void),
+                "rt_doc_set"            => Some(runtime::rt_doc_set            as *mut c_void),
+                "rt_doc_append"         => Some(runtime::rt_doc_append         as *mut c_void),
                 "rt_gpane_next_event_for" => Some(runtime::rt_gpane_next_event_for as *mut c_void),
                 _ => None,
             }
@@ -1309,6 +1328,7 @@ impl Wf64Session {
             boot_wl_buckets: Vec::new(),
             boot_tools_buckets: Vec::new(),
             boot_private_buckets: Vec::new(),
+            boot_ivars_buckets: Vec::new(),
         };
 
         let xt_init_dictionary_overlay = session.xt_of("init_dictionary_overlay")?;
@@ -1337,6 +1357,15 @@ impl Wf64Session {
                 .with_context(|| format!("boot: load {}", core_path.display()))?;
         }
 
+        // Load the object system (lib/oop.f) on top of core.f, still
+        // *before* the boot snapshot so its selector table sits below the
+        // reset fence and its words survive reset() like core.f's do.
+        let oop_path = core_path.with_file_name("oop.f");
+        if oop_path.exists() {
+            session.load_source_file(&oop_path)
+                .with_context(|| format!("boot: load {}", oop_path.display()))?;
+        }
+
         session.boot_here   = session.here();
         session.boot_latest = session.latest();
         session.boot_latestxt = session.user_u64(USER_LATESTXT_VAR);
@@ -1360,6 +1389,17 @@ impl Wf64Session {
         session.boot_private_buckets = unsafe {
             std::slice::from_raw_parts(private_wid_snap as *const u64, 512)
                 .to_vec()
+        };
+        // OOP ivar wordlist (created by lib/oop.f, which publishes its wid to
+        // USER_OOP_IVARS_WID). Snapshot its buckets so reset() can clear the
+        // scoped ivar entries a test adds. Empty Vec if oop.f wasn't loaded.
+        let ivars_wid_snap = session.user_u64(USER_OOP_IVARS_WID);
+        session.boot_ivars_buckets = if ivars_wid_snap != 0 {
+            unsafe {
+                std::slice::from_raw_parts(ivars_wid_snap as *const u64, 512).to_vec()
+            }
+        } else {
+            Vec::new()
         };
         session.write_user_u64(USER_FORGET_FENCE, session.boot_latest);
         session.debug_synced_here = session.boot_here;
@@ -1802,6 +1842,10 @@ impl Wf64Session {
         self.write_user_u64(USER_THROW_CODE,   0);
         self.write_user_u64(USER_TRACE,        0);
         self.write_user_u64(USER_LOCALS_COUNT, 0);
+        // OOP early-binding hint: clear so a stale HERE can't false-match
+        // a fresh receiver after HERE rewinds (see lib/oop.f).
+        self.write_user_u64(USER_OOP_RECV_CLASS, 0);
+        self.write_user_u64(USER_OOP_RECV_HERE,  0);
         self.write_user_u64(USER_FP0,          self.user_base + USER_FP_STACK + 0x100);
         self.write_user_u64(USER_FSP,          self.user_base + USER_FP_STACK + 0x100);
         // HEAPPTR + LITERAL region reset: clear both slot regions,
@@ -1855,6 +1899,19 @@ impl Wf64Session {
                 private_wid_r as *mut u64,
                 512,
             );
+        }
+        // Same for the OOP ivar wordlist, if oop.f published one. Restoring
+        // its (boot-empty) buckets clears the scoped ivar entries a test
+        // added, so the next test doesn't chase rewound overlay nodes.
+        let ivars_wid_r = self.user_u64(USER_OOP_IVARS_WID);
+        if ivars_wid_r != 0 && self.boot_ivars_buckets.len() == 512 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.boot_ivars_buckets.as_ptr(),
+                    ivars_wid_r as *mut u64,
+                    512,
+                );
+            }
         }
         self.write_user_u64(USER_CURRENT,      forth_wid);
         // Default search order: PRIVATE TOOLS FORTH (innermost first).
