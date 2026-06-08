@@ -709,6 +709,14 @@ pub(crate) const USER_OOP_RECV_HERE:  u64 = 0x1800;
 // snapshotted at boot and restored on reset so scoped ivar entries added
 // during a test don't dangle (same treatment as forth/tools/private).
 pub(crate) const USER_OOP_IVARS_WID:  u64 = 0x1808;
+// Near RWX arena that runtime CODE:/LET code is assembled into (so it's
+// rel32-reachable from the kernel/dict — no far-segment trampoline). Base
+// and size are published here at boot for runtime.rs to build a CodeArena.
+pub(crate) const USER_JIT_ARENA_BASE: u64 = 0x1810;
+pub(crate) const USER_JIT_ARENA_SIZE: u64 = 0x1818;
+/// Size of the runtime JIT code arena (`CODE:`/`LET`). 32 MB — plenty for
+/// thousands of small words, well inside the rel32 window.
+const JIT_ARENA_SIZE: usize = 32 * 1024 * 1024;
 pub(crate) const USER_HEAPPTR_BASE:  u64 = 0x2000;  // first slot of the region
 pub(crate) const HEAPPTR_REGION_SIZE: u64 = 0x1000; // 4 KB = 512 slots
 pub(crate) const USER_LITERAL_BASE:  u64 = 0x3000;  // first slot of LITERAL region
@@ -1005,6 +1013,45 @@ fn alloc_forth_region(kernel_addr: u64) -> Result<*mut c_void> {
     Ok(base)
 }
 
+// Near JIT code arena for runtime CODE:/LET words. Anchored near the Forth
+// region (not the kernel): the region is already within ±1.75 GB of the
+// kernel, and a ±128 MB window keeps the arena within rel32 (±2 GB) of BOTH
+// the kernel and the dict heap, so `call rel32` reaches it either way.
+// RWX so the SimpleMCJITMemoryManager's FinalizeMemory can be a no-op.
+fn alloc_jit_arena(anchor: u64) -> Result<*mut c_void> {
+    let va2 = get_virtual_alloc2().context("locate VirtualAlloc2")?;
+    const GRANULARITY: u64 = 0x10000;
+    const WINDOW:      u64 = 0x08000000; // ±128 MB
+    let low_aligned = ((anchor.saturating_sub(WINDOW) + GRANULARITY - 1)
+        & !(GRANULARITY - 1)).max(GRANULARITY);
+    let high_inclusive = (anchor.saturating_add(WINDOW) & !(GRANULARITY - 1))
+        .saturating_sub(1);
+    let mut req = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: low_aligned as *mut c_void,
+        HighestEndingAddress:  high_inclusive as *mut c_void,
+        Alignment: 0,
+    };
+    let mut param = MEM_EXTENDED_PARAMETER {
+        type_and_reserved: MemExtendedParameterAddressRequirements,
+        pointer: &mut req as *mut _ as *mut c_void,
+    };
+    let base = unsafe {
+        va2(
+            ptr::null_mut(), ptr::null_mut(), JIT_ARENA_SIZE,
+            MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE,
+            &mut param, 1,
+        )
+    };
+    if base.is_null() {
+        let err = unsafe { GetLastError() };
+        anyhow::bail!(
+            "JIT-arena VirtualAlloc2 returned null (GetLastError = {err}); \
+             anchor {anchor:#018x}, window [{low_aligned:#018x} .. {high_inclusive:#018x}]"
+        );
+    }
+    Ok(base)
+}
+
 // Locals stack region — a separate 1 MB block. Addressed exclusively
 // through R15-relative loads, so it doesn't need to live near the
 // kernel; plain VirtualAlloc is enough.
@@ -1239,6 +1286,11 @@ impl Wf64Session {
         let region_base = alloc_forth_region(kernel_addr)?;
         let region_u64 = region_base as u64;
 
+        // Near JIT code arena for runtime CODE:/LET words (rel32-reachable
+        // from both the kernel and the dict region). Published to the user
+        // area below; runtime.rs builds a CodeArena from it.
+        let jit_arena_base = alloc_jit_arena(region_u64)?;
+
         // Locals stack — independent 1 MB allocation, R15 grows down from
         // the top. Released by Drop. Far address is fine: only ever
         // accessed via R15-relative loads, no rel32 constraint.
@@ -1287,6 +1339,9 @@ impl Wf64Session {
             // LITERAL region: same shape, distinct region — used by
             // S$" for compile-time string literals.
             write_u64(up, USER_LITERAL_NEXT, user_base + USER_LITERAL_BASE);
+            // Publish the near JIT code arena (runtime CODE:/LET).
+            write_u64(up, USER_JIT_ARENA_BASE, jit_arena_base as u64);
+            write_u64(up, USER_JIT_ARENA_SIZE, JIT_ARENA_SIZE as u64);
         }
 
         // Register kernel procs with SEH for symbolic crash dumps.

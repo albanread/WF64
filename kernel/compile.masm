@@ -2362,20 +2362,19 @@ proc(code_colon_word)
     mov     r8, [UP + user_LATEST]
     mov     byte ptr [r8 + dh_tfa], tfa_tcol
 
-    ; Emit trampoline: mov rcx, imm64 ; jmp rcx  (12 bytes).  We use
-    ; rcx, not rax, because rax holds the user's TOS at the moment the
-    ; trampoline is entered — clobbering it would silently destroy the
-    ; caller's input value.  rcx is caller-saved and the interpreter
-    ; only puts xt there before jumping in, so we can safely overwrite.
-    mov     rcx, [UP + user_PAD + 8]         ; fn_addr
-    mov     r8,  [UP + user_HERE]
-    mov     byte ptr [r8 + 0], 0x48
-    mov     byte ptr [r8 + 1], 0xB9          ; mov rcx, imm64
-    mov     [r8 + 2], rcx                    ; the 8-byte fn_addr
-    mov     byte ptr [r8 + 10], 0xFF         ; jmp rcx
-    mov     byte ptr [r8 + 11], 0xE1
-    add     r8, 12
-    mov     [UP + user_HERE], r8
+    ; The body is real near-arena code: rt_code_compile_body assembled it
+    ; into our near code arena and left fn_addr in user_PAD+8.  Point the
+    ; word's xt straight at it — a plain `call rel32` reaches it, so there
+    ; is no body, no copy, and no far-segment trampoline.  Then write the
+    ; xt back-offset into the arena's reserved header cell at
+    ; [fn_addr - cell], exactly like a boot-time primitive, so >ct / >name
+    ; recover the header from the xt.
+    mov     r10, [UP + user_PAD + 8]         ; r10 = fn_addr (near)
+    mov     [r8 + dh_xtptr], r10             ; dh_xtptr = fn_addr
+    mov     [UP + user_LATESTXT], r10        ; latestxt = fn_addr
+    lea     r9, [r8 + dh_ct]                 ; &dh_ct
+    sub     r9, r10                          ; back-offset = &dh_ct - fn_addr
+    mov     [r10 - cell], r9                 ; store at [fn_addr - cell]
     next()
 
 .compile_error:

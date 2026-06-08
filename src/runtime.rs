@@ -2289,7 +2289,7 @@ pub extern "C" fn rt_string_bytes_equal(tagged_a: u64, tagged_b: u64) -> u64 {
 // error details are printed to stderr.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use wfasm::Jit;
+use wfasm::{CodeArena, Jit};
 
 use crate::let_lang;
 
@@ -2299,6 +2299,35 @@ const RT_USER_SOURCE_LEN:  u64 = 0x38;
 const RT_USER_TO_IN:       u64 = 0x40;
 const RT_USER_HERE:        u64 = 0x18;
 const RT_USER_FSP:         u64 = 0x1218;
+const RT_USER_JIT_ARENA_BASE: u64 = 0x1810; // near RWX arena base (set at boot)
+const RT_USER_JIT_ARENA_SIZE: u64 = 0x1818; // near RWX arena size
+
+/// One process-wide near JIT code arena, lazily built from the user-area
+/// cells the session published at boot. Leaked so it lives for the whole
+/// session; its bump offset accumulates across every CODE:/LET word, all of
+/// which land rel32-reachable from the kernel/dict.
+thread_local! {
+    static JIT_ARENA: std::cell::Cell<*mut CodeArena> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Get (or lazily create) the near code arena. Returns null only if the
+/// session never published one (e.g. a unit test with a bare user area).
+unsafe fn jit_code_arena(up: u64) -> *mut CodeArena {
+    JIT_ARENA.with(|cell| {
+        let p = cell.get();
+        if !p.is_null() { return p; }
+        let base = unsafe { read_u64(up + RT_USER_JIT_ARENA_BASE) };
+        let size = unsafe { read_u64(up + RT_USER_JIT_ARENA_SIZE) };
+        if base == 0 || size == 0 { return std::ptr::null_mut(); }
+        // 8-byte code header so the xt back-offset cell lands at
+        // [fn_addr - cell], exactly like a boot-time primitive.
+        let arena = Box::new(CodeArena::with_code_header(base as *mut u8, size as usize, 8));
+        let raw = Box::into_raw(arena);
+        cell.set(raw);
+        raw
+    })
+}
 
 thread_local! {
     /// Compiled LET functions live in their own JIT modules.  We keep
@@ -2737,16 +2766,23 @@ unsafe fn try_compile_code(up: u64) -> Result<u64, String> {
             .map_err(|e| format!("{e}"))
     })?;
 
-    let mut jit = Jit::new(&format!("code_mod_{counter:04}"))
-        .map_err(|e| format!("Jit::new: {e:?}"))?;
+    // Assemble straight into the near code arena, so the function lands
+    // rel32-reachable from the kernel/dict — the word's xt points right at
+    // it (no far-segment trampoline, no byte copy). The arena is host-owned,
+    // so we drop the engine immediately; the emitted code lives on.
+    let arena = unsafe { jit_code_arena(up) };
+    if arena.is_null() {
+        return Err("JIT code arena not initialised (session published no arena)".to_string());
+    }
+    let mut jit = Jit::new_in_arena(&format!("code_mod_{counter:04}"), arena)
+        .map_err(|e| format!("Jit::new_in_arena: {e:?}"))?;
     jit.add_asm(&mc_text)
         .map_err(|e| format!("add_asm: {e:?}\nasm was:\n{mc_text}"))?;
     jit.declare_fn(&fn_label, 0)
         .map_err(|e| format!("declare_fn({fn_label}): {e:?}"))?;
     let fn_addr = jit.lookup_addr(&fn_label)
         .map_err(|e| format!("lookup_addr({fn_label}): {e:?}"))?;
-
-    CODE_JITS.with(|j| j.borrow_mut().push(jit));
+    drop(jit); // code persists in the arena; engine no longer needed
 
     // Advance TO_IN past the consumed portion of the current line.
     unsafe {
