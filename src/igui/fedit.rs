@@ -2740,6 +2740,8 @@ const FORTH_KEYWORDS: &[&str] = &[
     "exit", "recurse",
     // exception
     "catch", "throw", "abort",
+    // object system (lib/oop.f) — structural syntax
+    "end-class", ";m", "super", "->",
 ];
 
 /// Defining words — anything that creates a new dictionary entry
@@ -2755,6 +2757,8 @@ const FORTH_DEFINING: &[&str] = &[
     "marker", "forget",
     "immediate", "compile-only",
     "defer", "is",
+    // object system (lib/oop.f) — each is followed by a new name
+    "class", "subclass", "ivar:", ":m", "new",
 ];
 
 /// `:` is also a defining word.  Handled separately because the
