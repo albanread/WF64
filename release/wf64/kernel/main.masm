@@ -93,7 +93,11 @@
 ; nothing reads it again).
 ;
 ; Win64 ABI: rcx=target_xt, rdx=logical_dsp_in, r8=rsp_top, r9=user_base.
-; All callee-saved GPRs are preserved; xmm6-15 are untouched.
+; All callee-saved GPRs are preserved.  xmm6-15 (callee-saved per Win64)
+; are SAVED on entry and RESTORED on exit, so Forth FP code — including
+; native LET words and any primitive that wants the high xmm regs — may
+; use xmm6-15 freely without corrupting the host (e.g. Direct2D, which
+; relies on them).  This is the one boundary where they are spilled.
 proc(forth_main)
     push    rbx
     push    rbp
@@ -106,6 +110,21 @@ proc(forth_main)
                                               ; (R15 is reserved as the locals
                                               ; stack pointer LP inside Forth;
                                               ; primitives must not scribble on it)
+
+    ; Spill xmm6-15 (10 * 16 = 160 bytes) onto the host stack.  movups is
+    ; used (no 16-alignment requirement); the matching reload is in the
+    ; epilogue, keyed off the same user_HOST_RSP value saved just below.
+    sub     rsp, 160
+    movups  [rsp +   0], xmm6
+    movups  [rsp +  16], xmm7
+    movups  [rsp +  32], xmm8
+    movups  [rsp +  48], xmm9
+    movups  [rsp +  64], xmm10
+    movups  [rsp +  80], xmm11
+    movups  [rsp +  96], xmm12
+    movups  [rsp + 112], xmm13
+    movups  [rsp + 128], xmm14
+    movups  [rsp + 144], xmm15
 
     ; Install Forth registers.
     mov     UP,  r9
@@ -168,8 +187,21 @@ proc(forth_main)
     ; Persist the Forth rstack pointer for the next call.
     mov     [UP + user_RSP_CURRENT], rsp
 
-    ; Restore host's RSP and callee-saved regs.
+    ; Restore host's RSP, then reload the spilled xmm6-15 (user_HOST_RSP
+    ; points at the 160-byte xmm save area from the prologue), then the
+    ; callee-saved GPRs.
     mov     rsp, [UP + user_HOST_RSP]
+    movups  xmm6,  [rsp +   0]
+    movups  xmm7,  [rsp +  16]
+    movups  xmm8,  [rsp +  32]
+    movups  xmm9,  [rsp +  48]
+    movups  xmm10, [rsp +  64]
+    movups  xmm11, [rsp +  80]
+    movups  xmm12, [rsp +  96]
+    movups  xmm13, [rsp + 112]
+    movups  xmm14, [rsp + 128]
+    movups  xmm15, [rsp + 144]
+    add     rsp, 160
     pop     r15
     pop     r14
     pop     r13
