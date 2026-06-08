@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePatternBrush,
@@ -88,6 +88,15 @@ pub(crate) const WM_IGUI_FCONSOLE_FLUSH: u32 = WM_USER + 9;
 /// a future VEH path); flush the captured dumps into the crash
 /// view, opening it if it isn't already.  wparam/lparam unused.
 pub(crate) const WM_IGUI_CRASH_FLUSH: u32 = WM_USER + 10;
+/// Open the built-in help-pane MDI child — the DocCrate-style folder
+/// browser.  Same marshaling rationale as WM_IGUI_OPEN_TEXT.
+const WM_IGUI_OPEN_HELP: u32 = WM_USER + 11;
+/// Open a generic, Forth-writable Markdown doc-pane MDI child.  Same
+/// marshaling rationale as WM_IGUI_OPEN_TEXT.
+const WM_IGUI_OPEN_DOC: u32 = WM_USER + 12;
+/// Repaint a doc-pane after its Markdown source changed.  Posted (not
+/// sent) — same rationale as WM_IGUI_TEXT_FLUSH.
+const WM_IGUI_DOC_FLUSH: u32 = WM_USER + 13;
 /// Sent from the language thread to a render-host HWND to install
 /// or clear a Win32 timer driving `EvTick` events.
 /// `wparam` carries the interval in ms (0 = clear), `lparam` is unused.
@@ -107,6 +116,79 @@ static MDICLIENT_ORIG_PROC: OnceLock<isize> = OnceLock::new();
 /// Was LAMBDA_BRUSH_RAW (lisp wallpaper) before the Forth port.
 static LOGO_BRUSH_RAW: OnceLock<isize> = OnceLock::new();
 
+/// Background + glyph colours for the frame's tiled wallpaper.
+/// Set by the parent binary before `igui::run` (which calls
+/// `make_logo_brush` at MDICLIENT-create time).  Colours are
+/// packed 0xRRGGBB.
+#[derive(Clone, Copy, Debug)]
+pub struct FramePalette {
+    pub bg: u32,
+    pub fg: u32,
+}
+
+pub fn default_frame_palette() -> FramePalette {
+    FramePalette {
+        bg: 0x1C2834,  // deep navy-slate  (WF64's classic)
+        fg: 0x3A5068,  // dot glyph: ~+30 per channel
+    }
+}
+
+static FRAME_PALETTE: Mutex<FramePalette> = Mutex::new(FramePalette {
+    bg: 0x1C2834,
+    fg: 0x3A5068,
+});
+
+/// Override the frame wallpaper palette.  Must be called before
+/// `igui::run` so make_logo_brush picks it up.  Idempotent;
+/// most recent call wins.  WF64's own binary doesn't call this
+/// — its default ships; FactorForth calls it to warm the tint.
+pub fn set_frame_palette(p: FramePalette) {
+    if let Ok(mut g) = FRAME_PALETTE.lock() {
+        *g = p;
+    }
+}
+
+/// Cached app icon.  First call resolves; subsequent calls reuse.
+static APP_ICON_RAW: OnceLock<isize> = OnceLock::new();
+
+/// Return the HICON every WF64 window class should advertise.
+/// Tries to load an embedded RT_ICON at id 1 first (parent
+/// binaries that ship their own `.ico` via embed-resource get
+/// their branding automatically); falls back to the
+/// procedurally-drawn ∴ on a navy disk if no resource is present.
+///
+/// Safe to call from any thread; uses LR_SHARED so the handle
+/// is process-owned and doesn't need cleanup.
+///
+/// # Safety
+/// Must be called after a Win32 module handle is available
+/// (i.e. inside or after `igui::run`).  Calling from a static
+/// initializer would crash.
+pub unsafe fn app_icon() -> windows::Win32::UI::WindowsAndMessaging::HICON {
+    use windows::Win32::UI::WindowsAndMessaging::HICON;
+    let raw = *APP_ICON_RAW.get_or_init(|| {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
+        };
+        let h_instance: HINSTANCE = unsafe {
+            GetModuleHandleW(None)
+        }.unwrap_or_default().into();
+        // Resource id 1 matches the convention in
+        // tools/<host>-ui.rc:  `1 ICON "host.ico"`.
+        let loaded = unsafe {
+            LoadImageW(
+                Some(h_instance), PCWSTR(1 as *const u16),
+                IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED,
+            )
+        };
+        match loaded {
+            Ok(handle) if !handle.is_invalid() => handle.0 as isize,
+            _ => unsafe { make_app_icon() }.0 as isize,
+        }
+    });
+    HICON(raw as *mut _)
+}
+
 /// Discovered demo files: (menu_id, display_name, absolute_path).
 /// Populated by `discover_demos` at frame creation; the WM_COMMAND
 /// handler looks up entries here when the user clicks a Demos item.
@@ -121,43 +203,23 @@ pub(crate) fn demo_files_snapshot() -> Vec<(u16, String, std::path::PathBuf)> {
 
 // ── Help / documentation launcher ─────────────────────────────────────────
 
-/// Locate `doc-crate.exe` and the bundled `docs/` directory, then
-/// spawn the documentation browser.
+/// Open the bundled user guide **in-window** as a help-pane (the
+/// DocCrate-style folder browser), rendered by the embedded `docpane`
+/// core.  No external viewer is launched.
 ///
-/// Search order for each asset:
-///
-/// **doc-crate.exe**
-///   1. `<exe_dir>/doc-crate.exe`  — production installation
-///   2. `DOC_CRATE_EXE` env var   — developer override
-///
-/// **docs/**
+/// `docs/` search order:
 ///   1. `<exe_dir>/docs/`         — production installation
 ///   2. `<exe_dir>/../../docs/`   — dev build (exe is under target/debug/)
 ///   3. `CARGO_MANIFEST_DIR/docs/` — `cargo run` from anywhere
 pub(crate) fn open_docs() {
+    // Open the manual *in-window* as a help-pane (the DocCrate-style
+    // folder browser), rendered through the shared `docpane` core.  We're
+    // already on the GUI thread here (called from the frame's WM_COMMAND),
+    // so we create the child directly rather than marshaling through
+    // `open_help_child`.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-
-    // ── locate doc-crate.exe ──────────────────────────────────────
-    let doc_exe: Option<std::path::PathBuf> = exe_dir
-        .as_ref()
-        .map(|d| d.join("doc-crate.exe"))
-        .filter(|p| p.is_file())
-        .or_else(|| {
-            std::env::var("DOC_CRATE_EXE")
-                .ok()
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_file())
-        });
-
-    let Some(doc_exe) = doc_exe else {
-        eprintln!(
-            "[docs] doc-crate.exe not found next to this executable.\n\
-             Copy doc-crate.exe alongside wf64-ui.exe, or set DOC_CRATE_EXE."
-        );
-        return;
-    };
 
     // ── locate docs/ directory ────────────────────────────────────
     let docs_dir: Option<std::path::PathBuf> = exe_dir
@@ -186,13 +248,12 @@ pub(crate) fn open_docs() {
         return;
     };
 
-    // ── spawn ─────────────────────────────────────────────────────
-    if let Err(e) = std::process::Command::new(&doc_exe)
-        .arg(&docs_dir)
-        .spawn()
-    {
-        eprintln!("[docs] failed to launch {}: {e}", doc_exe.display());
-    }
+    let Some(mdi) = mdi_client_hwnd() else {
+        eprintln!("[docs] MDI client not available");
+        return;
+    };
+    let title: Vec<u16> = "Manual\u{0}".encode_utf16().collect();
+    super::help_pane::create_on_gui_thread(mdi, &title, &docs_dir.to_string_lossy());
 }
 
 /// Scan for `demos/*.f` files and return `(menu_id, display_name, path)`
@@ -281,10 +342,19 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 unsafe fn make_logo_brush() -> HBRUSH {
     const TILE: i32 = 80;
 
-    // Background: deep navy-slate  #1C2834
-    const BG: COLORREF = rgb(28, 40, 52);
-    // Logo glyph: ~55 units brighter per channel — subtle but legible
-    const FG: COLORREF = rgb(58, 80, 104);
+    // Background + glyph palette.  Defaults are WF64's deep
+    // navy-slate; parent binaries can override before the frame
+    // is created via `set_frame_palette` (FactorForth uses this
+    // to shift to a warm-charcoal tint that pairs with its
+    // amber brand colour).  See `FRAME_PALETTE` below.
+    let palette = FRAME_PALETTE.lock().map(|g| *g)
+        .unwrap_or(default_frame_palette());
+    let bg_rgb = palette.bg;
+    let fg_rgb = palette.fg;
+    let BG: COLORREF = rgb(
+        (bg_rgb >> 16) as u8, (bg_rgb >> 8) as u8, bg_rgb as u8);
+    let FG: COLORREF = rgb(
+        (fg_rgb >> 16) as u8, (fg_rgb >> 8) as u8, fg_rgb as u8);
 
     unsafe {
         let screen_dc = GetDC(None);
@@ -534,11 +604,9 @@ where
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }
         .map_err(|e| IGuiError::Win32(format!("LoadCursorW failed: {e}")))?;
 
-    // Window icon — procedurally generated ∴ on a navy disk.  Used
-    // for the title bar, taskbar, Alt+Tab.  Survives the process
-    // lifetime; HICON is process-managed so no explicit cleanup
-    // needed.
-    let app_icon = unsafe { make_app_icon() };
+    // Window icon — used for the frame's title bar, taskbar,
+    // Alt+Tab.  Child windows also use it via app_icon() below.
+    let app_icon = unsafe { app_icon() };
 
     // Frame class.
     let frame_class = WNDCLASSEXW {
@@ -729,6 +797,32 @@ unsafe extern "system" fn frame_wnd_proc(
             super::text_view::flush_on_gui_thread(child_id);
             LRESULT(0)
         }
+        WM_IGUI_OPEN_HELP => {
+            let req_ptr = lparam.0 as *mut OpenHelpRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { &mut *req_ptr };
+                if let Some(mdi_client) = mdi_client_hwnd() {
+                    req.out =
+                        super::help_pane::create_on_gui_thread(mdi_client, &req.title, &req.path);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_IGUI_OPEN_DOC => {
+            let req_ptr = lparam.0 as *mut OpenDocRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { &mut *req_ptr };
+                if let Some(mdi_client) = mdi_client_hwnd() {
+                    req.out = super::doc_pane::create_on_gui_thread(mdi_client, &req.title);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_IGUI_DOC_FLUSH => {
+            let child_id = wparam.0 as i64;
+            super::doc_pane::flush_on_gui_thread(child_id);
+            LRESULT(0)
+        }
         WM_IGUI_FCONSOLE_FLUSH => {
             super::fconsole::flush_on_gui_thread();
             LRESULT(0)
@@ -830,6 +924,26 @@ unsafe extern "system" fn frame_wnd_proc(
                 // Pipe into the same mailbox the worker drains; it
                 // tears down the session and brings up a fresh one.
                 super::channels::push(super::channels::IGuiEvent::ForthRestart);
+                return LRESULT(0);
+            }
+            if cmd_id == super::tools_menu::FORTH_INTERRUPT_CMD_ID {
+                // Doesn't drop the session — just nudges the VM to
+                // raise ERROR_INTERRUPT at the next safepoint.  The
+                // listener's recover catches it, prints "ANS error
+                // -28: Interrupt", and resumes the prompt.
+                //
+                // Crucial detail: we can't go through the IGuiEvent
+                // queue because the IDE worker thread is blocked
+                // inside session.eval() waiting for the dispatcher
+                // — that's the whole point of needing an interrupt
+                // in the first place.  Instead the parent binary
+                // registers an `interrupt_hook` at startup, and we
+                // call it synchronously from this thread (it's
+                // designed for cross-thread use; just signals a
+                // flag the VM polls at its next safepoint).
+                if let Ok(hook) = super::channels::INTERRUPT_HOOK.lock() {
+                    if let Some(f) = *hook { f(); }
+                }
                 return LRESULT(0);
             }
             // ── Demos menu ──────────────────────────────────────
@@ -954,7 +1068,15 @@ unsafe extern "system" fn frame_wnd_proc(
                 menu_id: 0,
                 item_id: cmd_id as i64,
             });
-            LRESULT(0)
+            // Then hand the command to DefFrameProcW. This is essential for a
+            // *maximized* MDI child: the system moves its minimize/restore/
+            // close buttons (the small window icons) into the frame's menu
+            // bar, and clicking them arrives here as a WM_COMMAND that only
+            // DefFrameProcW knows how to perform. Returning LRESULT(0) (as
+            // before) swallowed them, so the controls were dead. DefFrameProcW
+            // ignores genuine user-menu ids (well below the MDI reserved
+            // range), so this is safe for both.
+            unsafe { DefFrameProcW(hwnd, Some(mdi), msg, wparam, lparam) }
         }
         WM_SIZE => {
             // MDI client sizes itself via DefFrameProcW.
@@ -1181,6 +1303,18 @@ pub(crate) struct OpenTextRequest {
     pub out: Option<i64>,
 }
 
+pub(crate) struct OpenDocRequest {
+    pub title: Vec<u16>,
+    pub out: Option<i64>,
+}
+
+pub(crate) struct OpenHelpRequest {
+    pub title: Vec<u16>,
+    /// A docs folder (→ sidebar) or a single `.md` file path.
+    pub path: String,
+    pub out: Option<i64>,
+}
+
 pub(crate) struct CloseChildRequest {
     pub child_id: i64,
     pub ok: bool,
@@ -1272,6 +1406,52 @@ pub fn open_text_child(title: &str) -> Option<i64> {
     req.out
 }
 
+/// Open a generic Forth-writable Markdown pane.  Marshals to the GUI
+/// thread like `open_text_child`; the returned child id is the token
+/// Forth uses with `doc_pane::set_markdown` / `append_markdown`.
+pub fn open_doc_child(title: &str) -> Option<i64> {
+    let frame_raw = *FRAME_HWND.get()?;
+    let frame = HWND(frame_raw as *mut _);
+    let mut title_w: Vec<u16> = title.encode_utf16().collect();
+    title_w.push(0);
+    let mut req = OpenDocRequest {
+        title: title_w,
+        out: None,
+    };
+    unsafe {
+        SendMessageW(
+            frame,
+            WM_IGUI_OPEN_DOC,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut req as *mut _ as isize)),
+        )
+    };
+    req.out
+}
+
+/// Open a help-pane MDI child browsing `path` (a docs folder, or a single
+/// `.md` file).  Marshals to the GUI thread like `open_text_child`.
+pub fn open_help_child(title: &str, path: &str) -> Option<i64> {
+    let frame_raw = *FRAME_HWND.get()?;
+    let frame = HWND(frame_raw as *mut _);
+    let mut title_w: Vec<u16> = title.encode_utf16().collect();
+    title_w.push(0);
+    let mut req = OpenHelpRequest {
+        title: title_w,
+        path: path.to_owned(),
+        out: None,
+    };
+    unsafe {
+        SendMessageW(
+            frame,
+            WM_IGUI_OPEN_HELP,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut req as *mut _ as isize)),
+        )
+    };
+    req.out
+}
+
 pub fn close_child(child_id: i64) -> bool {
     let Some(frame_raw) = FRAME_HWND.get() else {
         return false;
@@ -1348,6 +1528,24 @@ pub(crate) fn post_text_flush(child_id: i64) {
         PostMessageW(
             Some(frame),
             WM_IGUI_TEXT_FLUSH,
+            WPARAM(child_id as usize),
+            LPARAM(0),
+        )
+    };
+}
+
+/// Counterpart to `post_text_flush` for a Markdown doc-pane.  Posted
+/// (not sent) so a streaming `append_markdown` loop doesn't block on
+/// the GUI thread.
+pub(crate) fn post_doc_flush(child_id: i64) {
+    let Some(frame_raw) = FRAME_HWND.get() else {
+        return;
+    };
+    let frame = HWND(*frame_raw as *mut _);
+    let _ = unsafe {
+        PostMessageW(
+            Some(frame),
+            WM_IGUI_DOC_FLUSH,
             WPARAM(child_id as usize),
             LPARAM(0),
         )

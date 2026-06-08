@@ -1263,6 +1263,12 @@ fn write_event(
             // (wf64-ui's worker drains the typed variant directly).
             k = kind::EVAL_BUFFER;
         }
+        IGuiEvent::ForthInterrupt => {
+            // Same arrangement as ForthRestart: typed Rust consumers
+            // see the discriminant directly; C-ABI consumers get the
+            // EVAL_BUFFER catch-all (no payload meaningful to them).
+            k = kind::EVAL_BUFFER;
+        }
         IGuiEvent::ReplSubmit { child_id } => {
             // Reuse EVAL_BUFFER tag for C-ABI consumers.  The wf64-ui
             // worker reads this via the Rust path and pops the input

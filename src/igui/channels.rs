@@ -13,6 +13,21 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Optional interrupt hook the parent binary can register so the
+/// GUI thread can signal "stop the running eval" without going
+/// through the event queue.  See the comment in window.rs for
+/// why this needs a side channel rather than the mailbox.
+pub static INTERRUPT_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
+
+/// Register a function the GUI thread will call when the user
+/// triggers Forth → Break (Ctrl+B).  Setting to None unregisters.
+/// Idempotent; the most recent call wins.
+pub fn set_interrupt_hook(hook: Option<fn()>) {
+    if let Ok(mut g) = INTERRUPT_HOOK.lock() {
+        *g = hook;
+    }
+}
+
 /// Stable enum tags exported to CP as `iGui.Ev*` constants.
 pub mod kind {
     pub const NONE: i64 = 0;
@@ -137,6 +152,13 @@ pub enum IGuiEvent {
     /// Any user-defined words from the previous session are
     /// gone; the GC heap is re-initialised.
     ForthRestart,
+    /// "Stop the currently-running eval at the next safepoint."
+    /// Fired from the Forth menu (Forth → Break) or Ctrl+B.
+    /// The worker calls the session's interrupt() method; the
+    /// VM raises ERROR_INTERRUPT at its next safepoint check,
+    /// which the listener's recover catches as "ANS error -28".
+    /// Session keeps running; only the in-flight eval aborts.
+    ForthInterrupt,
     /// "User pressed Enter on a complete form in the REPL pane."  The
     /// worker pops the input via `repl_pane::pop_input(child_id)`,
     /// evaluates it, and calls `repl_pane::append(child_id, …)` to
@@ -247,7 +269,7 @@ pub fn discard_stashed_events() {
 /// when the filter is non-empty.
 fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
     match ev {
-        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } | IGuiEvent::ForthRestart => true,
+        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } | IGuiEvent::ForthRestart | IGuiEvent::ForthInterrupt => true,
         IGuiEvent::Menu { .. } => true,
         IGuiEvent::Key { child_id, .. }
         | IGuiEvent::Char { child_id, .. }
@@ -288,6 +310,7 @@ fn matches_target(ev: &IGuiEvent, target: i64) -> bool {
         | IGuiEvent::Menu { .. }
         | IGuiEvent::EvalBuffer { .. }
         | IGuiEvent::ForthRestart
+        | IGuiEvent::ForthInterrupt
         | IGuiEvent::ReplSubmit { .. }
         | IGuiEvent::DpiChange { .. } => false,
         // Per-window events only match when their child_id is target.

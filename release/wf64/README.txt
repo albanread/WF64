@@ -16,18 +16,18 @@ View menu opens the stack viewer (Ctrl+Shift+K), log pane
 (Ctrl+Shift+L), and additional REPL panes (Ctrl+Shift+P).
 File -> New (Ctrl+N) opens the Forth source editor.
 
-Help -> Documentation (F1) opens the full user guide in the
-DocCrate viewer.  Requires doc-crate.exe in this folder.
+Help -> Documentation (F1) opens the full user guide in a
+document pane inside the IDE - rendered Markdown with a sidebar
+to browse pages.  No external viewer required.
 
 Layout
 ------
     wf64-ui.exe   - the IDE binary (drag a shortcut to your desktop)
-    doc-crate.exe - documentation viewer (needed for Help -> Docs)
     LLVM-C.dll    - LLVM runtime (must stay alongside wf64-ui.exe)
     kernel\       - JIT-assembled Forth primitives (loaded at boot)
     lib\          - Forth standard library (core.f)
     demos\        - sample programs reachable via the Demos menu
-    docs\         - user guide and reference (opened by DocCrate)
+    docs\         - user guide and reference (shown in-window via Help)
 
 Where things live at runtime
 ----------------------------

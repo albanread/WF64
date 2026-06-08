@@ -126,26 +126,9 @@ foreach ($f in $userDocFiles) {
     }
 }
 
-# DocCrate - the help-viewer executable.  Look next to the wf64-ui binary
-# first (trimmed/custom build), then fall back to the standard install path.
-$docCrateCandidates = @(
-    (Join-Path $buildDir 'doc-crate.exe'),
-    'E:\DocCrate\target\release\doc-crate.exe',
-    'E:\DocCrate\target\release-ship\doc-crate.exe'
-)
-$docCrateFound = $false
-foreach ($candidate in $docCrateCandidates) {
-    if (Test-Path $candidate) {
-        Copy-Item $candidate (Join-Path $OutDir 'doc-crate.exe')
-        $sizeMB = [math]::Round((Get-Item $candidate).Length / 1MB, 2)
-        Write-Host "[release] staged doc-crate.exe ($sizeMB MB) from $candidate"
-        $docCrateFound = $true
-        break
-    }
-}
-if (-not $docCrateFound) {
-    Write-Warning "[release] doc-crate.exe not found - Help menu will not open docs. Build DocCrate first (E:\DocCrate\)"
-}
+# DocCrate viewer no longer staged: Help -> Documentation now opens the
+# manual in-window (the doc/help panes render Markdown via the embedded
+# docpane core), so the standalone doc-crate.exe is not shipped.
 
 # End-user quickstart.
 $readme = @"
@@ -167,18 +150,18 @@ View menu opens the stack viewer (Ctrl+Shift+K), log pane
 (Ctrl+Shift+L), and additional REPL panes (Ctrl+Shift+P).
 File -> New (Ctrl+N) opens the Forth source editor.
 
-Help -> Documentation (F1) opens the full user guide in the
-DocCrate viewer.  Requires doc-crate.exe in this folder.
+Help -> Documentation (F1) opens the full user guide in a
+document pane inside the IDE - rendered Markdown with a sidebar
+to browse pages.  No external viewer required.
 
 Layout
 ------
     wf64-ui.exe   - the IDE binary (drag a shortcut to your desktop)
-    doc-crate.exe - documentation viewer (needed for Help -> Docs)
     LLVM-C.dll    - LLVM runtime (must stay alongside wf64-ui.exe)
     kernel\       - JIT-assembled Forth primitives (loaded at boot)
     lib\          - Forth standard library (core.f)
     demos\        - sample programs reachable via the Demos menu
-    docs\         - user guide and reference (opened by DocCrate)
+    docs\         - user guide and reference (shown in-window via Help)
 
 Where things live at runtime
 ----------------------------

@@ -550,8 +550,69 @@ fn execute_d2d_batch(
             SurfaceCmd::DrawPath { commands, fill, stroke } => {
                 draw_path(target, commands, fill, stroke.as_ref())?;
             }
+            SurfaceCmd::Blit { x, y, w, h, pixels } => {
+                blit_pixels(target, *x, *y, *w, *h, pixels)?;
+            }
         }
     }
+    Ok(())
+}
+
+/// Upload a `w×h` BGRA8 CPU framebuffer to a Direct2D bitmap and draw it
+/// at `(x, y)`. The GUI-thread end of the canvas fast path: one
+/// `CreateBitmap` (bulk upload) + one `DrawBitmap`, replacing what would
+/// otherwise be `w*h` per-pixel draw commands. Pixels are `0xAARRGGBB`
+/// words read as native BGRA8 (little-endian byte order B,G,R,A).
+fn blit_pixels(
+    target: &ID2D1HwndRenderTarget,
+    x: f32,
+    y: f32,
+    w: u32,
+    h: u32,
+    pixels: &[u32],
+) -> Result<(), IGuiError> {
+    use windows::Win32::Graphics::Direct2D::Common::{
+        D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
+    };
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+    if w == 0 || h == 0 || pixels.len() < (w as usize) * (h as usize) {
+        return Ok(());
+    }
+    let bitmap = unsafe {
+        target.CreateBitmap(
+            D2D_SIZE_U { width: w, height: h },
+            Some(pixels.as_ptr() as *const std::ffi::c_void),
+            w * 4, // pitch: 4 bytes/pixel, tightly packed
+            &D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            },
+        )
+    }
+    .map_err(|e| IGuiError::D2D(format!("CreateBitmap (Blit): {e}")))?;
+    let dst = D2D_RECT_F {
+        left: x,
+        top: y,
+        right: x + w as f32,
+        bottom: y + h as f32,
+    };
+    unsafe {
+        target.DrawBitmap(
+            &bitmap,
+            Some(&dst),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            None,
+        )
+    };
     Ok(())
 }
 
@@ -1220,6 +1281,10 @@ fn log_ui_batch(child_id: i64, batch: &batch_mod::PaneBatch) {
                 fill.is_some(),
                 stroke.is_some()
             ),
+            SurfaceCmd::Blit { x, y, w, h, pixels } => eprintln!(
+                "[igui-batch-ui]   #{index} Blit at=({x:.1}, {y:.1}) {w}x{h} ({} px)",
+                pixels.len()
+            ),
         }
     }
 }
@@ -1536,7 +1601,8 @@ fn execute_gdi_batch(
             | SurfaceCmd::Caret { .. }
             | SurfaceCmd::SelectionRange { .. }
             | SurfaceCmd::FocusRing { .. }
-            | SurfaceCmd::DrawPath { .. } => {
+            | SurfaceCmd::DrawPath { .. }
+            | SurfaceCmd::Blit { .. } => {
                 eprintln!("[igui-gdi] Phase 5 primitive in GDI fallback — skipped");
             }
         }
@@ -1575,12 +1641,12 @@ pub fn register_classes() -> Result<(), IGuiError> {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: h_instance,
-        hIcon: Default::default(),
+        hIcon: unsafe { super::window::app_icon() },
         hCursor: cursor,
         hbrBackground: HBRUSH(std::ptr::null_mut()),
         lpszMenuName: PCWSTR::null(),
         lpszClassName: MDI_CHILD_CLASS,
-        hIconSm: Default::default(),
+        hIconSm: unsafe { super::window::app_icon() },
     };
     let _ = unsafe { RegisterClassExW(&mdi) };
 
@@ -1591,12 +1657,12 @@ pub fn register_classes() -> Result<(), IGuiError> {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: h_instance,
-        hIcon: Default::default(),
+        hIcon: unsafe { super::window::app_icon() },
         hCursor: cursor,
         hbrBackground: HBRUSH(std::ptr::null_mut()),
         lpszMenuName: PCWSTR::null(),
         lpszClassName: RENDER_HOST_CLASS,
-        hIconSm: Default::default(),
+        hIconSm: unsafe { super::window::app_icon() },
     };
     let _ = unsafe { RegisterClassExW(&render) };
 
@@ -1607,6 +1673,8 @@ pub fn register_classes() -> Result<(), IGuiError> {
     super::stack_view::register_class()?;
     super::crash_view::register_class()?;
     super::text_view::register_class()?;
+    super::help_pane::register_class()?;
+    super::doc_pane::register_class()?;
 
     Ok(())
 }

@@ -55,7 +55,9 @@ mod replies;
 mod tools_menu;
 pub mod system_colors;
 pub(crate) mod text_view;
-pub(crate) mod window;
+pub mod doc_pane;
+pub mod help_pane;
+pub mod window;
 
 pub use fedit::{install_checker, Diagnostic};
 pub use window::run;

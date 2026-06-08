@@ -5554,3 +5554,29 @@ fn parse_int(s: &str) -> Option<i64> {
         s.parse().ok()
     }
 }
+
+// ── canvas fast-path (rt_canvas_blit → SurfaceCmd::Blit) ─────────────
+
+/// The `canvas-blit` kernel primitive is published and the high-resolution
+/// canvas Mandelbrot demo compiles end-to-end. Booting the shared session
+/// already proves the new `canvas_blit_word` MASM proc assembles; this pins
+/// that `canvas-blit`, `L!`, `fractal-iter`, and the `gpane-*` words all
+/// resolve when the demo is loaded, and that its entry word is defined.
+#[test]
+fn canvas_mandelbrot_demo_compiles() {
+    let mut s = sess();
+
+    // The new primitive ticks cleanly (an undefined word would not).
+    let out = s.eval("' canvas-blit drop\nbye\n").unwrap();
+    assert_eq!(out, " ok\n", "canvas-blit should be a defined word: {out:?}");
+
+    // Load the demo source; every word it uses must resolve, or the colon
+    // definition of its entry word fails and the word never appears.
+    let demo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("demos")
+        .join("gfx-canvas-mandelbrot.f");
+    s.load_source_file(&demo).expect("load gfx-canvas-mandelbrot.f");
+
+    let out = s.eval("' gfx-canvas-mandelbrot drop\nbye\n").unwrap();
+    assert_eq!(out, " ok\n", "demo entry word should be defined: {out:?}");
+}

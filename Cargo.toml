@@ -33,6 +33,12 @@ embed-resource = "3"
 # Linux/macOS get stub builds via cfg(windows) inside the module.
 [target.'cfg(windows)'.dependencies]
 windows-numerics = "0.3"
+# docpane — the Markdown + Mermaid render core (forked from DocCrate),
+# WF64's own copy under crates/.  Brings selkie (Mermaid parser) +
+# pulldown-cmark.  Powers the in-window doc_pane / help_pane MDI
+# children.  Kept as a local path dep so WF64 stays independent of
+# NewFactor's tree.
+docpane = { path = "crates/docpane" }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"

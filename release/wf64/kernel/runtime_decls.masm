@@ -91,6 +91,7 @@
 @extern rt_gpane_stroke_rect(6) ; (x, y, w, h, thick, rgb) -> 0
 @extern rt_gpane_line(6)        ; (x0, y0, x1, y1, thick, rgb) -> 0
 @extern rt_gpane_fill_circle(4) ; (cx, cy, r, rgb) -> 0
+@extern rt_canvas_blit(4)       ; (child_id, src_addr, w, h) -> 0 — bulk BGRA framebuffer upload (canvas)
 
 ; Event polling: matches `child_id` (or globals), writes the
 ; decoded event into 5 cells of scratch storage passed as

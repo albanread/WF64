@@ -278,6 +278,19 @@ pub enum SurfaceCmd {
         fill: Option<Rgba>,
         stroke: Option<(StrokeStyle, Rgba)>,
     },
+    /// Bulk-upload a `w×h` BGRA8 CPU framebuffer and draw it at `(x, y)`.
+    /// The GPU end of the "canvas" fast path: a Forth program fills a
+    /// pixel buffer with native stores (no per-pixel boundary crossing)
+    /// then ships the whole frame here as one command. `pixels` is an
+    /// `Arc` so the submit is a refcount bump, not a pixel copy. Pixel
+    /// words are `0xAARRGGBB` (native BGRA, little-endian).
+    Blit {
+        x: f32,
+        y: f32,
+        w: u32,
+        h: u32,
+        pixels: Arc<Vec<u32>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +330,26 @@ pub fn submit(batch: PaneBatch) -> bool {
     } else {
         false
     }
+}
+
+/// Present a CPU framebuffer for `child_id` as a single `Blit` batch.
+/// This is the canvas fast path: the whole `w×h` BGRA frame crosses the
+/// GUI boundary once (one batch, one `Arc` handoff) instead of as
+/// thousands of per-pixel draw commands. Replaces the pane's current
+/// batch and posts a repaint, exactly like a normal `submit`.
+pub fn present_pixels(child_id: i64, w: u32, h: u32, pixels: Arc<Vec<u32>>) -> bool {
+    submit(PaneBatch {
+        child_id,
+        sequence: next_sequence(),
+        flags: 0,
+        cmds: vec![SurfaceCmd::Blit {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+            pixels,
+        }],
+    })
 }
 
 pub fn snapshot(child_id: i64) -> Option<Arc<PaneBatch>> {

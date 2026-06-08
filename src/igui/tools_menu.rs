@@ -36,13 +36,19 @@ pub const FILE_CMD_EXIT: u16 = 0x3050;
 /// Living here so all menu IDs sit together.
 pub const FORTH_RESTART_CMD_ID: u16 = 0x3200;
 
+/// Frame-level WM_COMMAND id for Forth → Break (interrupt the
+/// running eval at the next safepoint).  Unlike Restart this
+/// doesn't tear down the session — just aborts the in-flight
+/// eval via the VM's safepoint-interrupt mechanism.
+pub const FORTH_INTERRUPT_CMD_ID: u16 = 0x3201;
+
 /// Range reserved for auto-assigned Demos menu items.
 /// Up to 4096 demos before we overflow — well past any reasonable
 /// directory size.
 pub const DEMO_CMD_BASE: u16 = 0x4000;
 pub const DEMO_CMD_END:  u16 = 0x4FFF;
 
-/// Help → Documentation: spawn doc-crate.exe against the bundled docs/.
+/// Help → Documentation: open the bundled docs/ in-window as a help-pane.
 pub const HELP_CMD_DOCS: u16 = 0x5000;
 
 // ─── Menu builders ────────────────────────────────────────────────────
@@ -162,6 +168,7 @@ pub fn append_forth_menu(bar: HMENU) {
         return;
     };
     append_items(popup, "forth-menu", &[
+        (FORTH_INTERRUPT_CMD_ID,      "&Break\tCtrl+B"),
         (FORTH_RESTART_CMD_ID,        "&Restart\tCtrl+Shift+F5"),
         (0,                           "SEP"),
         (fedit::EDIT_CMD_RUN_BUFFER,  "R&un Buffer\tF5"),
@@ -169,7 +176,7 @@ pub fn append_forth_menu(bar: HMENU) {
     append_popup(bar, "forth-menu", "Fo&rth", popup);
 }
 
-/// Help menu — Documentation (opens doc-crate.exe against docs/).
+/// Help menu — Documentation (opens the bundled docs/ in-window as a help-pane).
 pub fn append_help_menu(bar: HMENU) {
     let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
         eprintln!("[help-menu] CreatePopupMenu failed");
@@ -214,6 +221,7 @@ pub fn build_accelerator_table() -> Option<HACCEL> {
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'L' as u16, cmd: log_view::MENU_CMD_ID },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'X' as u16, cmd: crash_view::MENU_CMD_ID },
         // Forth
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,          key: b'B' as u16, cmd: FORTH_INTERRUPT_CMD_ID },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: VK_F5.0,     cmd: FORTH_RESTART_CMD_ID },
         ACCEL { fVirt: FVIRTKEY,                     key: VK_F5.0,     cmd: fedit::EDIT_CMD_RUN_BUFFER },
         // Help

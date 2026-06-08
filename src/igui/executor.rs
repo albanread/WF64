@@ -240,7 +240,8 @@ pub fn execute(batch: &PaneBatch) -> Result<bool, IGuiError> {
             | SurfaceCmd::Caret { .. }
             | SurfaceCmd::SelectionRange { .. }
             | SurfaceCmd::FocusRing { .. }
-            | SurfaceCmd::DrawPath { .. } => {
+            | SurfaceCmd::DrawPath { .. }
+            | SurfaceCmd::Blit { .. } => {
                 eprintln!("[igui-executor] Phase 5 command on dormant DC path — ignored");
             }
         }

@@ -317,3 +317,26 @@ proc(fractal_iter_word)
     mov     TOS, r10
     next()
 endp()
+
+
+; canvas-blit  ( child-id addr w h -- )
+;     Ship a Forth-owned w×h BGRA framebuffer at `addr` to graphical
+;     pane `child-id` as ONE Direct2D bitmap upload — the "canvas" fast
+;     path (see rt_canvas_blit).  Instead of one draw command per pixel,
+;     Forth fills a packed array of 0xAARRGGBB words (native BGRA,
+;     little-endian) and ships the whole frame across in a single call.
+;     The runtime copies the buffer, so the Forth array may be reused or
+;     freed as soon as this returns.  No batch begin/present needed:
+;     canvas-blit submits and repaints on its own.
+proc(canvas_blit_word)
+    ; Stack: h=TOS, w=[DSP], addr=[DSP+cell], child-id=[DSP+2*cell].
+    mov     rcx, [DSP + 2*cell]                 ; child_id
+    mov     rdx, [DSP + cell]                   ; src_addr
+    mov     r8,  [DSP]                          ; w
+    mov     r9,  TOS                            ; h
+    win64_call(rt_canvas_blit)
+    ; Drop all 4 args.
+    mov     TOS, [DSP + 3*cell]
+    stk(4, 0)
+    next()
+endp()

@@ -223,12 +223,12 @@ pub fn register_class() -> Result<(), IGuiError> {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: h_instance,
-        hIcon: Default::default(),
+        hIcon: unsafe { super::window::app_icon() },
         hCursor: cursor,
         hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut()),
         lpszMenuName: PCWSTR::null(),
         lpszClassName: REPL_CLASS,
-        hIconSm: Default::default(),
+        hIconSm: unsafe { super::window::app_icon() },
     };
     let _ = unsafe { RegisterClassExW(&cls) };
     Ok(())

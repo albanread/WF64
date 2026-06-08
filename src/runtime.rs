@@ -1930,6 +1930,116 @@ pub extern "C" fn rt_gpane_fill_circle(
     0
 }
 
+// ─── Canvas FFI (Forth-owned pixel framebuffer, the bulk fast path) ──
+//
+// The `gpane-*` primitives above are immediate-mode: each shape is one
+// batch command, so a per-pixel image would mean one command per pixel
+// — death by boundary crossing.  The canvas inverts that.  Forth owns a
+// `w×h` BGRA byte-array, fills it with *native* stores (no FFI per
+// pixel), then ships the whole frame across in ONE call: O(1) boundary
+// crossings per frame instead of O(pixels).
+
+/// Blit a Forth-owned `w×h` BGRA framebuffer to graphical pane
+/// `child_id` and present it as a single Direct2D bitmap upload.
+///
+/// `src_addr` points at `w*h` packed `0xAARRGGBB` words (native BGRA,
+/// little-endian).  We copy them into an owned `Arc<Vec<u32>>` the GUI
+/// thread can still read when it paints a later frame — essential
+/// because NewGC may move or reclaim the source byte-array after this
+/// call returns.  Hands the copy to the batch as one `Blit` command.
+/// Returns 0 (command-style); a no-op off Windows.
+#[no_mangle]
+pub extern "C" fn rt_canvas_blit(child_id: u64, src_addr: u64, w: u64, h: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        let (w, h) = (w as usize, h as usize);
+        let n = w.saturating_mul(h);
+        if n == 0 || src_addr == 0 {
+            return 0;
+        }
+        // Copy out of the (possibly movable) Forth byte-array into an
+        // owned buffer the GUI thread reads on a later frame.
+        let src = unsafe { std::slice::from_raw_parts(src_addr as *const u32, n) };
+        let pixels = std::sync::Arc::new(src.to_vec());
+        crate::igui::batch::present_pixels(child_id as i64, w as u32, h as u32, pixels);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child_id, src_addr, w, h);
+    }
+    0
+}
+
+// ─── Doc-pane FFI (Forth-writable Markdown) ──────────────────────────
+//
+// A doc-pane is the read-only `help_pane`'s plain sibling: a single
+// Markdown document whose source a Forth program supplies.  `doc-open`
+// makes an empty pane and returns its child id; `doc-set` replaces the
+// Markdown; `doc-append` streams more onto the end.  The pane re-parses
+// and repaints itself on the GUI thread after each edit.
+
+/// Open an empty Markdown doc-pane with the UTF-8 title at
+/// `title_addr..title_addr+title_len`.  Returns the child id (>0) on
+/// success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn rt_doc_open(title_addr: u64, title_len: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        let title = unsafe {
+            std::slice::from_raw_parts(title_addr as *const u8, title_len as usize)
+        };
+        let title = std::str::from_utf8(title).unwrap_or("∴ doc");
+        match crate::igui::doc_pane::open(title) {
+            Some(id) => id as u64,
+            None => 0,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title_addr, title_len);
+        0
+    }
+}
+
+/// Replace doc-pane `child_id`'s Markdown with the UTF-8 text at
+/// `md_addr..md_addr+md_len`.  Returns 1 on success, 0 if the pane is
+/// gone or the bytes aren't valid UTF-8.
+#[no_mangle]
+pub extern "C" fn rt_doc_set(child_id: u64, md_addr: u64, md_len: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(md_addr as *const u8, md_len as usize)
+        };
+        let Ok(md) = std::str::from_utf8(bytes) else { return 0 };
+        if crate::igui::doc_pane::set_markdown(child_id as i64, md) { 1 } else { 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child_id, md_addr, md_len);
+        0
+    }
+}
+
+/// Append the UTF-8 text at `md_addr..md_addr+md_len` to doc-pane
+/// `child_id`'s Markdown.  Returns 1 on success, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn rt_doc_append(child_id: u64, md_addr: u64, md_len: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(md_addr as *const u8, md_len as usize)
+        };
+        let Ok(md) = std::str::from_utf8(bytes) else { return 0 };
+        if crate::igui::doc_pane::append_markdown(child_id as i64, md) { 1 } else { 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child_id, md_addr, md_len);
+        0
+    }
+}
+
 // ─── Forth-side event API ────────────────────────────────────────────
 //
 // `gpane-next-event ( child_id timeout-ms -- p4 p3 p2 p1 kind )`
@@ -1994,6 +2104,7 @@ fn decode_event(
         | IGuiEvent::Menu { .. }
         | IGuiEvent::EvalBuffer { .. }
         | IGuiEvent::ForthRestart
+        | IGuiEvent::ForthInterrupt
         | IGuiEvent::ReplSubmit { .. } => (EV_NONE, 0, 0, 0, 0),
     }
 }
@@ -2387,6 +2498,23 @@ unsafe fn emit_let_trampoline(here: u64, fn_addr: u64, n_in: usize, n_out: usize
     let dst = here as *mut u8;
     let mut p: usize = 0;
 
+    // Preserve the Forth machine registers this trampoline would
+    // otherwise destroy.  RAX is the cached TOS; r12 is callee-saved and
+    // we reuse it below to stash RSP across the call's stack alignment.
+    // Neither is restored without this — a SINGLE LET call hides it (the
+    // data stack is usually empty at the call), but calling a LET word
+    // inside a Forth loop corrupts TOS every iteration and leaves r12
+    // clobbered.  Save both on the return stack; they survive the callee
+    // (Win64 callee-saved) and the `and rsp,-16` below still aligns the
+    // call correctly regardless of these two extra pushes.
+    unsafe {
+        // push rax :: 50   — save Forth TOS
+        *dst.add(p) = 0x50; p += 1;
+        // push r12 :: 41 54 — save callee-saved r12
+        *dst.add(p) = 0x41; p += 1;
+        *dst.add(p) = 0x54; p += 1;
+    }
+
     // mov rcx, qword ptr [rbx + USER_FSP] :: 48 8B 8B disp32
     unsafe {
         *dst.add(p) = 0x48; p += 1;
@@ -2447,6 +2575,11 @@ unsafe fn emit_let_trampoline(here: u64, fn_addr: u64, n_in: usize, n_out: usize
         *dst.add(p) = 0x4C; p += 1;
         *dst.add(p) = 0x89; p += 1;
         *dst.add(p) = 0xE4; p += 1;
+        // pop r12 :: 41 5C — restore the original callee-saved r12
+        *dst.add(p) = 0x41; p += 1;
+        *dst.add(p) = 0x5C; p += 1;
+        // pop rax :: 58 — restore the Forth TOS
+        *dst.add(p) = 0x58; p += 1;
     }
 
     // Adjust FSP by delta.
