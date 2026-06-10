@@ -1,5 +1,7 @@
 # WF64
 
+See WF65 - that has moved on to no longer pack a 67MB LLVM requirement, and has added more optimization, this is here as the venerable ancestor.
+
 A Forth in LLVM/custom MASM — under development.
 
 
